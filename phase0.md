@@ -1,5 +1,7 @@
 # Phase 0 — De-risking before the Custom LLM WebSocket migration
 
+**Status: complete.** All four tasks below are done — the WS migration can now start.
+
 The goal is to move conversation intelligence out of Retell's hosted LLM and into this
 backend over a Retell Custom LLM WebSocket, leaving Retell as telephony transport only.
 That direction matches ADR-003. Phase 0 exists because an audit found the migration would
@@ -19,18 +21,28 @@ Plus one unknown that could have invalidated the whole architecture: DeepSeek's 
 
 | Task | Status |
 |---|---|
-| 1. Prove the phone rings | **Blocked on a manual step** — buy a Retell number |
+| 1. Prove the phone rings | **Done** |
 | 2. Real auth | Done |
 | 3. Dev ingress | Done (opt-in) |
 | 4. Latency spike | Done — **GO** |
 
-### Task 1 — telephony (outstanding)
+### Task 1 — telephony (done)
 
-The only remaining action, and it's manual: buy a number in the Retell dashboard, set
-`RETELL_FROM_NUMBER` in `.env`, restart the API, then `POST /api/agents/{id}/test-call`.
-The Twilio SIP-trunk path is deliberately *not* the route — see `phase2.md`, which also
-documents the credential bug that was fixed along the way (the code now works, but Option A
-needs none of it).
+Bought a number in the Retell dashboard (`+14059146006`), set `RETELL_FROM_NUMBER` in
+`.env`, recreated the API container (`docker compose up -d api` — note `restart` alone
+does not re-read `.env`), then placed a real call via `POST /api/agents/{id}/test-call`.
+**The phone rang and the agent spoke its `system_prompt`.** The Twilio SIP-trunk path was
+deliberately not used — see `phase2.md`, which also documents the credential bug that was
+fixed along the way (the code now works, but this path needed none of it).
+
+Worth restating explicitly, since it's easy to mistake for a bug: this call did **not**
+exercise DeepSeek or any server-side tool. Retell's own hosted LLM answered — that's by
+design for this endpoint (see `backend/services/test_call_service.py`'s docstring and the
+"Test call" UI copy). It proves the telephony leg — Twilio number → Retell → a phone
+ringing with audio — works end-to-end. It does not prove anything about our conversation
+brain, because the hosted-LLM path is built specifically to bypass it. Closing that gap
+(DeepSeek + real tools actually running a live call) is the entire point of the WS
+migration this phase was de-risking.
 
 ### Task 2 — auth
 
@@ -91,7 +103,7 @@ seconds of dead air.
 
 ## What this unblocks, and what's still missing
 
-Once a phone rings (Task 1), the WS migration can start. Build the socket endpoint
+All four gates are now closed. The WS migration can start. Build the socket endpoint
 *alongside* the hosted-LLM path behind a per-agent flag so there is always a working
 fallback, prove one call end-to-end, then layer in memory → real tools → streaming →
 observability.

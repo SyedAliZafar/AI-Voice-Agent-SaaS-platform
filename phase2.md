@@ -1,9 +1,8 @@
 # Phase 2 — Outbound Test Call: from-number setup
 
-Status: **code side resolved; blocked on one manual account action** (buy a Retell number).
-This picks up right after the Agent Builder + `/agents/{id}/test-call` endpoint (see
-`CONTEXT.md` for architecture, `backend/services/test_call_service.py` for the
-call-placement logic).
+Status: **resolved and verified end-to-end.** This picks up right after the Agent Builder +
+`/agents/{id}/test-call` endpoint (see `CONTEXT.md` for architecture,
+`backend/services/test_call_service.py` for the call-placement logic).
 
 > **Decision (superseding the "two ways forward" below): take Option A.**
 > The SIP-trunk credential bug described under "Root cause" has since been *fixed* in code
@@ -88,11 +87,18 @@ Unblocked — no further code changes needed:
    confirmed by the user). Confirm outbound international is allowed in Retell too.
 3. Open a Retell-platform agent → **Test call** card → enter your E.164 number → **Call me**.
 
-## Not yet re-verified end-to-end
-Nothing else in the test-call path has changed since the last verification pass (`ruff check`,
-`pytest`, `npm run build` all green — see prior session). Once a from-number is live, the
-remaining unverified step is simply: does the phone actually ring and does Retell speak the
-agent's `system_prompt`. No code should need to change for that — it's a live-call smoke test.
+## Verified end-to-end
+
+Bought a Retell number (`+14059146006`), set `RETELL_FROM_NUMBER`, recreated the API
+container so it picked up the new `.env` value (`docker compose restart` alone does not —
+use `docker compose up -d api`), then called `POST /api/agents/{id}/test-call` against the
+existing "Ali" agent. **The phone rang and Retell spoke the agent's `system_prompt`.** No
+code changes were needed for this — as predicted, it was a pure live-call smoke test.
+
+Note what this does and doesn't prove: it confirms the telephony leg (Twilio number →
+Retell → ringing phone with audio) works. It does not exercise DeepSeek or any server-side
+tool — this endpoint intentionally runs on Retell's own hosted LLM instead (see
+`test_call_service.py`'s docstring). See `phase0.md` for what comes next.
 
 ## Resolution — the SIP-trunk bug is fixed (Option B now works, but is not the chosen path)
 
