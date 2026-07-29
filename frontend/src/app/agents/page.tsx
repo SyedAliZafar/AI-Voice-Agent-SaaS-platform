@@ -7,10 +7,7 @@ import { AgentCard } from "@/components/AgentCard";
 import { AgentsIcon, PlusIcon } from "@/components/icons";
 import { Button, EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
-import { DEMO_TENANT_ID } from "@/lib/constants";
 import { Agent } from "@/lib/types";
-
-const TENANT_ID = DEMO_TENANT_ID;
 
 export default function AgentsPage() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -19,7 +16,7 @@ export default function AgentsPage() {
 
   useEffect(() => {
     api
-      .get<Agent[]>("/agents", { params: { tenant_id: TENANT_ID } })
+      .get<Agent[]>("/agents")
       .then((res) => setAgents(res.data))
       .catch(() => setAgents([]))
       .finally(() => setLoading(false));

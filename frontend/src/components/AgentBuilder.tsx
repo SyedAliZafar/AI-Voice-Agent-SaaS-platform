@@ -8,7 +8,6 @@ import { Field, Select, TagInput, TextArea, TextInput } from "@/components/form"
 import { SparkleIcon } from "@/components/icons";
 import { Badge, Button, Card } from "@/components/ui";
 import { api } from "@/lib/api";
-import { DEMO_TENANT_ID } from "@/lib/constants";
 import {
   agentDisplayName,
   CampaignIntake,
@@ -107,7 +106,6 @@ export function AgentBuilder() {
           system_prompt: finalPrompt,
           voice_config: { voiceId: intake.logistics.voiceId, campaign: intake },
         },
-        { params: { tenant_id: DEMO_TENANT_ID } },
       );
       router.push(`/agents/${res.data.id}`);
     } catch {

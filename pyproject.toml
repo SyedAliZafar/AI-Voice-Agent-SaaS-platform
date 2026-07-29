@@ -33,9 +33,25 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Alembic autogenerates these; reformatting them creates noise and diff churn against
+# what alembic will produce next time.
+extend-exclude = ["backend/migrations/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 flags function calls in argument defaults, but that IS the FastAPI dependency
+# idiom (`db: AsyncSession = Depends(get_db)`) — these are evaluated per-request by the
+# framework, not once at import. Without this the whole API layer is permanently red.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Security",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

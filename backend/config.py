@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     # Telephony
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
+    # Elastic SIP Trunk domain for the number being imported into Retell, e.g.
+    # "yourtrunk.pstn.twilio.com" (see scripts/setup_retell_number.py). Required for
+    # Retell's /import-phone-number call — it rejects an empty termination_uri.
+    twilio_termination_uri: str = ""
+    # SIP trunk credentials from the Credential List you create inside the Twilio Elastic
+    # SIP Trunk — NOT your Twilio account SID/auth token. These authenticate the SIP call
+    # between Twilio and Retell, a separate credential type from the Twilio API keys above.
+    retell_sip_trunk_username: str = ""
+    retell_sip_trunk_password: str = ""
 
     # Prospecting — Google Places discovery + website research
     google_places_api_key: str = ""

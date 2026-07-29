@@ -22,15 +22,22 @@ async def create_agent(db: AsyncSession, tenant_id: uuid.UUID, payload: AgentCre
     return agent
 
 
-async def get_agent(db: AsyncSession, agent_id: uuid.UUID) -> Agent | None:
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+async def get_agent(db: AsyncSession, agent_id: uuid.UUID, tenant_id: uuid.UUID) -> Agent | None:
+    """Fetch one agent, scoped to its tenant (ADR-001).
+
+    tenant_id is required, not optional — an agent belonging to another tenant comes
+    back as None so callers 404 rather than 403, keeping ids non-enumerable.
+    """
+    result = await db.execute(
+        select(Agent).where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
+    )
     return result.scalar_one_or_none()
 
 
 async def update_agent(
-    db: AsyncSession, agent_id: uuid.UUID, payload: AgentUpdate
+    db: AsyncSession, agent_id: uuid.UUID, tenant_id: uuid.UUID, payload: AgentUpdate
 ) -> Agent | None:
-    agent = await get_agent(db, agent_id)
+    agent = await get_agent(db, agent_id, tenant_id)
     if not agent:
         return None
 
@@ -42,8 +49,8 @@ async def update_agent(
     return agent
 
 
-async def delete_agent(db: AsyncSession, agent_id: uuid.UUID) -> None:
-    agent = await get_agent(db, agent_id)
+async def delete_agent(db: AsyncSession, agent_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+    agent = await get_agent(db, agent_id, tenant_id)
     if agent:
         await db.delete(agent)
         await db.commit()

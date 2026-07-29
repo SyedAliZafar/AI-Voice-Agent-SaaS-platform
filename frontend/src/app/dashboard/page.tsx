@@ -9,19 +9,16 @@ import { CallsIcon, ClockIcon, CheckIcon, LiveIcon } from "@/components/icons";
 import { Card, PageHeader, Skeleton } from "@/components/ui";
 import { useCallMetrics } from "@/hooks/useCallMetrics";
 import { api } from "@/lib/api";
-import { DEMO_TENANT_ID } from "@/lib/constants";
 import { formatDuration } from "@/lib/format";
 import { Call } from "@/lib/types";
 
-const TENANT_ID = DEMO_TENANT_ID; // replace with real auth-derived tenant id
-
 export default function DashboardPage() {
-  const { summary, loading } = useCallMetrics(TENANT_ID);
+  const { summary, loading } = useCallMetrics();
   const [calls, setCalls] = useState<Call[]>([]);
 
   useEffect(() => {
     api
-      .get<Call[]>("/calls", { params: { tenant_id: TENANT_ID, limit: 10 } })
+      .get<Call[]>("/calls", { params: { limit: 10 } })
       .then((res) => setCalls(res.data))
       .catch(() => setCalls([]));
   }, []);

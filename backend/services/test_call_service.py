@@ -27,6 +27,7 @@ class TestCallError(Exception):
 async def place_test_call(
     db: AsyncSession,
     agent_id: uuid.UUID,
+    tenant_id: uuid.UUID,
     to_number: str,
     system_prompt_override: str | None = None,
 ) -> dict:
@@ -36,8 +37,12 @@ async def place_test_call(
     push a *personalized* variant (base script + [COMPANY BRIEF]) to Retell for just this
     call, without overwriting the agent's base `system_prompt` in the database — the
     campaign script stays the source of truth; personalization is call-time only.
+
+    tenant_id is required: this endpoint spends real telephony money on the caller's
+    Retell/Twilio account, so it must never dial on behalf of an agent the caller
+    doesn't own.
     """
-    agent = await agent_service.get_agent(db, agent_id)
+    agent = await agent_service.get_agent(db, agent_id, tenant_id)
     if not agent:
         raise TestCallError("Agent not found")
 
@@ -48,8 +53,10 @@ async def place_test_call(
 
     if not settings.retell_from_number:
         raise TestCallError(
-            "RETELL_FROM_NUMBER is not set. Run scripts/setup_retell_number.py to import a "
-            "Twilio number into Retell, then set RETELL_FROM_NUMBER in .env."
+            "RETELL_FROM_NUMBER is not set. Buy a number in the Retell dashboard "
+            "(Phone Numbers -> Buy a number), then set RETELL_FROM_NUMBER in .env and "
+            "restart the API. To dial from an existing Twilio number instead, see "
+            "phase2.md — that path needs a Twilio Elastic SIP Trunk first."
         )
 
     prompt = system_prompt_override or agent.system_prompt

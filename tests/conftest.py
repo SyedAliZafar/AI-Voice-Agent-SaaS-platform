@@ -4,12 +4,15 @@ and a mock voice platform adapter so tests never hit real Retell/Vapi APIs.
 
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from jose import jwt
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.config import get_settings
 from backend.database import get_db
 from backend.main import app
 from backend.models.base import Base
@@ -55,6 +58,38 @@ def tenant_id() -> uuid.UUID:
     return uuid.uuid4()
 
 
+@pytest.fixture
+def other_tenant_id() -> uuid.UUID:
+    """A second tenant, for asserting cross-tenant isolation (ADR-001)."""
+    return uuid.uuid4()
+
+
+def make_token(tenant_id: uuid.UUID) -> str:
+    """Mint a bearer token the way backend/api/deps.py expects to receive one."""
+    settings = get_settings()
+    now = datetime.now(UTC)
+    return jwt.encode(
+        {
+            "tenant_id": str(tenant_id),
+            "sub": f"test-user@{tenant_id}",
+            "iat": now,
+            "exp": now + timedelta(hours=1),
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+@pytest.fixture
+def auth_headers(tenant_id: uuid.UUID) -> dict[str, str]:
+    return {"Authorization": f"Bearer {make_token(tenant_id)}"}
+
+
+@pytest.fixture
+def other_auth_headers(other_tenant_id: uuid.UUID) -> dict[str, str]:
+    return {"Authorization": f"Bearer {make_token(other_tenant_id)}"}
+
+
 class MockVoicePlatformAdapter:
     """Drop-in replacement for RetellAdapter/VapiAdapter in tests."""
 
@@ -68,7 +103,11 @@ class MockVoicePlatformAdapter:
         pass
 
     def parse_webhook(self, payload: dict) -> dict:
-        return {"event": payload.get("event", "unknown"), "call_id": "mock-call", "transcript": None}
+        return {
+            "event": payload.get("event", "unknown"),
+            "call_id": "mock-call",
+            "transcript": None,
+        }
 
 
 @pytest.fixture

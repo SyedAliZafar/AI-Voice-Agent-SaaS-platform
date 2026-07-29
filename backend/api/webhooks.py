@@ -3,6 +3,16 @@
 CRITICAL: these must respond in <200ms. Do the minimum synchronously
 (create/update the Call row, publish to Redis), then enqueue everything
 else (transcript processing, sentiment, CRM sync) as Celery tasks.
+
+AUTH: deliberately NOT behind Depends(get_current_tenant) — Retell/Vapi call these
+and cannot send our JWT. They are unauthenticated by necessity, which is safe today
+only because they resolve calls by the platform's own external_id and no-op on
+anything they can't match (see call_service's module docstring).
+
+TODO before these are publicly reachable: verify the platform signature header on
+each request (Retell signs with the account key; Vapi with a configured secret).
+Without that, anyone who learns the tunnel URL can forge call events. Tracked as a
+Phase 0 follow-up — it becomes load-bearing the moment a tunnel is opened.
 """
 
 from fastapi import APIRouter, Depends, Request

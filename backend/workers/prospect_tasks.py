@@ -72,7 +72,9 @@ async def _research(prospect_id: str) -> None:
     pid = uuid.UUID(prospect_id)
 
     async with AsyncSessionLocal() as db:
-        prospect = await prospect_service.get_prospect(db, pid)
+        # Unscoped is correct here: this task is driven by a prospect_id the discovery
+        # pipeline produced, not by an HTTP caller, so there's no tenant to scope to.
+        prospect = await prospect_service.get_prospect_unscoped(db, pid)
         if not prospect:
             return
         name, website, address = prospect.name, prospect.website, prospect.address

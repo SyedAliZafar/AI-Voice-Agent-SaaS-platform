@@ -6,10 +6,7 @@ import { CallTable } from "@/components/CallTable";
 import { CallsIcon, SearchIcon } from "@/components/icons";
 import { Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
-import { DEMO_TENANT_ID } from "@/lib/constants";
 import { Call } from "@/lib/types";
-
-const TENANT_ID = DEMO_TENANT_ID;
 
 const FILTERS: { value: "all" | Call["status"]; label: string }[] = [
   { value: "all", label: "All" },
@@ -27,7 +24,7 @@ export default function CallsPage() {
 
   useEffect(() => {
     api
-      .get<Call[]>("/calls", { params: { tenant_id: TENANT_ID, limit: 100 } })
+      .get<Call[]>("/calls", { params: { limit: 100 } })
       .then((res) => setCalls(res.data))
       .catch(() => setCalls([]))
       .finally(() => setLoading(false));

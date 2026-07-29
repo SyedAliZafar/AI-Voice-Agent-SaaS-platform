@@ -7,7 +7,7 @@ import { PromptEditor } from "@/components/PromptEditor";
 import { ArrowLeftIcon, PhoneIcon, SparkleIcon } from "@/components/icons";
 import { TextInput } from "@/components/form";
 import { Badge, Button, Card, Skeleton } from "@/components/ui";
-import { api } from "@/lib/api";
+import { api, getApiErrorMessage } from "@/lib/api";
 import { OBJECTIVE_LABELS, type CampaignIntake } from "@/lib/builder";
 import { Agent } from "@/lib/types";
 
@@ -60,10 +60,7 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
       });
       setCallResult(res.data);
     } catch (err) {
-      const message =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
-        "Failed to place call. Check the backend logs.";
-      setCallError(message);
+      setCallError(getApiErrorMessage(err, "Failed to place call. Check the backend logs."));
     } finally {
       setCalling(false);
     }

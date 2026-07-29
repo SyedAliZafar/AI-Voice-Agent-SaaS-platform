@@ -21,7 +21,9 @@ async def test_place_test_call_requires_from_number(db_session, tenant_id):
     with patch("backend.services.test_call_service.settings") as mock_settings:
         mock_settings.retell_from_number = ""
         with pytest.raises(test_call_service.TestCallError, match="RETELL_FROM_NUMBER"):
-            await test_call_service.place_test_call(db_session, agent.id, "+491701234567")
+            await test_call_service.place_test_call(
+                db_session, agent.id, tenant_id, "+491701234567"
+            )
 
 
 @pytest.mark.asyncio
@@ -31,7 +33,7 @@ async def test_place_test_call_rejects_non_retell_agent(db_session, tenant_id):
     )
 
     with pytest.raises(test_call_service.TestCallError, match="Retell agents only"):
-        await test_call_service.place_test_call(db_session, agent.id, "+491701234567")
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
 
 @pytest.mark.asyncio
@@ -52,7 +54,9 @@ async def test_place_test_call_provisions_and_caches_retell_ids(db_session, tena
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
 
-        result = await test_call_service.place_test_call(db_session, agent.id, "+491701234567")
+        result = await test_call_service.place_test_call(
+            db_session, agent.id, tenant_id, "+491701234567"
+        )
 
     assert result == {"call_id": "call_abc", "from_number": "+15551234567", "status": "dialing"}
     mock_adapter.create_llm.assert_awaited_once_with("Pitch v1")
@@ -62,7 +66,7 @@ async def test_place_test_call_provisions_and_caches_retell_ids(db_session, tena
     )
 
     # ids are cached on the agent for reuse
-    refreshed = await agent_service.get_agent(db_session, agent.id)
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
     assert refreshed.voice_config["retell"] == {"llm_id": "llm_123", "agent_id": "agent_ext_123"}
 
     # a Call row is created immediately (status in_progress), so outbound calls
@@ -93,7 +97,7 @@ async def test_place_test_call_reuses_cached_ids_and_updates_prompt(db_session, 
     ):
         mock_settings.retell_from_number = "+15551234567"
 
-        await test_call_service.place_test_call(db_session, agent.id, "+491701234567")
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
     mock_adapter.update_llm.assert_awaited_once_with("llm_existing", "Pitch v2")
     mock_adapter.create_llm.assert_not_awaited()
@@ -129,6 +133,7 @@ async def test_place_test_call_override_does_not_persist_to_agent(db_session, te
         await test_call_service.place_test_call(
             db_session,
             agent.id,
+            tenant_id,
             "+491701234567",
             system_prompt_override="Base script\n[COMPANY BRIEF] personalized for Acme",
         )
@@ -137,5 +142,5 @@ async def test_place_test_call_override_does_not_persist_to_agent(db_session, te
         "Base script\n[COMPANY BRIEF] personalized for Acme"
     )
 
-    refreshed = await agent_service.get_agent(db_session, agent.id)
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
     assert refreshed.system_prompt == "Base script"  # unchanged in the DB

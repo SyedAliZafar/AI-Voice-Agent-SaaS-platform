@@ -24,7 +24,7 @@ async def test_create_outbound_call_record_sets_in_progress(db_session, tenant_i
     assert call.tenant_id == tenant_id
     assert call.agent_id == agent_id
 
-    fetched = await call_service.get_call(db_session, call.id)
+    fetched = await call_service.get_call(db_session, call.id, tenant_id)
     assert fetched is not None
     assert fetched.external_id == "retell_call_1"
 
@@ -37,7 +37,7 @@ async def test_handle_transcript_update_creates_transcript_for_known_call(db_ses
 
     await call_service.handle_transcript_update(db_session, "retell_call_2", "Hello there")
 
-    transcript = await call_service.get_transcript(db_session, call.id)
+    transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
     assert transcript is not None
     assert transcript.full_text == "Hello there"
 
@@ -50,7 +50,7 @@ async def test_handle_transcript_update_updates_existing_transcript(db_session, 
     await call_service.handle_transcript_update(db_session, "retell_call_3", "First")
     await call_service.handle_transcript_update(db_session, "retell_call_3", "First and second")
 
-    transcript = await call_service.get_transcript(db_session, call.id)
+    transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
     assert transcript.full_text == "First and second"
 
 
@@ -71,7 +71,7 @@ async def test_handle_call_ended_marks_resolved_and_sets_duration(db_session, te
 
     await call_service.handle_call_ended(db_session, "retell_call_4")
 
-    updated = await call_service.get_call(db_session, call.id)
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
     assert updated.status == "resolved"
     assert updated.duration_sec >= 42
 

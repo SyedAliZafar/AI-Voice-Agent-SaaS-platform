@@ -110,13 +110,31 @@ async def list_prospects(
     return list(result.scalars().all())
 
 
-async def get_prospect(db: AsyncSession, prospect_id: uuid.UUID) -> Prospect | None:
+async def get_prospect_unscoped(db: AsyncSession, prospect_id: uuid.UUID) -> Prospect | None:
+    """Tenant-blind lookup — ONLY for trusted internal callers (Celery tasks acting on a
+    prospect_id the system itself produced, and the mark_* helpers below).
+
+    Never call this from a router: a prospect_id arriving over HTTP is attacker-controlled
+    and must go through get_prospect() so ADR-001 isolation holds.
+    """
     result = await db.execute(select(Prospect).where(Prospect.id == prospect_id))
     return result.scalar_one_or_none()
 
 
+async def get_prospect(
+    db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID
+) -> Prospect | None:
+    """Fetch one prospect, scoped to its tenant (ADR-001). This is the router-facing
+    lookup — another tenant's prospect reads as None so callers 404 rather than 403.
+    """
+    result = await db.execute(
+        select(Prospect).where(Prospect.id == prospect_id, Prospect.tenant_id == tenant_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def mark_research_running(db: AsyncSession, prospect_id: uuid.UUID) -> None:
-    prospect = await get_prospect(db, prospect_id)
+    prospect = await get_prospect_unscoped(db, prospect_id)
     if not prospect:
         return
     prospect.research_status = "running"
@@ -127,7 +145,7 @@ async def mark_research_running(db: AsyncSession, prospect_id: uuid.UUID) -> Non
 async def mark_research_ready(
     db: AsyncSession, prospect_id: uuid.UUID, research: CompanyResearch
 ) -> None:
-    prospect = await get_prospect(db, prospect_id)
+    prospect = await get_prospect_unscoped(db, prospect_id)
     if not prospect:
         return
     prospect.research = research.model_dump()
@@ -137,7 +155,7 @@ async def mark_research_ready(
 
 
 async def mark_research_failed(db: AsyncSession, prospect_id: uuid.UUID, error: str) -> None:
-    prospect = await get_prospect(db, prospect_id)
+    prospect = await get_prospect_unscoped(db, prospect_id)
     if not prospect:
         return
     prospect.research_status = "failed"
@@ -146,9 +164,9 @@ async def mark_research_failed(db: AsyncSession, prospect_id: uuid.UUID, error: 
 
 
 async def set_outreach_status(
-    db: AsyncSession, prospect_id: uuid.UUID, status: str
+    db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID, status: str
 ) -> Prospect | None:
-    prospect = await get_prospect(db, prospect_id)
+    prospect = await get_prospect(db, prospect_id, tenant_id)
     if not prospect:
         return None
     prospect.outreach_status = status
@@ -157,8 +175,8 @@ async def set_outreach_status(
     return prospect
 
 
-async def record_call(db: AsyncSession, prospect_id: uuid.UUID) -> None:
-    prospect = await get_prospect(db, prospect_id)
+async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+    prospect = await get_prospect(db, prospect_id, tenant_id)
     if not prospect:
         return
     prospect.call_count += 1

@@ -71,16 +71,22 @@ class RetellAdapter(VoicePlatformAdapter):
             )
             resp.raise_for_status()
 
-    async def import_twilio_number(self, number: str, twilio_sid: str, twilio_token: str) -> None:
+    async def import_twilio_number(
+        self,
+        number: str,
+        termination_uri: str,
+        sip_trunk_username: str,
+        sip_trunk_password: str,
+    ) -> None:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{BASE_URL}/import-phone-number",
                 headers=self.headers,
                 json={
                     "phone_number": number,
-                    "termination_uri": "",
-                    "sip_trunk_auth_username": twilio_sid,
-                    "sip_trunk_auth_password": twilio_token,
+                    "termination_uri": termination_uri,
+                    "sip_trunk_auth_username": sip_trunk_username,
+                    "sip_trunk_auth_password": sip_trunk_password,
                 },
             )
             resp.raise_for_status()

@@ -48,7 +48,13 @@ class VoicePlatformAdapter(ABC):
         """Push an updated system prompt to an already-provisioned platform LLM."""
         raise NotImplementedError(f"{type(self).__name__} does not support update_llm")
 
-    async def import_twilio_number(self, number: str, twilio_sid: str, twilio_token: str) -> None:
+    async def import_twilio_number(
+        self,
+        number: str,
+        termination_uri: str,
+        sip_trunk_username: str,
+        sip_trunk_password: str,
+    ) -> None:
         """One-time setup: import a Twilio number so the platform can dial out from it."""
         raise NotImplementedError(f"{type(self).__name__} does not support import_twilio_number")
 

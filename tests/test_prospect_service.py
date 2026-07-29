@@ -60,7 +60,7 @@ async def test_upsert_does_not_clobber_research_or_outreach_state(db_session, te
 
     research = CompanyResearch(summary="Great clinic", industry="Healthcare")
     await prospect_service.mark_research_ready(db_session, prospect.id, research)
-    await prospect_service.set_outreach_status(db_session, prospect.id, "reached")
+    await prospect_service.set_outreach_status(db_session, prospect.id, tenant_id, "reached")
 
     # Re-discovering the same place should not reset research/outreach.
     [again] = await prospect_service.upsert_from_places(db_session, tenant_id, [place], "clinics")
@@ -88,18 +88,18 @@ async def test_research_status_transitions(db_session, tenant_id):
     assert prospect.research_status == "pending"
 
     await prospect_service.mark_research_running(db_session, prospect.id)
-    running = await prospect_service.get_prospect(db_session, prospect.id)
+    running = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert running.research_status == "running"
 
     await prospect_service.mark_research_failed(db_session, prospect.id, "scrape timeout")
-    failed = await prospect_service.get_prospect(db_session, prospect.id)
+    failed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert failed.research_status == "failed"
     assert failed.research_error == "scrape timeout"
 
     await prospect_service.mark_research_ready(
         db_session, prospect.id, CompanyResearch(summary="Recovered")
     )
-    ready = await prospect_service.get_prospect(db_session, prospect.id)
+    ready = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert ready.research_status == "ready"
     assert ready.research_error is None  # cleared on success
     assert ready.research["summary"] == "Recovered"
@@ -111,9 +111,9 @@ async def test_record_call_increments_count_and_flips_not_reached(db_session, te
     [prospect] = await prospect_service.upsert_from_places(db_session, tenant_id, [place], "q")
     assert prospect.outreach_status == "not_reached"
 
-    await prospect_service.record_call(db_session, prospect.id)
+    await prospect_service.record_call(db_session, prospect.id, tenant_id)
 
-    updated = await prospect_service.get_prospect(db_session, prospect.id)
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert updated.call_count == 1
     assert updated.outreach_status == "reached"
     assert updated.last_called_at is not None

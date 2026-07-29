@@ -1,8 +1,16 @@
 # Phase 2 — Outbound Test Call: from-number setup
 
-Status: **blocked on a manual account-level decision**, not code. This picks up right after
-the Agent Builder + `/agents/{id}/test-call` endpoint (see `CONTEXT.md` for architecture,
-`backend/services/test_call_service.py` for the call-placement logic).
+Status: **code side resolved; blocked on one manual account action** (buy a Retell number).
+This picks up right after the Agent Builder + `/agents/{id}/test-call` endpoint (see
+`CONTEXT.md` for architecture, `backend/services/test_call_service.py` for the
+call-placement logic).
+
+> **Decision (superseding the "two ways forward" below): take Option A.**
+> The SIP-trunk credential bug described under "Root cause" has since been *fixed* in code
+> (see "Resolution" at the bottom), so Option B now works — but it still requires manual
+> Twilio Console trunk setup for no benefit over simply buying a number inside Retell.
+> Option A is the path; Option B is kept working and documented as a fallback for anyone
+> who later needs to keep an existing Twilio number.
 
 ## What happened
 
@@ -85,3 +93,36 @@ Nothing else in the test-call path has changed since the last verification pass 
 `pytest`, `npm run build` all green — see prior session). Once a from-number is live, the
 remaining unverified step is simply: does the phone actually ring and does Retell speak the
 agent's `system_prompt`. No code should need to change for that — it's a live-call smoke test.
+
+## Resolution — the SIP-trunk bug is fixed (Option B now works, but is not the chosen path)
+
+`RetellAdapter.import_twilio_number()` was sending two wrong things: an empty
+`termination_uri`, and the Twilio **Account SID/Auth Token** in the
+`sip_trunk_auth_username`/`sip_trunk_auth_password` fields. Retell's
+`/import-phone-number` needs the trunk's termination URI plus credentials from a
+**Credential List** created inside the Twilio Elastic SIP Trunk — a different credential
+type entirely. That mismatch is what produced the opaque
+`{"status":"error","message":"Internal Server Error"}`.
+
+Fixed by threading three real values through, backed by new settings in `backend/config.py`
+(`twilio_termination_uri`, `retell_sip_trunk_username`, `retell_sip_trunk_password`):
+
+- `backend/services/retell_adapter.py` — `import_twilio_number(number, termination_uri,
+  sip_trunk_username, sip_trunk_password)`; no longer takes the Twilio API credentials.
+- `backend/services/voice_platform.py` — base signature updated to match.
+- `scripts/setup_retell_number.py` — validates all three are set and prints the exact
+  Twilio Console steps if they aren't. The Twilio SID/token are still read, but only to
+  *look up* the number via the Twilio REST API.
+
+These fields map 1:1 to Retell's own "Connect to your number via SIP trunking" dialog
+(Phone Number / Termination URI / SIP Trunk User Name / SIP Trunk Password).
+
+**This code is kept but is not on the critical path.** Option A (buy a Retell number)
+requires none of it. Only return to `setup_retell_number.py` if there's a concrete reason
+to keep using the existing Twilio number `+12526233516`.
+
+## Superseded by
+The larger architectural direction has moved on — see the Phase 0 plan (de-risking before
+the Retell Custom LLM WebSocket migration). Getting a phone to ring on this hosted-LLM path
+is Task 1 of that plan: it is the baseline the WebSocket work will be compared against, and
+the hosted-LLM path stays working as the fallback throughout that migration.

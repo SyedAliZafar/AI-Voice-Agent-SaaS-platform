@@ -45,13 +45,27 @@ async def list_calls(
     return list(result.scalars().all())
 
 
-async def get_call(db: AsyncSession, call_id: uuid.UUID) -> Call | None:
-    result = await db.execute(select(Call).where(Call.id == call_id))
+async def get_call(db: AsyncSession, call_id: uuid.UUID, tenant_id: uuid.UUID) -> Call | None:
+    """Fetch one call, scoped to its tenant (ADR-001). Another tenant's call reads as
+    None so callers 404 rather than 403, keeping ids non-enumerable.
+    """
+    result = await db.execute(select(Call).where(Call.id == call_id, Call.tenant_id == tenant_id))
     return result.scalar_one_or_none()
 
 
-async def get_transcript(db: AsyncSession, call_id: uuid.UUID) -> Transcript | None:
-    result = await db.execute(select(Transcript).where(Transcript.call_id == call_id))
+async def get_transcript(
+    db: AsyncSession, call_id: uuid.UUID, tenant_id: uuid.UUID
+) -> Transcript | None:
+    """Fetch a call's transcript, scoped via the parent call's tenant.
+
+    Transcript has no tenant_id of its own, so isolation is enforced by joining to Call —
+    a transcript is only reachable through a call the tenant owns.
+    """
+    result = await db.execute(
+        select(Transcript)
+        .join(Call, Transcript.call_id == Call.id)
+        .where(Transcript.call_id == call_id, Call.tenant_id == tenant_id)
+    )
     return result.scalar_one_or_none()
 
 
@@ -107,7 +121,7 @@ async def handle_transcript_update(
         )
         return
 
-    existing = await get_transcript(db, call.id)
+    existing = await get_transcript(db, call.id, call.tenant_id)
     if existing:
         existing.full_text = transcript_text
     else:

@@ -1,12 +1,25 @@
 """One-time setup: import your Twilio number into Retell so agents can place
 outbound test calls from it (see backend/services/test_call_service.py).
 
+NOT the recommended path — see phase2.md. Buying a number directly in the Retell
+dashboard needs none of this (no SIP trunk, no Twilio Console setup) and is what
+RETELL_FROM_NUMBER is normally set from. Use this script only if you specifically
+need to keep dialing from an existing Twilio number.
+
 Usage:
     uv run python scripts/setup_retell_number.py
 
-Reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / RETELL_API_KEY from .env via
-backend.config.get_settings(). Requires TWILIO_ACCOUNT_SID's phone number to
-already exist in your Twilio account.
+Reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / RETELL_API_KEY / TWILIO_TERMINATION_URI /
+RETELL_SIP_TRUNK_USERNAME / RETELL_SIP_TRUNK_PASSWORD from .env via
+backend.config.get_settings(). Requires TWILIO_ACCOUNT_SID's phone number to already
+exist in your Twilio account, AND an Elastic SIP Trunk already set up in the Twilio
+Console with that number assigned to it (see the TWILIO_TERMINATION_URI error message
+below for the exact steps) — this script cannot create the trunk for you.
+
+Note: TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN here are only used to look up your number via
+the Twilio REST API. They are NOT the SIP trunk credentials Retell needs — those are a
+separate username/password you create inside the trunk's Credential List
+(RETELL_SIP_TRUNK_USERNAME/PASSWORD below).
 
 What it does:
   1. Looks up your Twilio number(s) and confirms Voice capability.
@@ -56,6 +69,25 @@ async def main() -> int:
     if not settings.retell_api_key:
         print("ERROR: RETELL_API_KEY must be set in .env", file=sys.stderr)
         return 1
+    if not settings.twilio_termination_uri:
+        print(
+            "ERROR: TWILIO_TERMINATION_URI must be set in .env.\n"
+            "Create an Elastic SIP Trunk in the Twilio Console (Elastic SIP Trunking →\n"
+            "Trunks → Create new Trunk), add your number to it under 'Origination', and\n"
+            "copy its trunk domain (looks like 'yourtrunk.pstn.twilio.com') into .env as\n"
+            "TWILIO_TERMINATION_URI.",
+            file=sys.stderr,
+        )
+        return 1
+    if not settings.retell_sip_trunk_username or not settings.retell_sip_trunk_password:
+        print(
+            "ERROR: RETELL_SIP_TRUNK_USERNAME / RETELL_SIP_TRUNK_PASSWORD must be set in .env.\n"
+            "These are NOT your Twilio account SID/token — they're a username/password *you\n"
+            "choose* inside the trunk's Credential List (Twilio Console → your trunk →\n"
+            "Authentication → Credential Lists → create one). Put the same values in .env.",
+            file=sys.stderr,
+        )
+        return 1
 
     print("Looking up Twilio numbers...")
     try:
@@ -80,7 +112,10 @@ async def main() -> int:
     adapter = RetellAdapter()
     try:
         await adapter.import_twilio_number(
-            number, settings.twilio_account_sid, settings.twilio_auth_token
+            number,
+            settings.twilio_termination_uri,
+            settings.retell_sip_trunk_username,
+            settings.retell_sip_trunk_password,
         )
     except httpx.HTTPStatusError as exc:
         print(f"ERROR: Retell import failed: {exc.response.text}", file=sys.stderr)

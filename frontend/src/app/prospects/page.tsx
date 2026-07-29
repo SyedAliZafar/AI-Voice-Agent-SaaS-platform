@@ -5,11 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Field, TextInput } from "@/components/form";
 import { RefreshIcon, SearchIcon, TargetIcon } from "@/components/icons";
 import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
-import { api } from "@/lib/api";
-import { DEMO_TENANT_ID } from "@/lib/constants";
+import { api, getApiErrorMessage } from "@/lib/api";
 import { Agent, OutreachStatus, Prospect, ResearchStatus } from "@/lib/types";
-
-const TENANT_ID = DEMO_TENANT_ID;
 
 const RESEARCH_META: Record<ResearchStatus, { label: string; tone: "neutral" | "info" | "success" | "danger" }> = {
   pending: { label: "Queued", tone: "neutral" },
@@ -43,7 +40,7 @@ export default function ProspectsPage() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchProspects = useCallback(async () => {
-    const res = await api.get<Prospect[]>("/prospects", { params: { tenant_id: TENANT_ID } });
+    const res = await api.get<Prospect[]>("/prospects");
     setProspects(res.data);
     return res.data;
   }, []);
@@ -54,7 +51,7 @@ export default function ProspectsPage() {
       .finally(() => setLoading(false));
 
     api
-      .get<Agent[]>("/agents", { params: { tenant_id: TENANT_ID } })
+      .get<Agent[]>("/agents")
       .then((res) => {
         setAgents(res.data);
         const retellAgent = res.data.find((a) => a.platform === "retell");
@@ -91,7 +88,6 @@ export default function ProspectsPage() {
       await api.post(
         "/prospects/discover",
         { query, location: location || null, radius_m: 20000, limit: 20 },
-        { params: { tenant_id: TENANT_ID } },
       );
       // Discovery + research run in the background — refresh shortly after to catch new rows.
       setTimeout(() => fetchProspects().catch(() => {}), 1500);
@@ -130,9 +126,7 @@ export default function ProspectsPage() {
       }));
       fetchProspects().catch(() => {});
     } catch (err) {
-      const message =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
-        "Failed to place call.";
+      const message = getApiErrorMessage(err, "Failed to place call.");
       setCallFeedback((prev) => ({ ...prev, [prospect.id]: message }));
     } finally {
       setCallingId(null);
