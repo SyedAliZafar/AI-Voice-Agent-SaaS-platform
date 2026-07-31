@@ -1,6 +1,6 @@
 """Agent configuration models — the core product entity."""
 
-from sqlalchemy import JSON, ForeignKey, String, Text
+from sqlalchemy import JSON, Boolean, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,6 +14,10 @@ class Agent(Base, UUIDMixin, TimestampMixin, TenantMixin):
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     voice_config: Mapped[dict] = mapped_column(JSON, default=dict)  # voice_id, speed, pitch
     platform: Mapped[str] = mapped_column(String(50), default="retell")  # retell | vapi
+    # When True (Retell agents only), test calls run over our Custom LLM WebSocket
+    # (DeepSeek + server-side tools, ADR-003) instead of Retell's hosted LLM. See
+    # backend/services/test_call_service.py and backend/api/retell_ws.py.
+    use_custom_llm: Mapped[bool] = mapped_column(Boolean, default=False)
 
     tenant: Mapped["Tenant"] = relationship(back_populates="agents")  # noqa: F821
     phone_numbers: Mapped[list["PhoneNumber"]] = relationship(back_populates="agent")

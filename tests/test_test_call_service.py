@@ -144,3 +144,133 @@ async def test_place_test_call_override_does_not_persist_to_agent(db_session, te
 
     refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
     assert refreshed.system_prompt == "Base script"  # unchanged in the DB
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tenant_id):
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "custom_agent_1"
+    mock_adapter.create_outbound_call.return_value = "call_custom_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+
+        result = await test_call_service.place_test_call(
+            db_session, agent.id, tenant_id, "+491701234567"
+        )
+
+    assert result == {
+        "call_id": "call_custom_1",
+        "from_number": "+15551234567",
+        "status": "dialing",
+    }
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once_with(
+        name="SDR",
+        llm_websocket_url="wss://abc123.trycloudflare.com/llm-websocket",
+        voice_id="11labs-Adrian",
+    )
+    mock_adapter.create_llm.assert_not_awaited()
+    mock_adapter.create_outbound_call.assert_awaited_once_with(
+        from_number="+15551234567",
+        to_number="+491701234567",
+        agent_external_id="custom_agent_1",
+    )
+
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.voice_config["retell_custom"] == {
+        "agent_id": "custom_agent_1",
+        "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+    }
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_requires_public_base_url(db_session, tenant_id):
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+
+    with patch("backend.services.test_call_service.settings") as mock_settings:
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.public_base_url = ""
+        with pytest.raises(test_call_service.TestCallError, match="PUBLIC_BASE_URL"):
+            await test_call_service.place_test_call(
+                db_session, agent.id, tenant_id, "+491701234567"
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_rejects_prompt_override(db_session, tenant_id):
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+
+    with patch("backend.services.test_call_service.settings") as mock_settings:
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        with pytest.raises(test_call_service.TestCallError, match="use_custom_llm"):
+            await test_call_service.place_test_call(
+                db_session,
+                agent.id,
+                tenant_id,
+                "+491701234567",
+                system_prompt_override="Personalized for Acme",
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_session, tenant_id):
+    """A cached agent_id from a previous (now-dead) tunnel URL must trigger
+    re-provisioning rather than silently pointing Retell at a stale websocket.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {
+        "retell_custom": {
+            "agent_id": "stale_agent",
+            "ws_url": "wss://old-tunnel.trycloudflare.com/llm-websocket",
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "fresh_agent"
+    mock_adapter.create_outbound_call.return_value = "call_fresh"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://new-tunnel.trycloudflare.com"
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once_with(
+        name="SDR",
+        llm_websocket_url="wss://new-tunnel.trycloudflare.com/llm-websocket",
+        voice_id="11labs-Adrian",
+    )
+    mock_adapter.create_outbound_call.assert_awaited_once_with(
+        from_number="+15551234567",
+        to_number="+491701234567",
+        agent_external_id="fresh_agent",
+    )

@@ -38,7 +38,7 @@ async def create_agent(
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def get_agent(
-    agent_id: uuid.UUID,
+    agent_id: uuid.UUID,    
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):

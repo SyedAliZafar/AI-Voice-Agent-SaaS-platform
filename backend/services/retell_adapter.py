@@ -52,6 +52,31 @@ class RetellAdapter(VoicePlatformAdapter):
             resp.raise_for_status()
             return resp.json()["agent_id"]
 
+    async def create_agent_with_custom_llm(
+        self, name: str, llm_websocket_url: str, voice_id: str
+    ) -> str:
+        """Provision an agent backed by OUR Custom LLM WebSocket (ADR-003) — Retell dials
+        `llm_websocket_url` (appending the call's own call_id itself, per Retell's
+        protocol: docs.retellai.com/api-references/llm-websocket) and relays transcript
+        turns to backend/api/retell_ws.py, which answers using DeepSeek + server-side
+        tools. Contrast with create_agent_with_llm, which uses Retell's own hosted LLM.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}/create-agent",
+                headers=self.headers,
+                json={
+                    "agent_name": name,
+                    "response_engine": {
+                        "type": "custom-llm",
+                        "llm_websocket_url": llm_websocket_url,
+                    },
+                    "voice_id": voice_id,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["agent_id"]
+
     async def create_llm(self, system_prompt: str) -> str:
         async with httpx.AsyncClient() as client:
             resp = await client.post(

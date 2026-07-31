@@ -1,12 +1,19 @@
 """Outbound "test call" — dial the operator's own phone so they can hear an
-agent's generated sales script live.
+agent's live behavior.
 
-Uses Retell's built-in LLM (response_engine "retell-llm") rather than our
-custom-LLM websocket, so no tunnel/WS server is required to hear the pitch.
-DeepSeek + server-side tools are NOT exercised by this path — see ADR-003 for
-the real call-time brain, which this intentionally bypasses for a quick,
-low-friction way to audition a script. ADR-002: all Retell HTTP stays behind
-the adapter; this service only orchestrates.
+Two provisioning paths, chosen by `agent.use_custom_llm`:
+
+- **Hosted LLM (default, `use_custom_llm=False`)** — Retell's built-in LLM
+  (response_engine "retell-llm") answers. No tunnel/WS server required. DeepSeek +
+  server-side tools are NOT exercised — see ADR-003 for the real call-time brain,
+  which this path intentionally bypasses for a quick, low-friction way to audition
+  a script.
+- **Custom LLM (`use_custom_llm=True`)** — Retell relays the conversation to OUR
+  websocket (backend/api/retell_ws.py), which answers via DeepSeek + server-side
+  tools (ADR-003, the real target architecture). Requires PUBLIC_BASE_URL (a public
+  tunnel) to be set.
+
+ADR-002: all Retell HTTP stays behind the adapter; this service only orchestrates.
 """
 
 import uuid
@@ -14,6 +21,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
+from backend.models.agent import Agent
 from backend.services import agent_service, call_service
 from backend.services.retell_adapter import RetellAdapter
 
@@ -31,12 +39,13 @@ async def place_test_call(
     to_number: str,
     system_prompt_override: str | None = None,
 ) -> dict:
-    """Place an outbound call for `agent`. By default reads/pushes `agent.system_prompt`.
+    """Place an outbound call for `agent`.
 
     `system_prompt_override` lets a caller (e.g. prospect_service's per-company call)
-    push a *personalized* variant (base script + [COMPANY BRIEF]) to Retell for just this
-    call, without overwriting the agent's base `system_prompt` in the database — the
-    campaign script stays the source of truth; personalization is call-time only.
+    push a *personalized* variant (base script + [COMPANY BRIEF]) for just this call,
+    without overwriting the agent's base `system_prompt` in the database — the campaign
+    script stays the source of truth; personalization is call-time only. Only supported
+    on the hosted-LLM path today (see `_provision_custom_llm_agent`).
 
     tenant_id is required: this endpoint spends real telephony money on the caller's
     Retell/Twilio account, so it must never dial on behalf of an agent the caller
@@ -59,33 +68,20 @@ async def place_test_call(
             "phase2.md — that path needs a Twilio Elastic SIP Trunk first."
         )
 
-    prompt = system_prompt_override or agent.system_prompt
-
     adapter = RetellAdapter()
-    retell_ids: dict = dict((agent.voice_config or {}).get("retell") or {})
 
-    if retell_ids.get("llm_id"):
-        await adapter.update_llm(retell_ids["llm_id"], prompt)
-    else:
-        retell_ids["llm_id"] = await adapter.create_llm(prompt)
-
-    if not retell_ids.get("agent_id"):
-        voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
-        retell_ids["agent_id"] = await adapter.create_agent_with_llm(
-            name=agent.name, llm_id=retell_ids["llm_id"], voice_id=voice_id
+    if agent.use_custom_llm:
+        agent_external_id = await _provision_custom_llm_agent(
+            db, adapter, agent, system_prompt_override
         )
-
-    # Persist the external ids so subsequent test calls reuse them instead of
-    # re-provisioning, and so a prompt edit only needs an update, not a recreate.
-    new_voice_config = {**(agent.voice_config or {}), "retell": retell_ids}
-    agent.voice_config = new_voice_config
-    await db.commit()
-    await db.refresh(agent)
+    else:
+        prompt = system_prompt_override or agent.system_prompt
+        agent_external_id = await _provision_hosted_llm_agent(db, adapter, agent, prompt)
 
     call_id = await adapter.create_outbound_call(
         from_number=settings.retell_from_number,
         to_number=to_number,
-        agent_external_id=retell_ids["agent_id"],
+        agent_external_id=agent_external_id,
     )
 
     # Create the Call row now — we have agent_id/tenant_id here, which webhook
@@ -99,3 +95,84 @@ async def place_test_call(
         "from_number": settings.retell_from_number,
         "status": "dialing",
     }
+
+
+async def _provision_hosted_llm_agent(
+    db: AsyncSession, adapter: RetellAdapter, agent: Agent, prompt: str
+) -> str:
+    """Retell's own hosted LLM. Caches {llm_id, agent_id} under voice_config["retell"]
+    so a subsequent test call only needs a prompt update, not a recreate.
+    """
+    retell_ids: dict = dict((agent.voice_config or {}).get("retell") or {})
+
+    if retell_ids.get("llm_id"):
+        await adapter.update_llm(retell_ids["llm_id"], prompt)
+    else:
+        retell_ids["llm_id"] = await adapter.create_llm(prompt)
+
+    if not retell_ids.get("agent_id"):
+        voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
+        retell_ids["agent_id"] = await adapter.create_agent_with_llm(
+            name=agent.name, llm_id=retell_ids["llm_id"], voice_id=voice_id
+        )
+
+    agent.voice_config = {**(agent.voice_config or {}), "retell": retell_ids}
+    await db.commit()
+    await db.refresh(agent)
+    return retell_ids["agent_id"]
+
+
+async def _provision_custom_llm_agent(
+    db: AsyncSession,
+    adapter: RetellAdapter,
+    agent: Agent,
+    system_prompt_override: str | None,
+) -> str:
+    """OUR Custom LLM WebSocket (backend/api/retell_ws.py) answers instead of Retell's
+    hosted LLM — DeepSeek + server-side tools, ADR-003's actual target.
+
+    Unlike the hosted path, no prompt is pushed to Retell at provisioning time: the WS
+    handler reads Agent.system_prompt fresh from the DB per call. That means a
+    call-time system_prompt_override has nowhere to live yet for this path — rejected
+    explicitly below rather than silently ignored. (Tracked follow-up, not a bug: see
+    phase0.md's next-files list.)
+
+    Caches {agent_id, ws_url} under voice_config["retell_custom"], keyed on ws_url so a
+    tunnel restart (which changes PUBLIC_BASE_URL) is detected and re-provisions
+    automatically instead of silently pointing Retell at a dead websocket.
+    """
+    if system_prompt_override:
+        raise TestCallError(
+            "Personalized prompts (system_prompt_override) aren't supported yet for "
+            "use_custom_llm agents — the Custom LLM WebSocket reads Agent.system_prompt "
+            "directly at call time. Use a hosted-LLM agent for personalized/prospect calls "
+            "for now, or set agent.system_prompt directly instead of overriding per-call."
+        )
+
+    if not settings.public_base_url:
+        raise TestCallError(
+            "PUBLIC_BASE_URL is not set. use_custom_llm requires a public tunnel so Retell "
+            "can reach our websocket — start one (docker compose --profile tunnel up -d) "
+            "and set PUBLIC_BASE_URL to its https URL in .env."
+        )
+
+    ws_base = settings.public_base_url.replace("https://", "wss://").replace("http://", "ws://")
+    ws_url = f"{ws_base}/llm-websocket"
+
+    cached: dict = dict((agent.voice_config or {}).get("retell_custom") or {})
+
+    if cached.get("agent_id") and cached.get("ws_url") == ws_url:
+        return cached["agent_id"]
+
+    voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
+    agent_external_id = await adapter.create_agent_with_custom_llm(
+        name=agent.name, llm_websocket_url=ws_url, voice_id=voice_id
+    )
+
+    agent.voice_config = {
+        **(agent.voice_config or {}),
+        "retell_custom": {"agent_id": agent_external_id, "ws_url": ws_url},
+    }
+    await db.commit()
+    await db.refresh(agent)
+    return agent_external_id

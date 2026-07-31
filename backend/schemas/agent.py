@@ -14,12 +14,14 @@ class AgentCreate(BaseModel):
     system_prompt: str = ""
     voice_config: dict = Field(default_factory=dict)
     platform: str = "retell"
+    use_custom_llm: bool = False
 
 
 class AgentUpdate(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
     voice_config: dict | None = None
+    use_custom_llm: bool | None = None
 
 
 class AgentResponse(BaseModel):
@@ -28,6 +30,7 @@ class AgentResponse(BaseModel):
     system_prompt: str
     voice_config: dict
     platform: str
+    use_custom_llm: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}

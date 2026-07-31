@@ -69,7 +69,11 @@ async def get_transcript(
     return result.scalar_one_or_none()
 
 
-async def _get_call_by_external_id(db: AsyncSession, external_call_id: str) -> Call | None:
+async def get_call_by_external_id(db: AsyncSession, external_call_id: str) -> Call | None:
+    """Tenant-unscoped by necessity — used both by webhook handlers (no tenant context
+    yet) and backend/api/retell_ws.py (Retell's frames carry only its own call_id, no
+    auth). This is the resolution step that TURNS a bare call_id into a tenant/agent.
+    """
     result = await db.execute(select(Call).where(Call.external_id == external_call_id))
     return result.scalar_one_or_none()
 
@@ -113,7 +117,7 @@ async def handle_call_started(external_call_id: str, platform: str) -> None:
 async def handle_transcript_update(
     db: AsyncSession, external_call_id: str, transcript_text: str
 ) -> None:
-    call = await _get_call_by_external_id(db, external_call_id)
+    call = await get_call_by_external_id(db, external_call_id)
     if not call:
         logger.info(
             "transcript_update for unknown call, ignoring",
@@ -130,7 +134,7 @@ async def handle_transcript_update(
 
 
 async def handle_call_ended(db: AsyncSession, external_call_id: str) -> None:
-    call = await _get_call_by_external_id(db, external_call_id)
+    call = await get_call_by_external_id(db, external_call_id)
     if not call:
         logger.info(
             "call_ended for unknown call, ignoring",

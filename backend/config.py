@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     # (see scripts/setup_retell_number.py). Empty until then.
     retell_from_number: str = ""
     retell_default_voice_id: str = "11labs-Adrian"
+    # Our own public https URL (the dev tunnel's address, e.g. the cloudflared
+    # trycloudflare.com host — see docker-compose.yml's "tunnel" profile). Retell's
+    # Custom LLM WebSocket needs to dial wss://<this host>/llm-websocket, so this gets
+    # translated to wss:// when registering that URL with Retell. The quick tunnel's
+    # host changes every restart — update this and re-provision when that happens
+    # (backend/services/test_call_service.py detects the mismatch and re-provisions
+    # automatically the next time a call is placed).
+    public_base_url: str = ""
 
     # Telephony
     twilio_account_sid: str = ""

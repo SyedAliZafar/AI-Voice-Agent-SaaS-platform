@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api import agents, analytics, calls, prospects, webhooks, ws
+from backend.api import agents, analytics, calls, prospects, retell_ws, webhooks, ws
 from backend.config import get_settings
 from backend.middleware.logging import setup_logging
 
@@ -51,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(prospects.router, prefix="/api/prospects", tags=["prospects"])
     app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
     app.include_router(ws.router, tags=["websocket"])
+    app.include_router(retell_ws.router, tags=["websocket"])
 
     @app.get("/health")
     async def health():
