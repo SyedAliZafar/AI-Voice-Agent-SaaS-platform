@@ -110,32 +110,45 @@ Press **Sync status** on the Calls page (or `POST /api/calls/sync`) to pull auth
 state — status, duration, transcript, sentiment — straight from the voice platform for
 every still-in-progress call. See ADR-007 in `CONTEXT.md`.
 
-## Using DeepSeek instead of Retell's built-in LLM
+## Using a Custom LLM instead of Retell's built-in LLM
 
 On an agent's detail page, the **Conversation engine** card switches between:
 
-- **Retell built-in LLM** (default) — zero setup, no tunnel. DeepSeek and server-side
-  tools are *not* exercised.
-- **DeepSeek (custom LLM)** — Retell relays the conversation to our websocket
-  (`backend/api/retell_ws.py`), which answers with DeepSeek + server-side tools. Requires
-  `PUBLIC_BASE_URL` and a running tunnel, plus `DEEPSEEK_API_KEY`.
+- **Retell built-in LLM** (default) — zero setup, no tunnel. Server-side tools are *not*
+  exercised.
+- **Custom LLM** — Retell relays the conversation to our websocket
+  (`backend/api/retell_ws.py`), which answers with server-side tools plus whichever model
+  you pick in the **Model** dropdown that appears once this is selected (DeepSeek or
+  OpenAI, ADR-008 in `CONTEXT.md`). Requires `PUBLIC_BASE_URL` and a running tunnel, plus
+  that model's API key (`DEEPSEEK_API_KEY` or `OPENAI_API_KEY`) — a model whose provider
+  has no key set shows as disabled in the dropdown.
 
 Switching re-provisions the agent with Retell on the next test call automatically.
 
-**If the DeepSeek path "does nothing"** — the caller hears dead air and nothing appears in
-the logs — run:
+**If the custom-LLM path "does nothing"** — the caller hears dead air and nothing appears
+in the logs — run:
 
 ```bash
 uv run python scripts/check_custom_llm.py
 ```
 
-It walks the same chain Retell walks (config → tunnel → DeepSeek → websocket, ending with a
-real DeepSeek exchange over `wss://` from the public internet) and tells you which link is
+It walks the same chain Retell walks (config → tunnel → LLM → websocket, ending with a
+real completion over `wss://` from the public internet) and tells you which link is
 broken, without spending a phone call.
 
 The usual culprit is a stale `PUBLIC_BASE_URL`. **A dead tunnel still reports `Up` in
 `docker compose ps`** — it sits in a silent reconnect loop. Trust
 `curl $PUBLIC_BASE_URL/health`, not the container status.
+
+## Trying an agent without a phone call
+
+Click **Try in sandbox** on an agent's detail page (`/agents/{id}/sandbox`) to chat with
+its persona over text — no `RETELL_FROM_NUMBER`, no tunnel, no telephony spend. Edit the
+system prompt in the pane on the right and it's used for your very next message, whether
+or not you've clicked "Save prompt" yet; that button writes the draft back to the agent.
+Server-side tools (`book_appointment`, `create_lead`, ...) are off by default — they hit
+real integrations — flip "Run server-side tools" on to actually exercise the tool-calling
+loop.
 
 ## Tests
 

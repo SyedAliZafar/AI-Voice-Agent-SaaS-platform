@@ -25,7 +25,7 @@ and exposes a dashboard for real-time call monitoring, analytics, and agent conf
 | Object storage | S3 / MinIO | Call recordings, transcript exports |
 | Frontend | Next.js 14 + React 18 + Tailwind | SSR dashboard, WebSocket live call view |
 | Voice platforms | Retell AI SDK, Vapi AI SDK | Telephony, STT/TTS, call orchestration |
-| LLM | DeepSeek API (OpenAI-compatible) | Conversation engine, intent detection, function calling |
+| LLM | DeepSeek + OpenAI (both OpenAI-compatible), per-agent (ADR-008) | Conversation engine, intent detection, function calling |
 | Auth | Clerk or Auth0 | Multi-tenant auth with org-level roles |
 | Infra | Docker Compose (dev), AWS ECS (prod) | Container-first deployment |
 
@@ -73,11 +73,12 @@ voiceagent/
 │   │   ├── __init__.py
 │   │   ├── agent_service.py      # Agent CRUD, prompt management
 │   │   ├── call_service.py       # Call lifecycle, state machine
-│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no DeepSeek/tools, see phase0.md)
+│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phase0.md)
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
-│   │   ├── llm_service.py        # DeepSeek API calls, tool execution
+│   │   ├── llm_service.py        # Provider-agnostic LLM calls (DeepSeek/OpenAI, ADR-008), tool execution
+│   │   ├── sandbox_service.py    # Text-chat agent testing sandbox — no phone call, see "Agent testing sandbox" flow
 │   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
 │   │   ├── analytics_service.py  # Metrics computation, sentiment aggregation
 │   │   ├── places_service.py     # Google Places search — prospecting Agent 1, discovery (ADR-006)
@@ -121,7 +122,9 @@ voiceagent/
 │   │   │   ├── agents/
 │   │   │   │   ├── page.tsx      # Agent list
 │   │   │   │   ├── [id]/
-│   │   │   │   │   └── page.tsx  # Agent detail + prompt editor
+│   │   │   │   │   ├── page.tsx  # Agent detail + prompt editor
+│   │   │   │   │   └── sandbox/
+│   │   │   │   │       └── page.tsx  # Text-chat sandbox — try the persona, no phone call
 │   │   │   │   └── new/
 │   │   │   │       └── page.tsx  # Create agent wizard
 │   │   │   ├── calls/
@@ -172,6 +175,7 @@ voiceagent/
     ├── test_retell_ws.py
     ├── test_webhooks.py
     ├── test_llm_service.py
+    ├── test_sandbox_service.py
     ├── test_prospect_service.py
     ├── test_research_service.py
     ├── test_script_service.py
@@ -240,6 +244,14 @@ provisioning time (`retell_adapter.create_agent_with_llm` /
 fixed at creation, so `test_call_service` re-provisions when it changes — otherwise an
 agent created before a tunnel existed keeps pointing at nothing forever.
 
+`Transcript.turns` now has two writers, not one: `backend/api/retell_ws.py` writes it
+turn-by-turn as a live custom-LLM call happens (`call_service.record_turns`, called after
+each response is sent — off the turn-latency path), and `apply_retell_call_state` parses
+Retell's post-call `transcript_object` as the authoritative final write, which also covers
+the hosted-LLM path (no WS handler to have written anything live). Retell always sends the
+*full* transcript so far, live or post-call, never a delta — so both writers are idempotent
+wholesale replaces, safe to call repeatedly.
+
 ### ADR-007: Webhooks are the fast path, reconciliation is the source of truth
 Webhook delivery is best-effort: the dev tunnel may be down, `PUBLIC_BASE_URL` may be
 unset, the tunnel host changes on every restart. A missed `call_ended` used to strand a
@@ -261,6 +273,27 @@ Signature verification (`X-Retell-Signature`, HMAC-SHA256 over the raw body with
 `RetellAdapter.verify_webhook_signature`. It must run against the **raw** request bytes,
 which is why `webhooks.py` reads the body itself rather than taking a parsed Pydantic
 model as a route parameter.
+
+### ADR-008: Provider-agnostic LLM, chosen per agent
+`llm_service.py` was hardcoded to one module-level `AsyncOpenAI(base_url="https://api.deepseek.com")`
+— trying GPT meant editing that file. DeepSeek and OpenAI both speak the OpenAI-compatible
+chat-completions protocol, so "which provider" reduces to `api_key` + `base_url` + `model`:
+
+- A model id resolves to a provider via `MODEL_CATALOG` (the UI's dropdown source) or,
+  for an id not yet listed, a prefix guess (`gpt-*`/`o1*`/`o3*` -> openai, `deepseek-*` ->
+  deepseek) — `llm_service.provider_for()`. Unresolvable, or resolvable but missing its
+  API key, both raise `LLMConfigError` rather than a raw SDK error.
+- Exactly one `AsyncOpenAI` client per provider, cached (`get_client`, `@lru_cache`) — not
+  per call. phase0.md measured ~2.5s of dead air on a cold client (DNS + TLS); constructing
+  one per turn in the WS handler would reintroduce that on every response.
+- `Agent.llm_model` (empty string = "use `settings.default_llm_model`") makes the choice
+  per-agent, not global — set via the "Conversation engine" card's model `<select>`
+  (`GET /api/agents/models` reports the catalog plus which providers are `configured`).
+  Only takes effect on the `use_custom_llm` path; Retell's hosted LLM ignores it.
+- `get_agent_response(..., tools_enabled=...)` — `False` omits the `tools` kwarg entirely
+  (not `tools=None`; the SDK's `tools` param isn't `Optional`, so `None` would literally
+  serialize as `"tools": null`). This is what lets the sandbox (below) run a text chat
+  without risking a real `book_appointment`/`create_lead` call.
 
 ### ADR-006: Prospecting pipeline (Prospector + Researcher agents)
 Before a call can happen, something has to decide *who* to call. The prospecting
@@ -396,6 +429,18 @@ for how to move through these efficiently.
 
 If step 1 never happens (no tunnel, unset `PUBLIC_BASE_URL`, tunnel restarted mid-call),
 `POST /api/calls/sync` reconciles from the platform instead — see ADR-007.
+
+### Agent testing sandbox
+Try an agent's persona/system_prompt over text before spending a real call on it —
+`frontend/src/app/agents/[id]/sandbox/page.tsx` → `POST /api/agents/{id}/sandbox-chat` →
+`sandbox_service.chat()` → `llm_service.get_agent_response()`. Stateless: the client
+resends the whole message history each turn, the same shape a live call already uses —
+no new table, no session store. Unlike the live custom-LLM path (which rejects
+`system_prompt_override` because the WS handler reads `Agent.system_prompt` fresh from
+the DB per call), the sandbox can run with an unsaved prompt draft — that's the point of
+the feature. Tools default off (`tools_enabled=False`): `book_appointment`/`create_lead`
+make real HTTP calls to Cal.com/HubSpot via `integration_service.py`, and a text chat
+shouldn't hit those by accident.
 
 ## LLM prompt architecture
 

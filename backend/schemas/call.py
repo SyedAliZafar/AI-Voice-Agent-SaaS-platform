@@ -31,7 +31,7 @@ class CallSyncResponse(BaseModel):
 
 
 class TranscriptTurn(BaseModel):
-    role: str  # caller | agent
+    role: Literal["caller", "agent"]
     text: str
     ts: datetime
 

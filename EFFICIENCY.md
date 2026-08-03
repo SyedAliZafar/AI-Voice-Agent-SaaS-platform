@@ -74,10 +74,9 @@ update the ADR — don't leave two contradictory sources.
 These are documented in `phase0.md` / `phase3.md` and are *known*, not bugs to go find:
 
 - `transfer_call`, `send_sms`, `lookup_customer` return fabricated success — not real yet.
-- No conversation state persistence: `Transcript.turns` is only ever written as `[]`
-  (`full_text` *is* now populated from Retell), `CallEvent` has zero write sites.
-- `ws.py`'s `publish_call_event` is called from nowhere, so dashboard live monitoring is
-  inert.
+- `CallEvent` has zero write sites — no per-tool-call/transfer/error record.
+  (`Transcript.turns` itself is no longer a gap — see ADR-008/"Key data flows" in
+  CONTEXT.md: `retell_ws.py` writes it live, `apply_retell_call_state` writes it post-call.)
 - The Custom LLM websocket is non-streaming — one blocking LLM call per turn. phase0.md's
   latency spike says this will blow the 1.5s budget once tools are in play.
 - Vapi's webhook has no signature verification (Retell's now does).

@@ -18,6 +18,10 @@ class Agent(Base, UUIDMixin, TimestampMixin, TenantMixin):
     # (DeepSeek + server-side tools, ADR-003) instead of Retell's hosted LLM. See
     # backend/services/test_call_service.py and backend/api/retell_ws.py.
     use_custom_llm: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Which model answers this agent's conversations (ADR-008). Empty string means
+    # "use settings.default_llm_model" — see llm_service.MODEL_CATALOG for valid ids.
+    # Only takes effect on the use_custom_llm path; Retell's hosted LLM ignores it.
+    llm_model: Mapped[str] = mapped_column(String(100), default="")
 
     tenant: Mapped["Tenant"] = relationship(back_populates="agents")  # noqa: F821
     phone_numbers: Mapped[list["PhoneNumber"]] = relationship(back_populates="agent")

@@ -8,14 +8,23 @@ import { CheckIcon } from "@/components/icons";
 interface PromptEditorProps {
   initialValue: string;
   onSave: (value: string) => void | Promise<void>;
+  // Fires on every keystroke, in addition to the editor's own internal state — lets a
+  // parent track the live draft (e.g. the sandbox page, which sends it as a per-turn
+  // system_prompt_override before it's ever saved).
+  onChange?: (value: string) => void;
 }
 
-export function PromptEditor({ initialValue, onSave }: PromptEditorProps) {
+export function PromptEditor({ initialValue, onSave, onChange }: PromptEditorProps) {
   const [value, setValue] = useState(initialValue);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => setValue(initialValue), [initialValue]);
+
+  const handleChange = (next: string) => {
+    setValue(next);
+    onChange?.(next);
+  };
 
   const dirty = value !== initialValue;
 
@@ -40,7 +49,7 @@ export function PromptEditor({ initialValue, onSave }: PromptEditorProps) {
       </div>
       <textarea
         value={value}
-        onChange={(e) => setValue(e.target.value)}
+        onChange={(e) => handleChange(e.target.value)}
         rows={14}
         spellCheck={false}
         className="block w-full resize-y border-0 bg-white p-4 font-mono text-[13px] leading-relaxed text-slate-800 focus:outline-none focus:ring-0"

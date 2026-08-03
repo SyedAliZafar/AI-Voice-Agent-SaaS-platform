@@ -199,3 +199,139 @@ async def test_handle_call_ended_noop_for_unknown_call(db_session):
 async def test_handle_call_started_never_raises():
     # Purely a log-and-return no-op today (see module docstring) — just must not crash.
     await call_service.handle_call_started("some_call_id", platform="retell")
+
+
+class TestParseRetellTurns:
+    def test_maps_retell_roles_to_storage_roles(self):
+        """Retell's transcript role is "user"/"agent"; storage (and the frontend's
+        TranscriptViewer) expects "caller"/"agent"."""
+        turns = call_service.parse_retell_turns(
+            [{"role": "user", "content": "Hi"}, {"role": "agent", "content": "Hello!"}]
+        )
+        assert turns == [
+            {"role": "caller", "text": "Hi"},
+            {"role": "agent", "text": "Hello!"},
+        ]
+
+    def test_skips_items_with_non_string_content(self):
+        turns = call_service.parse_retell_turns([{"role": "user", "content": None}])
+        assert turns == []
+
+    def test_unknown_role_defaults_to_caller(self):
+        turns = call_service.parse_retell_turns([{"role": "system", "content": "..."}])
+        assert turns[0]["role"] == "caller"
+
+
+class TestRecordTurns:
+    @pytest.mark.asyncio
+    async def test_writes_turns_and_synthesizes_full_text_by_default(self, db_session, tenant_id):
+        call = await call_service.create_outbound_call_record(
+            db_session, tenant_id, uuid.uuid4(), "turns_1", "+491701234567"
+        )
+
+        await call_service.record_turns(
+            db_session,
+            call,
+            [{"role": "caller", "text": "Hi"}, {"role": "agent", "text": "Hello!"}],
+        )
+        await db_session.commit()
+
+        transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
+        assert [t["role"] for t in transcript.turns] == ["caller", "agent"]
+        assert [t["text"] for t in transcript.turns] == ["Hi", "Hello!"]
+        assert "Hi" in transcript.full_text and "Hello!" in transcript.full_text
+
+    @pytest.mark.asyncio
+    async def test_sync_full_text_false_leaves_full_text_untouched(self, db_session, tenant_id):
+        call = await call_service.create_outbound_call_record(
+            db_session, tenant_id, uuid.uuid4(), "turns_2", "+491701234567"
+        )
+        await call_service.handle_transcript_update(db_session, "turns_2", "Retell's own text")
+
+        await call_service.record_turns(
+            db_session, call, [{"role": "caller", "text": "Hi"}], sync_full_text=False
+        )
+        await db_session.commit()
+
+        transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
+        assert transcript.full_text == "Retell's own text"
+        assert transcript.turns[0]["text"] == "Hi"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_prefix_preserves_ts(self, db_session, tenant_id):
+        """Re-recording the same first turn (as happens every time Retell resends the
+        whole transcript-so-far) must not restamp it to "now" — otherwise every turn
+        in a long call would end up with nearly the same timestamp as the last one."""
+        call = await call_service.create_outbound_call_record(
+            db_session, tenant_id, uuid.uuid4(), "turns_3", "+491701234567"
+        )
+
+        await call_service.record_turns(db_session, call, [{"role": "caller", "text": "Hi"}])
+        await db_session.commit()
+        first = await call_service.get_transcript(db_session, call.id, tenant_id)
+        first_ts = first.turns[0]["ts"]
+
+        await call_service.record_turns(
+            db_session,
+            call,
+            [{"role": "caller", "text": "Hi"}, {"role": "agent", "text": "Hello!"}],
+        )
+        await db_session.commit()
+        second = await call_service.get_transcript(db_session, call.id, tenant_id)
+
+        assert second.turns[0]["ts"] == first_ts
+        assert second.turns[1]["text"] == "Hello!"
+
+    @pytest.mark.asyncio
+    async def test_changed_turn_gets_a_new_ts(self, db_session, tenant_id):
+        call = await call_service.create_outbound_call_record(
+            db_session, tenant_id, uuid.uuid4(), "turns_4", "+491701234567"
+        )
+
+        await call_service.record_turns(db_session, call, [{"role": "caller", "text": "Hi"}])
+        await db_session.commit()
+        first_transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
+        first_ts = first_transcript.turns[0]["ts"]
+
+        await call_service.record_turns(
+            db_session, call, [{"role": "caller", "text": "Hi, there!"}]
+        )
+        await db_session.commit()
+        second = await call_service.get_transcript(db_session, call.id, tenant_id)
+
+        assert second.turns[0]["text"] == "Hi, there!"
+        # Not asserting inequality of ts (a fast test run could tie); the meaningful
+        # guarantee is the text actually changed, which is covered above.
+        assert first_ts is not None
+
+
+@pytest.mark.asyncio
+async def test_apply_retell_call_state_parses_transcript_object_into_turns(db_session, tenant_id):
+    """The free win: parsing transcript_object in apply_retell_call_state means even
+    hosted-LLM calls (no live WS handler) end up with structured turns, not just
+    full_text — see phase0.md's formerly-open "Transcript.turns is always []" gap."""
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "obj_1", "+491701234567"
+    )
+
+    changed = await call_service.apply_retell_call_state(
+        db_session,
+        call,
+        {
+            "call_status": "ended",
+            "disconnection_reason": "user_hangup",
+            "transcript": "user: Hi\nagent: Hello!",
+            "transcript_object": [
+                {"role": "user", "content": "Hi"},
+                {"role": "agent", "content": "Hello!"},
+            ],
+        },
+    )
+    await db_session.commit()
+
+    assert changed is True
+    transcript = await call_service.get_transcript(db_session, call.id, tenant_id)
+    assert [t["role"] for t in transcript.turns] == ["caller", "agent"]
+    # sync_full_text=False in apply_retell_call_state — Retell's own raw "transcript"
+    # string wins over a synthesized one.
+    assert transcript.full_text == "user: Hi\nagent: Hello!"

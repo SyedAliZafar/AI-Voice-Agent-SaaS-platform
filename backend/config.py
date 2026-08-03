@@ -20,6 +20,11 @@ class Settings(BaseSettings):
 
     # LLM
     deepseek_api_key: str = ""
+    openai_api_key: str = ""
+    # Model id used when Agent.llm_model is unset ("") — see llm_service.MODEL_CATALOG
+    # for the list of ids this can be and services/llm_service.py's provider_for for how
+    # a model id maps to a provider/client.
+    default_llm_model: str = "deepseek-chat"
 
     # Voice platforms
     retell_api_key: str = ""

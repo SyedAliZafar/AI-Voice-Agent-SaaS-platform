@@ -146,13 +146,91 @@ async def handle_call_started(external_call_id: str, platform: str) -> None:
     )
 
 
-async def _write_transcript(db: AsyncSession, call: Call, transcript_text: str) -> None:
-    """Upsert a call's transcript. Caller commits."""
+async def _get_or_create_transcript(db: AsyncSession, call: Call) -> Transcript:
+    """Fetch a call's Transcript row, creating an empty one if none exists yet.
+    Shared by both transcript writers (_write_transcript, record_turns) so there's
+    one upsert, not two. Caller commits/flushes as needed.
+    """
     existing = await get_transcript(db, call.id, call.tenant_id)
     if existing:
-        existing.full_text = transcript_text
-    else:
-        db.add(Transcript(call_id=call.id, full_text=transcript_text, turns=[]))
+        return existing
+    transcript = Transcript(call_id=call.id, full_text="", turns=[])
+    db.add(transcript)
+    return transcript
+
+
+async def _write_transcript(db: AsyncSession, call: Call, transcript_text: str) -> None:
+    """Upsert a call's transcript full_text — Retell's own raw transcript string
+    (payload["transcript"]), kept separate from the structured turns record_turns
+    writes. Caller commits.
+    """
+    transcript = await _get_or_create_transcript(db, call)
+    transcript.full_text = transcript_text
+
+
+# Retell's transcript role -> our storage role, matching what TranscriptViewer.tsx and
+# frontend/src/lib/types.ts's TranscriptTurn already expect ("caller" | "agent"). Kept
+# separate from retell_ws.py's _ROLE_MAP, which maps onto OpenAI's "user"/"assistant"
+# for LLM conversation history — a different vocabulary for a different consumer.
+_RETELL_STORAGE_ROLE_MAP = {"user": "caller", "agent": "agent"}
+
+
+def parse_retell_turns(transcript_items: list[dict[str, Any]]) -> list[dict]:
+    """Retell uses the same [{role, content, ...}, ...] shape in two places: the live
+    WS handler's response_required/reminder_required frames (backend/api/retell_ws.py)
+    and the post-call transcript_object on call_ended/call_analyzed payloads. Both
+    convert here into the {role, text} shape record_turns expects.
+    """
+    turns = []
+    for item in transcript_items:
+        content = item.get("content")
+        if not isinstance(content, str):
+            continue
+        role = _RETELL_STORAGE_ROLE_MAP.get(item.get("role", ""), "caller")
+        turns.append({"role": role, "text": content})
+    return turns
+
+
+async def record_turns(
+    db: AsyncSession, call: Call, turns: list[dict], *, sync_full_text: bool = True
+) -> None:
+    """Wholesale-replace a call's Transcript.turns.
+
+    Retell always sends the FULL transcript so far — both on every live WS
+    response_required frame and in transcript_object on the post-call payload — never
+    a delta. So each call here is an idempotent replace: a dropped write self-corrects
+    on the next turn, and there's no accumulator state to keep anywhere.
+
+    Preserves `ts` for turns unchanged at the same index, so re-recording an unchanged
+    prefix doesn't restamp already-spoken lines to "now"; new or changed turns get
+    now(UTC). sync_full_text=False (used by apply_retell_call_state) leaves full_text
+    to _write_transcript's separate write of Retell's own raw transcript string —
+    turns is the only thing this function owns there. The live WS handler has no raw
+    string to fall back on, so it takes the default and gets full_text synthesized
+    from turns.
+
+    Caller commits.
+    """
+    transcript = await _get_or_create_transcript(db, call)
+    existing = transcript.turns or []
+    now = datetime.now(UTC).isoformat()
+
+    new_turns = []
+    for i, turn in enumerate(turns):
+        role = turn["role"]
+        text = turn.get("text", "")
+        unchanged = (
+            i < len(existing)
+            and existing[i].get("role") == role
+            and existing[i].get("text") == text
+        )
+        ts = existing[i].get("ts") if unchanged else None
+        ts = ts or now
+        new_turns.append({"role": role, "text": text, "ts": ts})
+
+    transcript.turns = new_turns
+    if sync_full_text:
+        transcript.full_text = "\n".join(f"{t['role']}: {t['text']}" for t in new_turns)
 
 
 async def handle_transcript_update(
@@ -241,6 +319,19 @@ async def apply_retell_call_state(
     if isinstance(transcript_text, str) and transcript_text.strip():
         await _write_transcript(db, call, transcript_text)
         changed = True
+
+    # transcript_object is Retell's structured per-turn record. Parsing it here makes
+    # this the authoritative final write for Transcript.turns — including for the
+    # hosted-LLM path, which has no live WS handler to have written turns already.
+    transcript_object = payload.get("transcript_object")
+    if isinstance(transcript_object, list) and transcript_object:
+        turns = parse_retell_turns(transcript_object)
+        if turns:
+            # sync_full_text=False: transcript_text above (Retell's own raw string) is
+            # the better full_text when both are present; don't clobber it with a
+            # synthesized "role: text" join.
+            await record_turns(db, call, turns, sync_full_text=False)
+            changed = True
 
     return changed
 

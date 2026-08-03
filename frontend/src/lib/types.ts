@@ -5,9 +5,42 @@ export interface Agent {
   voice_config: Record<string, unknown>;
   platform: "retell" | "vapi";
   // false -> Retell's built-in LLM answers. true -> our Custom LLM websocket answers
-  // with DeepSeek + server-side tools (needs PUBLIC_BASE_URL + a running tunnel).
+  // with DeepSeek/OpenAI + server-side tools (needs PUBLIC_BASE_URL + a running tunnel).
   use_custom_llm: boolean;
+  // Model id, e.g. "deepseek-chat" or "gpt-4o-mini". "" means "use the backend's
+  // default_llm_model". Only takes effect when use_custom_llm is true.
+  llm_model: string;
   created_at: string;
+}
+
+export interface LlmModel {
+  id: string;
+  label: string;
+  provider: string;
+  configured: boolean; // whether that provider's API key is set on the backend
+}
+
+export interface LlmModelsResponse {
+  models: LlmModel[];
+  default: string;
+}
+
+export interface SandboxMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface SandboxChatRequest {
+  messages: SandboxMessage[];
+  system_prompt_override?: string | null;
+  model?: string | null;
+  tools_enabled?: boolean;
+}
+
+export interface SandboxChatResponse {
+  reply: string;
+  model: string;
+  tools_enabled: boolean;
 }
 
 export interface Call {

@@ -1,6 +1,9 @@
 """Retell Custom LLM WebSocket — Retell dials in here during a live call and relays
-transcript turns; we answer using DeepSeek + server-side tools (ADR-003), replacing
-Retell's own hosted LLM for agents with Agent.use_custom_llm=True.
+transcript turns; we answer using the agent's configured model (ADR-008) + server-side
+tools (ADR-003), replacing Retell's own hosted LLM for agents with
+Agent.use_custom_llm=True. Also writes the turn-by-turn transcript as the call
+progresses (see _persist_and_publish_turn) — previously only the post-call webhook
+payload ever populated it.
 
 Protocol: docs.retellai.com/api-references/llm-websocket. Retell appends the call's own
 call_id to whatever base URL we registered via
@@ -25,6 +28,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from backend.api import ws as call_ws
 from backend.database import AsyncSessionLocal
 from backend.services import agent_service, call_service, llm_service
 
@@ -45,6 +49,40 @@ def _to_conversation_history(transcript: list[dict[str, Any]]) -> list[dict[str,
         }
         for turn in transcript
     ]
+
+
+async def _persist_and_publish_turn(
+    call_id: str, transcript_so_far: list[dict[str, Any]], agent_reply: str
+) -> None:
+    """Write the turn-by-turn transcript as the call happens, and broadcast it to any
+    dashboard clients watching (gives ws.py's previously-inert publish_call_event its
+    first caller).
+
+    Called AFTER the response frame is sent — deliberate, keeps DB/Redis work off the
+    turn-latency path phase0.md measured against a 1.5s budget. A short-lived session,
+    per the module docstring's "sessions are opened fresh per connection". Any failure
+    here is logged and swallowed: a Postgres hiccup or a down Redis must never take
+    down a live phone call.
+    """
+    try:
+        turns = call_service.parse_retell_turns(transcript_so_far)
+        turns.append({"role": "agent", "text": agent_reply})
+
+        async with AsyncSessionLocal() as db:
+            call = await call_service.get_call_by_external_id(db, call_id)
+            if call:
+                await call_service.record_turns(db, call, turns)
+                await db.commit()
+
+        await call_ws.publish_call_event(
+            call_id, {"type": "turn", "role": "agent", "text": agent_reply}
+        )
+    except Exception:
+        logger.warning(
+            "llm_websocket: failed to persist/publish turn",
+            extra={"call_id": call_id},
+            exc_info=True,
+        )
 
 
 @router.websocket("/llm-websocket/{call_id}")
@@ -71,6 +109,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
             return
 
         system_prompt = agent.system_prompt
+        llm_model = agent.llm_model or None  # None -> llm_service.get_agent_response's default
         caller_context = {
             "caller_number": call.caller_number,
             "tenant_id": str(call.tenant_id),
@@ -100,9 +139,18 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                 )
             elif interaction_type in ("response_required", "reminder_required"):
                 conversation_history = _to_conversation_history(data.get("transcript", []))
-                text = await llm_service.get_agent_response(
-                    system_prompt, conversation_history, caller_context
-                )
+                try:
+                    text = await llm_service.get_agent_response(
+                        system_prompt, conversation_history, caller_context, model=llm_model
+                    )
+                except llm_service.LLMConfigError:
+                    # CONTEXT.md's documented LLM-failure fallback — an unresolvable
+                    # model/missing key must not kill a live call.
+                    logger.exception(
+                        "llm_websocket: LLM config error, using fallback response",
+                        extra={"call_id": call_id, "model": llm_model},
+                    )
+                    text = "I'm having trouble, let me transfer you."
                 await websocket.send_json(
                     {
                         "response_type": "response",
@@ -112,6 +160,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                         "end_call": False,
                     }
                 )
+                await _persist_and_publish_turn(call_id, data.get("transcript", []), text)
             # call_details / update_only: no response required, nothing to do.
     except WebSocketDisconnect:
         pass

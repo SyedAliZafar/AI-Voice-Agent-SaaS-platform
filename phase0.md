@@ -121,22 +121,28 @@ live and being verified against a real call:
   they can't disagree about the same call's outcome.
 - The frontend has a real toggle for `use_custom_llm` (`frontend/src/app/agents/[id]/page.tsx`)
   — this isn't curl-only anymore.
+- ~~`llm_service.py` hardcoded to DeepSeek~~ — ADR-008 (CONTEXT.md): provider-agnostic
+  (`provider_for`/`get_client`, one cached `AsyncOpenAI` per provider), model chosen
+  per-agent (`Agent.llm_model`) via the "Conversation engine" card, `GET /api/agents/models`
+  reports the catalog and which providers are configured.
+- ~~No per-turn conversation persistence; `Transcript.turns` always `[]`~~ —
+  `backend/api/retell_ws.py` now writes turns after each response is sent
+  (`call_service.record_turns`), and `apply_retell_call_state` parses Retell's post-call
+  `transcript_object` as the authoritative final write (covers the hosted-LLM path too,
+  which has no WS handler). `CallEvent` still has zero write sites — tool-invocation
+  events specifically are still not recorded, see below.
+- ~~`ws.py`'s `publish_call_event` called from nowhere~~ — the WS handler now calls it
+  after persisting each turn, so the dashboard's live call monitor has something to show.
+- ~~No sandbox to try a prompt/persona via text chat~~ —
+  `frontend/src/app/agents/[id]/sandbox/page.tsx` → `POST /api/agents/{id}/sandbox-chat` →
+  `sandbox_service.chat()`. Stateless, tools off by default.
 
 **Still open:**
 - `transfer_call`, `send_sms`, `lookup_customer` return fabricated success. `transfer_call`'s
   own docstring calls it "the most important tool in the system." Make them real before
   building a streaming tool-calling loop over them.
-- No **per-turn** conversation persistence from the live WS handler itself —
-  `backend/api/retell_ws.py` never writes to `Transcript`/`CallEvent` as the call happens.
-  The *final* transcript does get saved, but only after the fact, via Retell's own
-  post-call payload riding along on the `call_ended`/`call_analyzed` webhook
-  (`apply_retell_call_state`'s `transcript_text` handling) — there's no live, turn-by-turn
-  record, and nothing populates the structured `Transcript.turns` JSON (still always `[]`).
-- `ws.py`'s producer `publish_call_event` is called from nowhere, so the dashboard's live
-  call monitor is inert regardless of the new socket.
+- `CallEvent` still has zero write sites — no record of individual tool invocations,
+  transfers, or errors during a call, only the transcript.
 - No CI, no production deployment path.
-- `llm_service.py` is still non-streaming and hardcoded to DeepSeek
-  (`AsyncOpenAI(base_url="https://api.deepseek.com")`, `MODEL = "deepseek-chat"`) — no
-  provider abstraction, so swapping models means editing this file directly.
-- No sandbox to try an agent's prompt/persona via text chat before spending a real call on
-  it — `llm_service.get_agent_response` is only ever invoked from a live phone call today.
+- The Custom LLM websocket is still non-streaming — one blocking LLM call per turn.
+  phase0.md's own latency spike (below) says this is what will hurt once tools are in play.

@@ -9,7 +9,7 @@ import { TextInput } from "@/components/form";
 import { Badge, Button, Card, Skeleton } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { OBJECTIVE_LABELS, type CampaignIntake } from "@/lib/builder";
-import { Agent } from "@/lib/types";
+import { Agent, LlmModel } from "@/lib/types";
 
 interface TestCallResult {
   call_id: string;
@@ -25,10 +25,20 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   const [callResult, setCallResult] = useState<TestCallResult | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
   const [savingBrain, setSavingBrain] = useState(false);
+  const [models, setModels] = useState<LlmModel[]>([]);
+  const [defaultModel, setDefaultModel] = useState("");
+  const [savingModel, setSavingModel] = useState(false);
   const router = useRouter();
 
   useEffect(() => {
     api.get<Agent>(`/agents/${params.id}`).then((res) => setAgent(res.data)).catch(() => {});
+    api
+      .get<{ models: LlmModel[]; default: string }>("/agents/models")
+      .then((res) => {
+        setModels(res.data.models);
+        setDefaultModel(res.data.default);
+      })
+      .catch(() => setModels([]));
   }, [params.id]);
 
   if (!agent) {
@@ -50,6 +60,12 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   const voiceConfig = (agent.voice_config || {}) as Record<string, unknown>;
   const campaign = voiceConfig.campaign as CampaignIntake | undefined;
   const voiceEntries = Object.entries(voiceConfig).filter(([k]) => k !== "campaign");
+
+  // The model actually in effect: the agent's own choice, or the backend's configured
+  // default (empty llm_model means "use settings.default_llm_model").
+  const effectiveModelId = agent.llm_model || defaultModel;
+  const effectiveModelLabel =
+    models.find((m) => m.id === effectiveModelId)?.label || effectiveModelId || "the configured model";
 
   async function placeTestCall() {
     setCalling(true);
@@ -81,6 +97,20 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
     }
   }
 
+  async function changeModel(next: string) {
+    if (!agent) return;
+    setSavingModel(true);
+    setCallError(null);
+    try {
+      await api.patch(`/agents/${agent.id}`, { llm_model: next });
+      setAgent({ ...agent, llm_model: next });
+    } catch (err) {
+      setCallError(getApiErrorMessage(err, "Couldn't change the model."));
+    } finally {
+      setSavingModel(false);
+    }
+  }
+
   async function regeneratePrompt() {
     if (!campaign || !agent) return;
     setRegenerating(true);
@@ -109,17 +139,27 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
         <ArrowLeftIcon width={16} height={16} /> Back to agents
       </button>
 
-      <div className="mb-6 flex flex-wrap items-center gap-3">
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-base font-semibold text-white">
-          {agent.name.trim().charAt(0).toUpperCase() || "A"}
-        </div>
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{agent.name}</h1>
-          <div className="mt-1 flex items-center gap-2 text-sm text-slate-500">
-            <Badge tone="brand">{agent.platform}</Badge>
-            <span>created {new Date(agent.created_at).toLocaleDateString()}</span>
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-base font-semibold text-white">
+            {agent.name.trim().charAt(0).toUpperCase() || "A"}
+          </div>
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{agent.name}</h1>
+            <div className="mt-1 flex items-center gap-2 text-sm text-slate-500">
+              <Badge tone="brand">{agent.platform}</Badge>
+              <span>created {new Date(agent.created_at).toLocaleDateString()}</span>
+            </div>
           </div>
         </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          icon={<SparkleIcon width={14} height={14} />}
+          onClick={() => router.push(`/agents/${agent.id}/sandbox`)}
+        >
+          Try in sandbox
+        </Button>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -137,15 +177,15 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
               {agent.use_custom_llm ? (
                 <>
                   Dial your own phone to hear this agent&apos;s current script. Runs on{" "}
-                  <strong className="font-medium text-slate-700">DeepSeek</strong> via your Custom
-                  LLM websocket, with server-side tools. Needs <code>PUBLIC_BASE_URL</code> set and
-                  a tunnel running, or the call will fail.
+                  <strong className="font-medium text-slate-700">{effectiveModelLabel}</strong>{" "}
+                  via your Custom LLM websocket, with server-side tools. Needs{" "}
+                  <code>PUBLIC_BASE_URL</code> set and a tunnel running, or the call will fail.
                 </>
               ) : (
                 <>
                   Dial your own phone to hear this agent&apos;s current script. Runs on{" "}
                   <strong className="font-medium text-slate-700">Retell&apos;s built-in LLM</strong>{" "}
-                  — DeepSeek and server-side tools aren&apos;t exercised by this call.
+                  — {effectiveModelLabel} and server-side tools aren&apos;t exercised by this call.
                 </>
               )}
             </p>
@@ -206,8 +246,9 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
           <Card className="p-5">
             <p className="mb-1 text-sm font-semibold text-slate-900">Conversation engine</p>
             <p className="mb-3 text-xs text-slate-500">
-              Which brain answers the caller. Retell&apos;s hosted LLM needs no setup; DeepSeek
-              runs your own prompt logic and server-side tools.
+              Which brain answers the caller. Retell&apos;s hosted LLM needs no setup; a Custom
+              LLM runs your own prompt logic and server-side tools, on whichever model you pick
+              below.
             </p>
             <div className="space-y-2">
               <EngineOption
@@ -221,10 +262,34 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
                 selected={agent.use_custom_llm}
                 disabled={savingBrain}
                 onSelect={() => toggleCustomLlm(true)}
-                title="DeepSeek (custom LLM)"
+                title="Custom LLM"
                 detail="Server-side tools. Needs PUBLIC_BASE_URL + tunnel."
               />
             </div>
+
+            {agent.use_custom_llm && (
+              <div className="mt-4 border-t border-slate-100 pt-4">
+                <label className="mb-1.5 block text-xs font-medium text-slate-700">
+                  Model
+                </label>
+                <select
+                  value={agent.llm_model}
+                  onChange={(e) => changeModel(e.target.value)}
+                  disabled={savingModel || models.length === 0}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-300 focus:outline-none disabled:opacity-50"
+                >
+                  <option value="">
+                    Default{defaultModel ? ` (${models.find((m) => m.id === defaultModel)?.label ?? defaultModel})` : ""}
+                  </option>
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id} disabled={!m.configured}>
+                      {m.label}
+                      {!m.configured ? " (no API key configured)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </Card>
 
           <Card className="h-fit p-5">

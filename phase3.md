@@ -190,20 +190,31 @@ Carried over, unchanged by this phase:
 - `transfer_call`, `send_sms`, `lookup_customer` return fabricated success.
   `transfer_call`'s own docstring calls it "the most important tool in the system," and
   the `escalated` status now written on `call_transfer` is meaningless until it's real.
-- `Transcript.turns` is still only ever `[]` (though `full_text` is now populated from
-  Retell's payload). `CallEvent` still has zero write sites.
-- `ws.py`'s `publish_call_event` is called from nowhere — dashboard live monitoring is
-  inert regardless of the new socket.
+- `CallEvent` still has zero write sites — no per-tool-call/transfer/error record, only
+  the transcript (see "Since resolved" below — `Transcript.turns` itself is done).
 - The Custom LLM websocket is **non-streaming**: one blocking `get_agent_response()` per
   turn. phase0.md measured 1.389s p95 non-streaming against a 1.5s budget, and noted a
   single tool call doubles the round-trips. This is the next thing that will hurt.
 - `system_prompt_override` (per-prospect personalization) is rejected on the custom-LLM
   path — the WS handler reads `Agent.system_prompt` fresh from the DB per call, so a
-  call-time override has nowhere to live.
+  call-time override has nowhere to live. (The text sandbox added below *does* support an
+  override, since it's a plain request rather than a WS handler reading the DB.)
 - Vapi's webhook still has no signature verification.
 - No CI, no production deployment path. Clerk login unbuilt.
 - `uv run mypy backend` reports ~11 pre-existing errors (openai types, missing jose/celery
   stubs, model forward refs) — untouched by this phase.
+
+**Since resolved (LLM provider switching, live transcript, sandbox):**
+- ~~`Transcript.turns` is still only ever `[]`~~ — `backend/api/retell_ws.py` writes it
+  turn-by-turn as a live call happens (after each response is sent, off the latency path);
+  `apply_retell_call_state` parses Retell's post-call `transcript_object` as the
+  authoritative final write, which also covers the hosted-LLM path.
+- ~~`ws.py`'s `publish_call_event` is called from nowhere~~ — called after each persisted
+  turn; the dashboard's live call monitor has something to show now.
+- ~~`llm_service.py` hardcoded to DeepSeek~~ — ADR-008: provider-agnostic, model chosen
+  per-agent via `Agent.llm_model` and the "Conversation engine" card.
+- ~~No sandbox to try a prompt/persona via text chat~~ —
+  `/agents/{id}/sandbox` → `POST /api/agents/{id}/sandbox-chat`.
 
 ## Could be done next
 
@@ -216,10 +227,9 @@ Roughly in order of how much they'd hurt to skip:
 3. **Stream the WS responses.** phase0.md's measurement says streaming is what makes the
    architecture viable rather than a nice-to-have — first audio at ~0.7s regardless of
    total length. Reuse the warm client; don't construct `AsyncOpenAI` per call.
-4. **Persist conversation state** — write `Transcript.turns` and `CallEvent` rows from the
-   WS handler, which also gives the live-monitoring panel something to show.
-5. **Wire `publish_call_event`** so the live call view stops being inert.
-6. **Scheduled reconciliation** — `POST /api/calls/sync` is manual today. A periodic Celery
+4. **Write `CallEvent` rows** for tool calls/transfers/errors during a call — turns are
+   now persisted (see "Since resolved"), but individual events still aren't.
+5. **Scheduled reconciliation** — `POST /api/calls/sync` is manual today. A periodic Celery
    task would close the loop without anyone clicking a button.
-7. **CI** — ruff + pytest on every PR. There is none, and this phase's regression
+6. **CI** — ruff + pytest on every PR. There is none, and this phase's regression
    (a payload-shape mismatch caught only by a real call) is exactly what tests catch.

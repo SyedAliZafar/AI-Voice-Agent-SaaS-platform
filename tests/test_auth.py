@@ -21,11 +21,13 @@ from tests.conftest import make_token
 # see the AUTH note in backend/api/webhooks.py.
 PROTECTED_ROUTES = [
     ("get", "/api/agents"),
+    ("get", "/api/agents/models"),
     ("post", "/api/agents"),
     ("get", f"/api/agents/{uuid.uuid4()}"),
     ("patch", f"/api/agents/{uuid.uuid4()}"),
     ("delete", f"/api/agents/{uuid.uuid4()}"),
     ("post", f"/api/agents/{uuid.uuid4()}/test-call"),
+    ("post", f"/api/agents/{uuid.uuid4()}/sandbox-chat"),
     ("get", "/api/calls"),
     ("get", f"/api/calls/{uuid.uuid4()}"),
     ("get", f"/api/calls/{uuid.uuid4()}/transcript"),
@@ -160,6 +162,22 @@ async def test_cannot_place_test_call_on_another_tenants_agent(
     )
     assert resp.status_code == 422
     assert "not found" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cannot_sandbox_chat_with_another_tenants_agent(
+    client, db_session, tenant_id, other_auth_headers
+):
+    agent = await agent_service.create_agent(
+        db_session, tenant_id, AgentCreate(name="Mine", platform="retell")
+    )
+
+    resp = await client.post(
+        f"/api/agents/{agent.id}/sandbox-chat",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+        headers=other_auth_headers,
+    )
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
