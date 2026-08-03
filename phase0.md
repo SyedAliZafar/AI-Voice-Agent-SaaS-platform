@@ -108,12 +108,35 @@ All four gates are now closed. The WS migration can start. Build the socket endp
 fallback, prove one call end-to-end, then layer in memory → real tools → streaming →
 observability.
 
-Known gaps that will bite during that work, none addressed here:
+Known gaps, updated as of the Custom LLM WebSocket MVP (`backend/api/retell_ws.py`) going
+live and being verified against a real call:
+
+**Since resolved, past sessions built these:**
+- ~~No webhook signature verification~~ — `backend/api/webhooks.py` now verifies
+  `X-Retell-Signature` (`settings.retell_verify_webhooks`, on by default).
+- ~~Calls could strand at `in_progress` forever if a webhook never arrived~~ —
+  `call_service.reconcile_call`/`reconcile_stale_calls`, exposed as `POST /api/calls/sync`,
+  pulls authoritative state from Retell's `GET /v2/get-call` and self-heals.
+- Webhook and reconcile paths now converge on one writer, `apply_retell_call_state`, so
+  they can't disagree about the same call's outcome.
+- The frontend has a real toggle for `use_custom_llm` (`frontend/src/app/agents/[id]/page.tsx`)
+  — this isn't curl-only anymore.
+
+**Still open:**
 - `transfer_call`, `send_sms`, `lookup_customer` return fabricated success. `transfer_call`'s
   own docstring calls it "the most important tool in the system." Make them real before
   building a streaming tool-calling loop over them.
-- No conversation state persistence — `Transcript.turns` is only ever written as `[]` and
-  `CallEvent` has zero write sites.
-- `ws.py`'s producer `publish_call_event` is called from nowhere, so live monitoring is
-  inert regardless of the new socket.
-- No CI, no production deployment path, no webhook signature verification.
+- No **per-turn** conversation persistence from the live WS handler itself —
+  `backend/api/retell_ws.py` never writes to `Transcript`/`CallEvent` as the call happens.
+  The *final* transcript does get saved, but only after the fact, via Retell's own
+  post-call payload riding along on the `call_ended`/`call_analyzed` webhook
+  (`apply_retell_call_state`'s `transcript_text` handling) — there's no live, turn-by-turn
+  record, and nothing populates the structured `Transcript.turns` JSON (still always `[]`).
+- `ws.py`'s producer `publish_call_event` is called from nowhere, so the dashboard's live
+  call monitor is inert regardless of the new socket.
+- No CI, no production deployment path.
+- `llm_service.py` is still non-streaming and hardcoded to DeepSeek
+  (`AsyncOpenAI(base_url="https://api.deepseek.com")`, `MODEL = "deepseek-chat"`) — no
+  provider abstraction, so swapping models means editing this file directly.
+- No sandbox to try an agent's prompt/persona via text chat before spending a real call on
+  it — `llm_service.get_agent_response` is only ever invoked from a live phone call today.
