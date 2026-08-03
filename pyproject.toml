@@ -19,6 +19,9 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "python-multipart>=0.0.12",
     "beautifulsoup4>=4.12.0",
+    # Used only for Retell webhook signature verification (Retell.verify) in
+    # services/retell_adapter.py — the HMAC scheme is not worth reimplementing by hand.
+    "retell-sdk>=4.0.0",
 ]
 
 [project.optional-dependencies]

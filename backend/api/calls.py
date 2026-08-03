@@ -7,10 +7,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_tenant
 from backend.database import get_db
-from backend.schemas.call import CallResponse, TranscriptResponse
+from backend.schemas.call import CallResponse, CallSyncResponse, TranscriptResponse
 from backend.services import call_service
+from backend.services.retell_adapter import RetellAdapter
 
 router = APIRouter()
+
+
+@router.post("/sync", response_model=CallSyncResponse)
+async def sync_calls(
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reconcile every still-in_progress call against the voice platform.
+
+    Webhooks are the primary path, but they only work when Retell can reach us — no
+    tunnel, an unset PUBLIC_BASE_URL, or a tunnel that restarted mid-call all mean a
+    call_ended is lost and the row is stranded at in_progress forever. This pulls
+    authoritative state (status, duration, transcript, sentiment) from the platform and
+    repairs those rows.
+
+    Declared before /{call_id} so "sync" isn't captured as a call id by the path param.
+    """
+    updated = await call_service.reconcile_stale_calls(db, tenant_id, RetellAdapter())
+    return CallSyncResponse(updated=updated)
 
 
 @router.get("", response_model=list[CallResponse])

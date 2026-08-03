@@ -53,6 +53,8 @@ async def test_place_test_call_provisions_and_caches_retell_ids(db_session, tena
     ):
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
+        # No tunnel — the hosted path must still work, just without lifecycle webhooks.
+        mock_settings.public_base_url = ""
 
         result = await test_call_service.place_test_call(
             db_session, agent.id, tenant_id, "+491701234567"
@@ -67,7 +69,11 @@ async def test_place_test_call_provisions_and_caches_retell_ids(db_session, tena
 
     # ids are cached on the agent for reuse
     refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
-    assert refreshed.voice_config["retell"] == {"llm_id": "llm_123", "agent_id": "agent_ext_123"}
+    assert refreshed.voice_config["retell"] == {
+        "llm_id": "llm_123",
+        "agent_id": "agent_ext_123",
+        "webhook_url": None,
+    }
 
     # a Call row is created immediately (status in_progress), so outbound calls
     # show up in the Calls list / dashboard without waiting on a webhook.
@@ -81,11 +87,90 @@ async def test_place_test_call_provisions_and_caches_retell_ids(db_session, tena
 
 
 @pytest.mark.asyncio
+async def test_place_test_call_registers_webhook_url_when_public_url_set(db_session, tenant_id):
+    """Retell needs a webhook_url to send call_ended — without it, calls never leave
+    in_progress. Registered at agent-creation time from PUBLIC_BASE_URL.
+    """
+    agent = await agent_service.create_agent(
+        db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Pitch")
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_llm.return_value = "llm_1"
+    mock_adapter.create_agent_with_llm.return_value = "agent_1"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_llm.assert_awaited_once_with(
+        name="SDR",
+        llm_id="llm_1",
+        voice_id="11labs-Adrian",
+        webhook_url="https://abc123.trycloudflare.com/webhooks/retell",
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_reprovisions_when_webhook_url_changes(db_session, tenant_id):
+    """A Retell agent's webhook_url is fixed at creation. An agent provisioned before
+    PUBLIC_BASE_URL was set (or under a since-restarted tunnel) would otherwise keep
+    pointing at a dead/absent webhook forever, and its calls would never resolve.
+    """
+    agent = await agent_service.create_agent(
+        db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Pitch")
+    )
+    agent.voice_config = {
+        "retell": {
+            "llm_id": "llm_existing",
+            "agent_id": "agent_stale",
+            "webhook_url": None,  # provisioned back when no tunnel existed
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_llm.return_value = "agent_fresh"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://now-tunnelled.trycloudflare.com"
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    # The LLM is reused (prompt just updated) but the AGENT is recreated with the webhook.
+    mock_adapter.update_llm.assert_awaited_once_with("llm_existing", "Pitch")
+    mock_adapter.create_agent_with_llm.assert_awaited_once_with(
+        name="SDR",
+        llm_id="llm_existing",
+        voice_id="11labs-Adrian",
+        webhook_url="https://now-tunnelled.trycloudflare.com/webhooks/retell",
+    )
+    mock_adapter.create_outbound_call.assert_awaited_once_with(
+        from_number="+15551234567", to_number="+491701234567", agent_external_id="agent_fresh"
+    )
+
+
+@pytest.mark.asyncio
 async def test_place_test_call_reuses_cached_ids_and_updates_prompt(db_session, tenant_id):
     agent = await agent_service.create_agent(
         db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Pitch v2")
     )
-    agent.voice_config = {"retell": {"llm_id": "llm_existing", "agent_id": "agent_existing"}}
+    agent.voice_config = {
+        "retell": {"llm_id": "llm_existing", "agent_id": "agent_existing", "webhook_url": None}
+    }
     await db_session.commit()
 
     mock_adapter = AsyncMock()
@@ -96,6 +181,8 @@ async def test_place_test_call_reuses_cached_ids_and_updates_prompt(db_session, 
         patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
     ):
         mock_settings.retell_from_number = "+15551234567"
+        # Unchanged from what the agent was provisioned with, so no re-provision.
+        mock_settings.public_base_url = ""
 
         await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
@@ -179,6 +266,7 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         name="SDR",
         llm_websocket_url="wss://abc123.trycloudflare.com/llm-websocket",
         voice_id="11labs-Adrian",
+        webhook_url="https://abc123.trycloudflare.com/webhooks/retell",
     )
     mock_adapter.create_llm.assert_not_awaited()
     mock_adapter.create_outbound_call.assert_awaited_once_with(
@@ -191,6 +279,7 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
     assert refreshed.voice_config["retell_custom"] == {
         "agent_id": "custom_agent_1",
         "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+        "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
     }
 
 
@@ -246,6 +335,7 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         "retell_custom": {
             "agent_id": "stale_agent",
             "ws_url": "wss://old-tunnel.trycloudflare.com/llm-websocket",
+            "webhook_url": "https://old-tunnel.trycloudflare.com/webhooks/retell",
         }
     }
     await db_session.commit()
@@ -268,6 +358,7 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         name="SDR",
         llm_websocket_url="wss://new-tunnel.trycloudflare.com/llm-websocket",
         voice_id="11labs-Adrian",
+        webhook_url="https://new-tunnel.trycloudflare.com/webhooks/retell",
     )
     mock_adapter.create_outbound_call.assert_awaited_once_with(
         from_number="+15551234567",

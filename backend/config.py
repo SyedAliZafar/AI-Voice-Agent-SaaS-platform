@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     # (backend/services/test_call_service.py detects the mismatch and re-provisions
     # automatically the next time a call is placed).
     public_base_url: str = ""
+    # Verify X-Retell-Signature on incoming /webhooks/retell requests. On by default —
+    # the moment a tunnel is up, an unverified webhook lets anyone with the URL forge
+    # call events. Turn off only to hand-post test payloads locally (tests do this via
+    # the settings override in conftest). Retell signs with the API key carrying the
+    # "webhook" badge in their dashboard; if every event fails verification, check that
+    # RETELL_API_KEY is that key.
+    retell_verify_webhooks: bool = True
 
     # Telephony
     twilio_account_sid: str = ""

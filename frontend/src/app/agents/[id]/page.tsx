@@ -24,6 +24,7 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   const [calling, setCalling] = useState(false);
   const [callResult, setCallResult] = useState<TestCallResult | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
+  const [savingBrain, setSavingBrain] = useState(false);
   const router = useRouter();
 
   useEffect(() => {
@@ -63,6 +64,20 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
       setCallError(getApiErrorMessage(err, "Failed to place call. Check the backend logs."));
     } finally {
       setCalling(false);
+    }
+  }
+
+  async function toggleCustomLlm(next: boolean) {
+    if (!agent) return;
+    setSavingBrain(true);
+    setCallError(null);
+    try {
+      await api.patch(`/agents/${agent.id}`, { use_custom_llm: next });
+      setAgent({ ...agent, use_custom_llm: next });
+    } catch (err) {
+      setCallError(getApiErrorMessage(err, "Couldn't change the conversation engine."));
+    } finally {
+      setSavingBrain(false);
     }
   }
 
@@ -119,8 +134,20 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
               <p className="text-sm font-semibold text-slate-900">Test call</p>
             </div>
             <p className="mb-3 text-xs text-slate-500">
-              Dial your own phone to hear this agent&apos;s current script. Runs on Retell&apos;s
-              built-in LLM — DeepSeek and server-side tools aren&apos;t exercised by this call.
+              {agent.use_custom_llm ? (
+                <>
+                  Dial your own phone to hear this agent&apos;s current script. Runs on{" "}
+                  <strong className="font-medium text-slate-700">DeepSeek</strong> via your Custom
+                  LLM websocket, with server-side tools. Needs <code>PUBLIC_BASE_URL</code> set and
+                  a tunnel running, or the call will fail.
+                </>
+              ) : (
+                <>
+                  Dial your own phone to hear this agent&apos;s current script. Runs on{" "}
+                  <strong className="font-medium text-slate-700">Retell&apos;s built-in LLM</strong>{" "}
+                  — DeepSeek and server-side tools aren&apos;t exercised by this call.
+                </>
+              )}
             </p>
             <div className="flex gap-2">
               <TextInput
@@ -176,6 +203,30 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
             </Card>
           )}
 
+          <Card className="p-5">
+            <p className="mb-1 text-sm font-semibold text-slate-900">Conversation engine</p>
+            <p className="mb-3 text-xs text-slate-500">
+              Which brain answers the caller. Retell&apos;s hosted LLM needs no setup; DeepSeek
+              runs your own prompt logic and server-side tools.
+            </p>
+            <div className="space-y-2">
+              <EngineOption
+                selected={!agent.use_custom_llm}
+                disabled={savingBrain}
+                onSelect={() => toggleCustomLlm(false)}
+                title="Retell built-in LLM"
+                detail="Zero setup. No tunnel required."
+              />
+              <EngineOption
+                selected={agent.use_custom_llm}
+                disabled={savingBrain}
+                onSelect={() => toggleCustomLlm(true)}
+                title="DeepSeek (custom LLM)"
+                detail="Server-side tools. Needs PUBLIC_BASE_URL + tunnel."
+              />
+            </div>
+          </Card>
+
           <Card className="h-fit p-5">
             <p className="mb-3 text-sm font-semibold text-slate-900">Voice config</p>
             {voiceEntries.length === 0 ? (
@@ -183,7 +234,7 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
             ) : (
               <dl className="space-y-2.5">
                 {voiceEntries.map(([key, val]) => (
-                  <Row key={key} label={key} value={String(val) || "—"} />
+                  <Row key={key} label={key} value={formatConfigValue(val)} />
                 ))}
               </dl>
             )}
@@ -198,7 +249,60 @@ function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-3">
       <dt className="text-slate-500">{label}</dt>
-      <dd className="truncate font-medium text-slate-800">{value}</dd>
+      <dd className="truncate font-medium text-slate-800" title={value}>
+        {value}
+      </dd>
     </div>
+  );
+}
+
+/** Voice config values are often nested objects (the cached `retell` / `retell_custom`
+ *  provisioning ids). String(val) on those renders "[object Object]" — summarize instead. */
+function formatConfigValue(val: unknown): string {
+  if (val === null || val === undefined || val === "") return "—";
+  if (typeof val === "object") {
+    const entries = Object.entries(val as Record<string, unknown>)
+      .filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .map(([k, v]) => `${k}: ${String(v)}`);
+    return entries.length ? entries.join(" · ") : "—";
+  }
+  return String(val);
+}
+
+function EngineOption({
+  selected,
+  disabled,
+  onSelect,
+  title,
+  detail,
+}: {
+  selected: boolean;
+  disabled: boolean;
+  onSelect: () => void;
+  title: string;
+  detail: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      disabled={disabled || selected}
+      aria-pressed={selected}
+      className={`w-full rounded-lg border p-3 text-left transition-colors disabled:cursor-default ${
+        selected
+          ? "border-brand-300 bg-brand-50"
+          : "border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-50"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`h-3.5 w-3.5 shrink-0 rounded-full border-[3px] ${
+            selected ? "border-brand-600 bg-white" : "border-slate-300 bg-white"
+          }`}
+        />
+        <span className="text-sm font-medium text-slate-900">{title}</span>
+      </div>
+      <p className="mt-1 pl-[1.375rem] text-xs text-slate-500">{detail}</p>
+    </button>
   );
 }

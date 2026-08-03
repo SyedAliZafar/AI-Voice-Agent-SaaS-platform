@@ -1,5 +1,13 @@
 # CONTEXT.md — AI Voice Agent SaaS Platform
 
+> **Investigation logs:** [phase0.md](phase0.md), [phase2.md](phase2.md) and
+> [phase3.md](phase3.md) document real de-risking and bug-fixing work (auth rewrite,
+> telephony proof, latency spike, call-lifecycle fixes) done after this file was first
+> written. Where they contradict an ADR below, they supersede it — this file has been
+> updated to match, but if something still looks off, trust the phase docs and the code
+> over this one, and fix this file. **phase3.md is the current state of play**, including
+> what is verified vs. merely written.
+
 ## Project overview
 
 Multi-tenant SaaS platform for building, deploying, and managing AI voice agents.
@@ -40,32 +48,42 @@ voiceagent/
 │   │   ├── tenant.py             # Tenant, User
 │   │   ├── agent.py              # Agent, PhoneNumber, ToolConfig
 │   │   ├── call.py               # Call, CallEvent, Transcript
-│   │   └── base.py               # DeclarativeBase, TenantMixin
+│   │   ├── prospect.py           # Prospect — Prospector/Researcher pipeline (see ADR-006)
+│   │   └── base.py               # DeclarativeBase, TenantMixin, TimestampMixin, UUIDMixin
 │   │
 │   ├── schemas/                  # Pydantic request/response schemas
 │   │   ├── __init__.py
 │   │   ├── agent.py
 │   │   ├── call.py
+│   │   ├── prospect.py
 │   │   └── webhook.py
 │   │
 │   ├── api/                      # FastAPI routers
 │   │   ├── __init__.py
+│   │   ├── deps.py               # get_current_tenant — the tenant-scoping dependency (ADR-001)
 │   │   ├── agents.py             # CRUD for agents + prompt config
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
+│   │   ├── prospects.py          # Prospecting pipeline: discover/list/research/outreach status
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
-│   │   └── ws.py                 # WebSocket endpoint for live call streaming
+│   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
+│   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phase0.md)
 │   │
 │   ├── services/                 # Business logic (no HTTP concerns)
 │   │   ├── __init__.py
 │   │   ├── agent_service.py      # Agent CRUD, prompt management
 │   │   ├── call_service.py       # Call lifecycle, state machine
+│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no DeepSeek/tools, see phase0.md)
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
 │   │   ├── llm_service.py        # DeepSeek API calls, tool execution
 │   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
-│   │   └── analytics_service.py  # Metrics computation, sentiment aggregation
+│   │   ├── analytics_service.py  # Metrics computation, sentiment aggregation
+│   │   ├── places_service.py     # Google Places search — prospecting Agent 1, discovery (ADR-006)
+│   │   ├── research_service.py   # Company research — prospecting Agent 2, knowledge base (ADR-006)
+│   │   ├── script_service.py     # Call-script generation for prospects
+│   │   └── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking (ADR-006)
 │   │
 │   ├── tools/                    # LLM function-calling tool definitions
 │   │   ├── __init__.py
@@ -80,12 +98,14 @@ voiceagent/
 │   │   ├── __init__.py
 │   │   ├── celery_app.py         # Celery config
 │   │   ├── transcript_tasks.py   # Post-call transcript processing
-│   │   └── analytics_tasks.py   # Periodic metric rollups
+│   │   ├── analytics_tasks.py    # Periodic metric rollups
+│   │   └── prospect_tasks.py     # discover_prospects / research_prospect (ADR-006)
 │   │
 │   ├── middleware/
-│   │   ├── tenant.py             # Extract tenant from JWT, set context
 │   │   ├── rate_limit.py         # Redis-based rate limiting
 │   │   └── logging.py            # Structured JSON logging
+│   │   # NOTE: tenant.py used to live here — deleted, superseded by api/deps.py's
+│   │   # get_current_tenant dependency. See ADR-001 and phase0.md Task 2.
 │   │
 │   └── migrations/               # Alembic migrations
 │       ├── env.py
@@ -110,41 +130,79 @@ voiceagent/
 │   │   │   │   │   └── page.tsx  # Single call detail + transcript
 │   │   │   │   └── live/
 │   │   │   │       └── page.tsx  # WebSocket live call monitor
-│   │   │   └── settings/
-│   │   │       └── page.tsx      # Integrations, phone numbers, billing
-│   │   ├── components/
+│   │   │   ├── prospects/
+│   │   │   │   └── page.tsx      # Prospecting pipeline UI (ADR-006)
+│   │   │   ├── settings/
+│   │   │   │   └── page.tsx      # Integrations, phone numbers, billing
+│   │   │   └── api/strategist/
+│   │   │       └── route.ts      # Next.js route proxying an LLM call for the agent-builder wizard — see FRONTEND.md
+│   │   ├── components/           # Currently flat — see FRONTEND.md for the target components/ui + components/features split
+│   │   │   ├── ui.tsx             # De-facto primitives: Button, Card, Badge, PageHeader, EmptyState, Skeleton
+│   │   │   ├── form.tsx
+│   │   │   ├── AppShell.tsx
+│   │   │   ├── Sidebar.tsx
+│   │   │   ├── Topbar.tsx
 │   │   │   ├── CallTable.tsx
 │   │   │   ├── MetricCard.tsx
 │   │   │   ├── AgentCard.tsx
+│   │   │   ├── AgentBuilder.tsx
+│   │   │   ├── Stepper.tsx
 │   │   │   ├── TranscriptViewer.tsx
 │   │   │   ├── PromptEditor.tsx  # Monaco-based prompt editing
-│   │   │   └── LiveCallPanel.tsx # Real-time call audio + transcript
+│   │   │   ├── LiveCallPanel.tsx # Real-time call audio + transcript
+│   │   │   └── icons.tsx
 │   │   ├── hooks/
 │   │   │   ├── useWebSocket.ts
 │   │   │   └── useCallMetrics.ts
 │   │   └── lib/
-│   │       ├── api.ts            # Axios/fetch wrapper
-│   │       └── types.ts          # Shared TypeScript interfaces
+│   │       ├── api.ts            # Axios wrapper + auth-token interceptor
+│   │       ├── types.ts          # Shared TS interfaces, hand-mirrored from backend/schemas/*.py — no codegen, see FRONTEND.md
+│   │       ├── format.ts
+│   │       ├── builder.ts
+│   │       └── constants.ts
 │   └── tailwind.config.ts
 │
 └── tests/
     ├── conftest.py               # Fixtures: test DB, test client, mock voice platform
+    ├── test_auth.py              # Every protected route rejects missing/forged tokens; cross-tenant isolation
     ├── test_agents.py
     ├── test_calls.py
+    ├── test_call_service.py
+    ├── test_test_call_service.py
+    ├── test_retell_ws.py
     ├── test_webhooks.py
     ├── test_llm_service.py
+    ├── test_prospect_service.py
+    ├── test_research_service.py
+    ├── test_script_service.py
     └── test_tools/
         ├── test_book_appointment.py
         └── test_lookup_customer.py
 ```
 
+This tree is a snapshot — it will drift again. When a change adds a new service, router,
+worker, or top-level component, update this tree in the same change (see
+[EFFICIENCY.md](EFFICIENCY.md)).
+
 ## Architecture decisions
 
 ### ADR-001: Multi-tenancy via row-level isolation
-Every model has a `tenant_id` FK. A middleware extracts tenant from JWT on every
-request and injects it into the DB session as a default filter. No schema-per-tenant —
-too much operational overhead at this stage. Revisit if we hit 500+ tenants with
-data isolation requirements.
+Every model has a `tenant_id` FK (`TenantMixin`, `backend/models/base.py`). No
+schema-per-tenant — too much operational overhead at this stage. Revisit if we hit
+500+ tenants with data isolation requirements.
+
+Tenant resolution is a **FastAPI dependency, not middleware**: `get_current_tenant`
+(`backend/api/deps.py`) decodes the bearer JWT's `tenant_id` claim and every `/api/*`
+route takes it via `Depends(...)`, never from a client-supplied query param. An earlier
+`backend/middleware/tenant.py` did this via `BaseHTTPMiddleware` — it was written, never
+registered, and has since been deleted, because middleware can't raise per-route 401s,
+can't participate in dependency injection (so tests can't override it), and is skipped
+for WebSocket scopes, which matters for the Retell custom-LLM socket. See `phase0.md`
+Task 2 for the full audit that drove this.
+
+`/webhooks/*` are the deliberate exception: Retell/Vapi can't send our JWT, so those
+routes stay unauthenticated by this mechanism. They still lack platform signature
+verification — a known open gap, see `backend/api/webhooks.py` and `phase0.md`.
 
 ### ADR-002: Voice platform adapter pattern
 `voice_platform.py` defines an abstract `VoicePlatformAdapter` with methods like
@@ -169,6 +227,78 @@ events from the webhook handler to all connected WebSocket clients watching that
 Transcript analysis, sentiment scoring, metric rollups, and CRM sync all happen async
 after the call ends. The webhook handler enqueues tasks and returns 200 immediately.
 This keeps webhook response time under 200ms (voice platforms timeout at 5-10s).
+
+**Retell's webhook contract** (learned the hard way — see phase3.md): exactly three
+events, `call_started` / `call_ended` / `call_analyzed`, and the call object is **nested**:
+`{"event": "call_ended", "call": {"call_id": ..., "duration_ms": ..., "transcript": ...}}`.
+There is no `transcript_update` webhook — that's a *websocket* message type from the
+custom-LLM protocol, not a webhook. Sentiment arrives on `call_analyzed`, not `call_ended`.
+
+Retell must also be *told* where to send these: `webhook_url` is set per-agent at
+provisioning time (`retell_adapter.create_agent_with_llm` /
+`create_agent_with_custom_llm`) from `PUBLIC_BASE_URL`. A Retell agent's webhook URL is
+fixed at creation, so `test_call_service` re-provisions when it changes — otherwise an
+agent created before a tunnel existed keeps pointing at nothing forever.
+
+### ADR-007: Webhooks are the fast path, reconciliation is the source of truth
+Webhook delivery is best-effort: the dev tunnel may be down, `PUBLIC_BASE_URL` may be
+unset, the tunnel host changes on every restart. A missed `call_ended` used to strand a
+call at `in_progress` permanently, with 0s duration and no transcript.
+
+So the platform is treated as authoritative and pollable, not just push-based:
+`call_service.reconcile_call()` fetches `GET /v2/get-call/{id}` and applies the real
+state; `POST /api/calls/sync` runs it across every still-`in_progress` call for the
+tenant. Both the webhook path and the reconcile path write through **one** function,
+`apply_retell_call_state()` — if they were separate writers they could disagree about
+the same call's outcome.
+
+Status mapping lives there too: `disconnection_reason` distinguishes `resolved` from
+`escalated` (`call_transfer`) and `failed` (dial failures, `error*`), which is richer than
+the "everything that ended is resolved" assumption this code started with.
+
+Signature verification (`X-Retell-Signature`, HMAC-SHA256 over the raw body with a
+5-minute replay window) is delegated to the official `retell-sdk` — see
+`RetellAdapter.verify_webhook_signature`. It must run against the **raw** request bytes,
+which is why `webhooks.py` reads the body itself rather than taking a parsed Pydantic
+model as a route parameter.
+
+### ADR-006: Prospecting pipeline (Prospector + Researcher agents)
+Before a call can happen, something has to decide *who* to call. The prospecting
+pipeline sources and ranks call targets, upstream of everything else in this doc:
+
+1. **Agent 1 — Prospector** (`places_service.py` + `workers/prospect_tasks.py`'s
+   `discover_prospects`): searches Google Places for businesses matching a query/location,
+   upserts them as `Prospect` rows (`models/prospect.py`) via
+   `prospect_service.upsert_from_places()`.
+2. **Ranking**: `prospect_service.compute_priority()` scores each prospect from rating,
+   review count, and presence of a website/phone — deliberately a transparent weighted
+   formula (see `config.py` for the weights), not ML, so it's easy to explain and retune
+   once real call outcomes exist.
+3. **Agent 2 — Researcher** (`research_service.py` + `prospect_tasks.py`'s
+   `research_prospect`, auto-chained after discovery for any prospect still `pending`):
+   builds a `CompanyResearch` knowledge base per prospect, written via
+   `prospect_service.mark_research_*()`. Tracked on `Prospect.research_status`
+   (`pending -> running -> ready | failed`), independent of `Prospect.outreach_status`
+   (`not_reached -> reached | callback | do_not_call`), since "have we researched them"
+   and "have we called them" are orthogonal.
+4. **Script generation** (`script_service.py`): turns a prospect + its research into a
+   call script.
+5. **Operator surface**: `backend/api/prospects.py` exposes discover/list/research/
+   outreach-status; `frontend/src/app/prospects/page.tsx` is the UI. The operator's only
+   job in this pipeline is deciding who to call and when — discovery and research run
+   unattended.
+
+Tenant-scoping note: `prospect_service.get_prospect()` is tenant-filtered like everything
+else, but Celery tasks have no HTTP caller to scope to, so they use the explicitly-named
+`get_prospect_unscoped()` instead — the safe name stays the default, the unsafe one is
+opt-in and explicit.
+
+Async-in-Celery hazard: with `CELERY_TASK_ALWAYS_EAGER=true` (solo-dev mode, see RUN.md),
+`.delay()` runs the task body inline, and if that call originates from an async FastAPI
+route (as `api/prospects.py` does), a plain `asyncio.run()` inside the task would raise
+"cannot be called from a running event loop." `prospect_tasks._run_sync()` detects this
+and runs the coroutine on a separate thread instead. The same pattern exists (unguarded)
+in `transcript_tasks.py` — worth fixing there too if it bites.
 
 ## Coding conventions
 
@@ -211,7 +341,40 @@ NEXT_PUBLIC_API_URL=http://localhost:8000/api
 - Commit messages: conventional commits (`feat:`, `fix:`, `docs:`, `refactor:`)
 - PR requires passing CI (ruff, pytest, type check) + 1 review
 
+## Change recipes
+
+The layering here (model → schema → service → api) means even a small change touches
+several files. That's the adapter/layer separation working as designed, not accidental
+sprawl — but it does mean the blast radius has to be known up front rather than
+rediscovered by grepping. This table is that map. Find your change type, touch those
+files, stop.
+
+| Change type | Files to touch, in order |
+|---|---|
+| **Add a field to an existing model** | `models/<x>.py` → `uv run alembic revision --autogenerate` → `schemas/<x>.py` → service layer *only if* logic depends on it → `api/<router>.py` if exposed → its test → `frontend/src/lib/types.ts` if the frontend reads it (hand-synced, see FRONTEND.md) |
+| **Add a new LLM tool** | `tools/<name>.py` implementing `BaseTool` → register in `tools/__init__.py`'s `_REGISTRY` (that's the only wiring — `llm_service` reads the registry) → `tests/test_tools/test_<name>.py` |
+| **Add a new voice platform** | new `services/<name>_adapter.py` implementing `VoicePlatformAdapter` → add to the `adapters` dict in `voice_platform.py`'s `get_adapter()` → nothing else; existing adapters and call paths are untouched (ADR-002) |
+| **Add a new Celery task** | `workers/<x>_tasks.py` (sync entry point + `async def _impl`, mirroring `prospect_tasks.py`) → register the enqueue call site (usually a webhook handler or service) → test with `CELERY_TASK_ALWAYS_EAGER=true`. If the task is async and may be called from an async route, use the `_run_sync()` pattern from `prospect_tasks.py` (see ADR-006). |
+| **Add a new API endpoint** | `api/<router>.py` (take `tenant_id: uuid.UUID = Depends(get_current_tenant)` — never a query param) → request/response models in `schemas/<x>.py` → the service method it delegates to → test, including an auth case in `tests/test_auth.py` |
+| **Add a new router (new resource)** | all of the above, plus register the router in `main.py`, and **add it to the structure tree in this file** |
+| **Add a new service / worker / top-level component** | write it, then update the structure tree in this file in the same change — this is the rule whose absence caused the drift this table exists to prevent |
+| **Change voice-platform behavior** | the relevant `*_adapter.py` only. If you find yourself importing the Retell or Vapi SDK anywhere else, stop — that's the ADR-002 violation. |
+
+Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
+do real work inline in a webhook handler (ADR-005). See [EFFICIENCY.md](EFFICIENCY.md)
+for how to move through these efficiently.
+
 ## Key data flows
+
+### Prospecting flow (upstream of everything below)
+1. Operator (or a scheduled trigger) calls `POST /api/prospects/discover` with a
+   query/location → `discover_prospects` task runs Google Places search, upserts
+   `Prospect` rows, computes priority score.
+2. Any newly-seen prospect (`research_status="pending"`) is auto-chained into
+   `research_prospect` → builds `CompanyResearch`, marks `ready` or `failed`.
+3. Operator reviews ranked prospects in `frontend/src/app/prospects/page.tsx`, generates
+   a script (`script_service.py`), and decides who becomes a `test-call` / outbound call
+   target and when (`outreach_status` moves from `not_reached` onward).
 
 ### Inbound call
 1. Caller dials → Twilio routes to Retell/Vapi
@@ -223,10 +386,16 @@ NEXT_PUBLIC_API_URL=http://localhost:8000/api
 7. Loop continues until hangup or escalation trigger
 
 ### Post-call processing (Celery)
-1. Call ends → voice platform sends `call_ended` webhook
-2. Handler enqueues: `process_transcript`, `compute_sentiment`, `sync_to_crm`
-3. Transcript stored in DB + S3 (audio), sentiment score written to `calls` table
+1. Call ends → Retell POSTs `call_ended` to the per-agent `webhook_url`
+2. `webhooks.py` verifies the signature, resolves the row by `external_id`, and writes
+   terminal state (status from `disconnection_reason`, duration from `duration_ms`,
+   transcript) via `apply_retell_call_state`
+3. Handler enqueues `process_transcript`; `call_analyzed` follows shortly after with
+   `call_analysis.user_sentiment`
 4. If CRM integration configured, lead/contact created/updated in HubSpot/Salesforce
+
+If step 1 never happens (no tunnel, unset `PUBLIC_BASE_URL`, tunnel restarted mid-call),
+`POST /api/calls/sync` reconciles from the platform instead — see ADR-007.
 
 ## LLM prompt architecture
 

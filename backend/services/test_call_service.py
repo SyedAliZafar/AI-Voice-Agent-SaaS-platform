@@ -97,24 +97,50 @@ async def place_test_call(
     }
 
 
+def _webhook_url() -> str | None:
+    """Where Retell should POST call_started/call_ended/call_analyzed for agents we
+    provision. None when there's no public URL — the hosted-LLM path is meant to work
+    with no tunnel at all, so this stays optional rather than a hard requirement.
+
+    The cost of it being None: no call lifecycle events arrive, so calls sit at
+    status="in_progress" until someone runs POST /api/calls/sync. That reconcile path
+    exists precisely to cover this case.
+    """
+    if not settings.public_base_url:
+        return None
+    return f"{settings.public_base_url.rstrip('/')}/webhooks/retell"
+
+
 async def _provision_hosted_llm_agent(
     db: AsyncSession, adapter: RetellAdapter, agent: Agent, prompt: str
 ) -> str:
-    """Retell's own hosted LLM. Caches {llm_id, agent_id} under voice_config["retell"]
-    so a subsequent test call only needs a prompt update, not a recreate.
+    """Retell's own hosted LLM. Caches {llm_id, agent_id, webhook_url} under
+    voice_config["retell"] so a subsequent test call only needs a prompt update, not a
+    recreate.
+
+    Keyed on webhook_url as well as agent_id: a Retell agent's webhook URL is fixed at
+    creation time, so an agent provisioned before PUBLIC_BASE_URL was set (or under a
+    since-restarted tunnel) would otherwise keep pointing at a dead/absent webhook
+    forever and its calls would never leave in_progress. Detecting the mismatch and
+    recreating mirrors what _provision_custom_llm_agent does for ws_url.
     """
     retell_ids: dict = dict((agent.voice_config or {}).get("retell") or {})
+    webhook_url = _webhook_url()
 
     if retell_ids.get("llm_id"):
         await adapter.update_llm(retell_ids["llm_id"], prompt)
     else:
         retell_ids["llm_id"] = await adapter.create_llm(prompt)
 
-    if not retell_ids.get("agent_id"):
+    if not retell_ids.get("agent_id") or retell_ids.get("webhook_url") != webhook_url:
         voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
         retell_ids["agent_id"] = await adapter.create_agent_with_llm(
-            name=agent.name, llm_id=retell_ids["llm_id"], voice_id=voice_id
+            name=agent.name,
+            llm_id=retell_ids["llm_id"],
+            voice_id=voice_id,
+            webhook_url=webhook_url,
         )
+        retell_ids["webhook_url"] = webhook_url
 
     agent.voice_config = {**(agent.voice_config or {}), "retell": retell_ids}
     await db.commit()
@@ -137,9 +163,9 @@ async def _provision_custom_llm_agent(
     explicitly below rather than silently ignored. (Tracked follow-up, not a bug: see
     phase0.md's next-files list.)
 
-    Caches {agent_id, ws_url} under voice_config["retell_custom"], keyed on ws_url so a
-    tunnel restart (which changes PUBLIC_BASE_URL) is detected and re-provisions
-    automatically instead of silently pointing Retell at a dead websocket.
+    Caches {agent_id, ws_url, webhook_url} under voice_config["retell_custom"], keyed on
+    both URLs so a tunnel restart (which changes PUBLIC_BASE_URL) is detected and
+    re-provisions automatically instead of silently pointing Retell at a dead websocket.
     """
     if system_prompt_override:
         raise TestCallError(
@@ -160,18 +186,30 @@ async def _provision_custom_llm_agent(
     ws_url = f"{ws_base}/llm-websocket"
 
     cached: dict = dict((agent.voice_config or {}).get("retell_custom") or {})
+    webhook_url = _webhook_url()
 
-    if cached.get("agent_id") and cached.get("ws_url") == ws_url:
+    if (
+        cached.get("agent_id")
+        and cached.get("ws_url") == ws_url
+        and cached.get("webhook_url") == webhook_url
+    ):
         return cached["agent_id"]
 
     voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
     agent_external_id = await adapter.create_agent_with_custom_llm(
-        name=agent.name, llm_websocket_url=ws_url, voice_id=voice_id
+        name=agent.name,
+        llm_websocket_url=ws_url,
+        voice_id=voice_id,
+        webhook_url=webhook_url,
     )
 
     agent.voice_config = {
         **(agent.voice_config or {}),
-        "retell_custom": {"agent_id": agent_external_id, "ws_url": ws_url},
+        "retell_custom": {
+            "agent_id": agent_external_id,
+            "ws_url": ws_url,
+            "webhook_url": webhook_url,
+        },
     }
     await db.commit()
     await db.refresh(agent)

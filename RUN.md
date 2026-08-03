@@ -89,10 +89,53 @@ The `tunnel` service logs a `https://<random>.trycloudflare.com` URL that forwar
 API. It's opt-in on purpose — starting it publishes your local backend to the internet.
 Only run it with auth working, and stop it when you're done.
 
-Note: `/webhooks/*` are deliberately unauthenticated (voice platforms can't send our JWT)
-and do **not** yet verify platform signatures — so while the tunnel is up, anyone with the
-URL can post forged call events. That's fine for a short debugging session, not for
-leaving running.
+Set `PUBLIC_BASE_URL` in `.env` to that URL and **recreate** the API container
+(`docker compose up -d api` — `restart` alone does not re-read `.env`). Two things need
+it: Retell's Custom LLM websocket, and the per-agent `webhook_url` that call lifecycle
+events are delivered to. Without it, calls never leave `in_progress` until you press
+"Sync status" on the Calls page (see below).
+
+`/webhooks/retell` verifies Retell's `X-Retell-Signature` (`RETELL_VERIFY_WEBHOOKS=true`
+by default), so a forged POST is rejected with 401. Retell only signs with the API key
+carrying the **webhook badge** in their dashboard — if every event starts failing
+verification, that's the first thing to check. `/webhooks/vapi` is still unverified.
+
+## When calls are stuck showing "In progress"
+
+Webhook delivery is best-effort — no tunnel, an unset `PUBLIC_BASE_URL`, or a tunnel that
+restarted mid-call all mean the `call_ended` event is simply lost, and the row sits at
+`in_progress` with 0s duration forever.
+
+Press **Sync status** on the Calls page (or `POST /api/calls/sync`) to pull authoritative
+state — status, duration, transcript, sentiment — straight from the voice platform for
+every still-in-progress call. See ADR-007 in `CONTEXT.md`.
+
+## Using DeepSeek instead of Retell's built-in LLM
+
+On an agent's detail page, the **Conversation engine** card switches between:
+
+- **Retell built-in LLM** (default) — zero setup, no tunnel. DeepSeek and server-side
+  tools are *not* exercised.
+- **DeepSeek (custom LLM)** — Retell relays the conversation to our websocket
+  (`backend/api/retell_ws.py`), which answers with DeepSeek + server-side tools. Requires
+  `PUBLIC_BASE_URL` and a running tunnel, plus `DEEPSEEK_API_KEY`.
+
+Switching re-provisions the agent with Retell on the next test call automatically.
+
+**If the DeepSeek path "does nothing"** — the caller hears dead air and nothing appears in
+the logs — run:
+
+```bash
+uv run python scripts/check_custom_llm.py
+```
+
+It walks the same chain Retell walks (config → tunnel → DeepSeek → websocket, ending with a
+real DeepSeek exchange over `wss://` from the public internet) and tells you which link is
+broken, without spending a phone call.
+
+The usual culprit is a stale `PUBLIC_BASE_URL`. **A dead tunnel still reports `Up` in
+`docker compose ps`** — it sits in a silent reconnect loop. Trust
+`curl $PUBLIC_BASE_URL/health`, not the container status.
 
 ## Tests
 

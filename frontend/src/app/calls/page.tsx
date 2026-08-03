@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 
 import { CallTable } from "@/components/CallTable";
 import { CallsIcon, SearchIcon } from "@/components/icons";
-import { Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
-import { api } from "@/lib/api";
+import { Button, Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
+import { api, getApiErrorMessage } from "@/lib/api";
 import { Call } from "@/lib/types";
 
 const FILTERS: { value: "all" | Call["status"]; label: string }[] = [
@@ -21,14 +21,44 @@ export default function CallsPage() {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<"all" | Call["status"]>("all");
   const [query, setQuery] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
 
-  useEffect(() => {
-    api
+  function loadCalls() {
+    return api
       .get<Call[]>("/calls", { params: { limit: 100 } })
       .then((res) => setCalls(res.data))
       .catch(() => setCalls([]))
       .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    loadCalls();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const stuckCount = useMemo(
+    () => calls.filter((c) => c.status === "in_progress").length,
+    [calls],
+  );
+
+  async function syncCalls() {
+    setSyncing(true);
+    setSyncNote(null);
+    try {
+      const res = await api.post<{ updated: number }>("/calls/sync");
+      await loadCalls();
+      setSyncNote(
+        res.data.updated > 0
+          ? `Updated ${res.data.updated} call${res.data.updated === 1 ? "" : "s"}.`
+          : "No changes — the platform still reports these as active.",
+      );
+    } catch (err) {
+      setSyncNote(getApiErrorMessage(err, "Sync failed. Check the backend logs."));
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   const filtered = useMemo(() => {
     return calls.filter((c) => {
@@ -63,18 +93,35 @@ export default function CallsPage() {
           })}
         </div>
 
-        <div className="relative sm:w-64">
-          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
-            <SearchIcon width={16} height={16} />
-          </span>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by number"
-            className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-brand-300 focus:outline-none"
-          />
+        <div className="flex items-center gap-2">
+          <div className="relative sm:w-64">
+            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+              <SearchIcon width={16} height={16} />
+            </span>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search by number"
+              className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-brand-300 focus:outline-none"
+            />
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={syncCalls}
+            disabled={syncing || stuckCount === 0}
+            title={
+              stuckCount === 0
+                ? "No calls are still in progress"
+                : `Re-check ${stuckCount} in-progress call${stuckCount === 1 ? "" : "s"} against the voice platform`
+            }
+          >
+            {syncing ? "Syncing…" : "Sync status"}
+          </Button>
         </div>
       </div>
+
+      {syncNote && <p className="mb-3 text-xs text-slate-500">{syncNote}</p>}
 
       <Card className="p-5">
         {loading ? (

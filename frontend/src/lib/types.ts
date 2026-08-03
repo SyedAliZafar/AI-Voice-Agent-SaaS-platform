@@ -4,6 +4,9 @@ export interface Agent {
   system_prompt: string;
   voice_config: Record<string, unknown>;
   platform: "retell" | "vapi";
+  // false -> Retell's built-in LLM answers. true -> our Custom LLM websocket answers
+  // with DeepSeek + server-side tools (needs PUBLIC_BASE_URL + a running tunnel).
+  use_custom_llm: boolean;
   created_at: string;
 }
 

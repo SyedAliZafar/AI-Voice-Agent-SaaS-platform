@@ -1214,6 +1214,24 @@ wheels = [
 ]
 
 [[package]]
+name = "retell-sdk"
+version = "5.60.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "cryptography" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f7/d5/0f479c76812d9ccb23daeec3a4fc8778139d7c3a91eef32fbcbf9dcf13ab/retell_sdk-5.60.0.tar.gz", hash = "sha256:1e3a1984301ee90c760540a7dbb74bbdff7d8cc7e6fbbc17ea010b3332d497cf", size = 559696, upload-time = "2026-08-01T03:24:19.294Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/eb/211bae893261af77895226b83ea687ee17db96ad5cdf68e7324e65e0d5d4/retell_sdk-5.60.0-py3-none-any.whl", hash = "sha256:8335cb1e90722aa754ff594de1e6466db32506cf89b68f384cfa57218b160b6d", size = 560852, upload-time = "2026-08-01T03:24:17.858Z" },
+]
+
+[[package]]
 name = "rsa"
 version = "4.9.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1488,6 +1506,7 @@ dependencies = [
     { name = "python-jose", extra = ["cryptography"] },
     { name = "python-multipart" },
     { name = "redis" },
+    { name = "retell-sdk" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1520,6 +1539,7 @@ requires-dist = [
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.3.0" },
     { name = "python-multipart", specifier = ">=0.0.12" },
     { name = "redis", specifier = ">=5.2.0" },
+    { name = "retell-sdk", specifier = ">=4.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },

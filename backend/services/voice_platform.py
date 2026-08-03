@@ -64,6 +64,25 @@ class VoicePlatformAdapter(ABC):
         """Place an outbound call. Returns the platform's call ID."""
         raise NotImplementedError(f"{type(self).__name__} does not support create_outbound_call")
 
+    async def get_call(self, call_external_id: str) -> dict[str, Any]:
+        """Fetch authoritative state for one call from the platform.
+
+        Backs call_service.reconcile_call — the self-healing path for calls whose
+        lifecycle webhook never arrived. Expected to return at least the platform's
+        status plus, once terminal, duration/transcript/analysis.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support get_call")
+
+    def verify_webhook_signature(self, raw_body: str, signature: str | None) -> bool:
+        """Verify a platform webhook's signature over the raw request body.
+
+        Default denies: a platform without a real implementation must not be treated as
+        verified. Callers gate on their own settings flag before reaching this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support verify_webhook_signature"
+        )
+
 
 def get_adapter(platform: str) -> VoicePlatformAdapter:
     """Factory — returns the correct adapter for an agent's configured platform."""
