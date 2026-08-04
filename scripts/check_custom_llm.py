@@ -28,7 +28,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import httpx
 import websockets
 from sqlalchemy import select
 
@@ -37,6 +36,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.agent import Agent
 from backend.models.call import Call
 from backend.models.tenant import Tenant
+from backend.services import tunnel_check
 
 settings = get_settings()
 
@@ -74,22 +74,23 @@ def check_config() -> None:
               "will fail until it's set.")
 
 
-def check_tunnel() -> None:
+async def check_tunnel() -> None:
     print("\n2. Tunnel reachability")
     url = f"{settings.public_base_url.rstrip('/')}/health"
-    try:
-        resp = httpx.get(url, timeout=20.0)
-    except Exception as exc:
+    # Shared with test_call_service's preflight guard (backend/services/tunnel_check.py)
+    # so this diagnostic and the runtime check can't silently drift apart. One request,
+    # not two: a second independent GET here could flake differently than the one the
+    # helper already made.
+    reason = await tunnel_check.check_public_url_reachable(settings.public_base_url, timeout=20.0)
+    if reason:
         _fail(
-            f"cannot reach {url} ({type(exc).__name__}: {exc})",
+            reason,
             "the quick tunnel's hostname changes on every restart, and a long-running one "
             "can die while the container still reports 'Up'. Check `docker compose logs "
             "tunnel` for the CURRENT https://*.trycloudflare.com URL, update PUBLIC_BASE_URL, "
             "and recreate the api container.",
         )
-    if resp.status_code != 200:
-        _fail(f"{url} returned HTTP {resp.status_code}", "is the api container running?")
-    print(f"{OK}   {url} -> {resp.status_code} {resp.text.strip()}")
+    print(f"{OK}   {url} -> 200 (reachable)")
 
 
 async def check_deepseek() -> None:
@@ -234,7 +235,7 @@ async def check_websocket() -> None:
 async def main() -> None:
     print("Custom LLM (DeepSeek) path diagnostic\n" + "=" * 38)
     check_config()
-    check_tunnel()
+    await check_tunnel()
     await check_deepseek()
     await check_websocket()
     print("\n" + "=" * 38)

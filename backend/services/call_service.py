@@ -39,7 +39,10 @@ from backend.models.call import Call, Transcript
 logger = logging.getLogger(__name__)
 
 # Retell disconnection_reason -> our Call.status. Anything ended and not listed here is
-# a normal completion ("resolved"). Source: Retell's call object docs.
+# a normal completion ("resolved"). Source: Retell's call object docs — this is their
+# full documented enum, not a guessed subset. error_* reasons are handled separately by
+# the reason.startswith("error") branch in _status_for, so they're deliberately absent
+# here rather than duplicated.
 _TRANSFER_REASONS = {"call_transfer"}
 _FAILURE_REASONS = {
     "dial_busy",
@@ -50,8 +53,17 @@ _FAILURE_REASONS = {
     "registered_call_timeout",
     "no_valid_payment",
     "concurrency_limit_reached",
+    "no_concurrency_fallback",
     "scam_detected",
     "error_user_not_joined",
+    # The callee declined or let it ring out unanswered — never became a real
+    # conversation, same bucket as dial_no_answer above.
+    "user_declined",
+    "invalid_destination",
+    "telephony_provider_permission_denied",
+    "telephony_provider_unavailable",
+    "sip_routing_error",
+    "marked_as_spam",
 }
 
 # Retell's call_analysis.user_sentiment is categorical; Call.sentiment_score is a float.

@@ -35,6 +35,14 @@ export default function DashboardPage() {
     [calls],
   );
 
+  // Same rationale as the Calls page: a webhook resolving a call server-side never
+  // reaches an already-open tab on its own. Only runs while something's in flight.
+  useEffect(() => {
+    if (stuckCount === 0) return;
+    const id = setInterval(loadCalls, 8000);
+    return () => clearInterval(id);
+  }, [stuckCount]);
+
   async function syncCalls() {
     setSyncing(true);
     setSyncNote(null);

@@ -42,6 +42,15 @@ export default function CallsPage() {
     [calls],
   );
 
+  // A webhook resolving a call server-side never reaches an already-open tab on its
+  // own — without this, "is it still in progress?" is a question the user can only
+  // answer by manually reloading. Only runs while something's actually in flight.
+  useEffect(() => {
+    if (stuckCount === 0) return;
+    const id = setInterval(loadCalls, 8000);
+    return () => clearInterval(id);
+  }, [stuckCount]);
+
   async function syncCalls() {
     setSyncing(true);
     setSyncNote(null);

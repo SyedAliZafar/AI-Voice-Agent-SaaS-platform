@@ -119,6 +119,48 @@ async def test_retell_dial_failure_marks_failed(client, db_session, tenant_id, u
     assert updated.status == "failed"
 
 
+@pytest.mark.parametrize(
+    "disconnection_reason",
+    [
+        "user_declined",  # the reported scenario: callee declined / let it ring out
+        "invalid_destination",
+        "telephony_provider_permission_denied",
+        "telephony_provider_unavailable",
+        "sip_routing_error",
+        "marked_as_spam",
+        "no_concurrency_fallback",
+    ],
+)
+@pytest.mark.asyncio
+async def test_retell_never_connected_reasons_mark_failed(
+    client, db_session, tenant_id, unsigned_webhooks, disconnection_reason
+):
+    """These disconnection_reason values (Retell's real, documented enum) all mean the
+    call never became a real conversation. Before this fix they weren't in
+    _FAILURE_REASONS, so they silently defaulted to "resolved" — the wrong terminal
+    status for a call nobody answered.
+    """
+    external_id = f"call_never_connected_{disconnection_reason}"
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), external_id, "+491701234567"
+    )
+
+    await client.post(
+        "/webhooks/retell",
+        json={
+            "event": "call_ended",
+            "call": {
+                "call_id": external_id,
+                "call_status": "ended",
+                "disconnection_reason": disconnection_reason,
+            },
+        },
+    )
+
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated.status == "failed"
+
+
 @pytest.mark.asyncio
 async def test_retell_call_analyzed_sets_sentiment(
     client, db_session, tenant_id, unsigned_webhooks

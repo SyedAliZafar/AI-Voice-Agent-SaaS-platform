@@ -8,7 +8,9 @@ in your own terminals). Pick one.
 | Symptom | What to do |
 |---|---|
 | Calls stuck at "In progress", 0s duration | Press **Sync status** on the Calls page (or `POST /api/calls/sync`) — see ["When calls are stuck"](#when-calls-are-stuck-showing-in-progress) |
-| `docker compose ps` shows `tunnel` as `Up` but nothing works | Don't trust it — check `docker compose logs tunnel` for the *current* `https://*.trycloudflare.com` URL, or `curl $PUBLIC_BASE_URL/health`. A dead tunnel sits in a silent reconnect loop while still reporting `Up`. |
+| Custom-LLM test call returns a 422 "not reachable" | The tunnel is down — this is the preflight guard working as intended, not a bug. It just saved you a billed call to dead air. Check `docker compose logs tunnel`, or run `scripts/check_custom_llm.py` for the full chain. |
+| Quick tunnel (`tunnel-quick`): `docker compose ps` shows `Up` but nothing works | Don't trust it — check `docker compose logs tunnel-quick` for the *current* `https://*.trycloudflare.com` URL, or `curl $PUBLIC_BASE_URL/health`. It sits in a silent reconnect loop while still reporting `Up`. Consider switching to the named tunnel (Option A below) so this stops happening. |
+| Named tunnel (`tunnel`): `docker compose ps` shows unhealthy | Trustworthy this time — its healthcheck calls cloudflared's own `/ready`. Check `docker compose logs tunnel` for why the connection isn't registering (bad `CF_TUNNEL_TOKEN` is the usual cause). |
 | Changed `PUBLIC_BASE_URL` in `.env` but nothing changed | `docker compose restart api` does **not** re-read `.env` — run `docker compose up -d api` to recreate the container. |
 | Custom-LLM (DeepSeek) call gives dead air, nothing in the logs | `uv run python scripts/check_custom_llm.py` — walks config → tunnel → LLM → websocket and prints which link is broken |
 | Webhooks returning 401 | Confirm `RETELL_API_KEY` is the key with the **webhook badge** in Retell's dashboard — only that one signs requests |
@@ -90,21 +92,64 @@ handy for testing a second tenant — mint one with `--tenant-id <uuid>`.)
 
 ## Exposing the API publicly (Retell webhooks / custom-LLM websocket)
 
-Retell can't reach `localhost`. To give it a public URL:
+Retell can't reach `localhost`. Two ways to give it a public URL — pick one profile.
+Both are opt-in by design: starting either publishes your local backend to the internet,
+so only run one with auth working (`backend/api/deps.py`), and stop it when you're done.
+
+### Option A — Named tunnel (recommended)
+
+A permanent hostname: set `PUBLIC_BASE_URL` once and it never changes again, so no
+re-provisioning churn and no risk of a stale URL silently going dead mid-session.
+Needs a free Cloudflare account and a domain you control.
+
+**One-time setup:**
+```bash
+cloudflared tunnel login                                    # opens a browser, pick a zone
+cloudflared tunnel create voiceagent                        # prints a tunnel UUID
+cloudflared tunnel route dns voiceagent voiceagent.<your-domain>
+cloudflared tunnel token voiceagent                          # prints the token
+```
+Put that token in `.env` as `CF_TUNNEL_TOKEN`, and set
+`PUBLIC_BASE_URL=https://voiceagent.<your-domain>`. Then:
 
 ```bash
-docker compose --profile tunnel up
+docker compose --profile tunnel up -d
+docker compose up -d api   # recreate — `restart` alone does not re-read .env
 ```
 
-The `tunnel` service logs a `https://<random>.trycloudflare.com` URL that forwards to the
-API. It's opt-in on purpose — starting it publishes your local backend to the internet.
-Only run it with auth working, and stop it when you're done.
+`docker compose ps` now reports a real health status for the `tunnel` service (backed by
+cloudflared's own `/ready` endpoint, not just "the process is running") — see the
+troubleshooting table below for what a failing healthcheck means.
 
-Set `PUBLIC_BASE_URL` in `.env` to that URL and **recreate** the API container
-(`docker compose up -d api` — `restart` alone does not re-read `.env`). Two things need
-it: Retell's Custom LLM websocket, and the per-agent `webhook_url` that call lifecycle
-events are delivered to. Without it, calls never leave `in_progress` until you press
-"Sync status" on the Calls page (see below).
+### Option B — Quick tunnel (zero setup, not for anything you'll leave running)
+
+```bash
+docker compose --profile tunnel-quick up
+```
+
+Logs a `https://<random>.trycloudflare.com` URL that forwards to the API. No account
+needed, but two things bite:
+- The hostname changes on **every restart** — update `PUBLIC_BASE_URL` and recreate the
+  API container each time.
+- The tunnel can **silently die mid-session** while `docker compose ps` still reports it
+  as `Up` — it sits in a reconnect loop instead of exiting. This is what caused custom-LLM
+  calls to go to dead air on 2026-08-04 (see `phase3.md`): the tunnel died ~45 minutes
+  after being restarted, and nothing surfaced that until a live call failed.
+
+If you hit that, don't trust `docker compose ps` — check `docker compose logs tunnel` for
+the *current* URL, or `curl $PUBLIC_BASE_URL/health`.
+
+### Either way
+
+Two things need `PUBLIC_BASE_URL`: Retell's Custom LLM websocket, and the per-agent
+`webhook_url` that call lifecycle events are delivered to. Without it, calls never leave
+`in_progress` until you press "Sync status" on the Calls page (see below).
+
+As of the tunnel-death incident above, placing a **custom-LLM** test call now preflights
+`PUBLIC_BASE_URL` reachability before dialing (`backend/services/tunnel_check.py`) — an
+unreachable tunnel fails immediately with a 422 explaining why, instead of silently
+spending a real, billed call on dead air. This check is custom-LLM-only; the hosted-LLM
+path is designed to work with no tunnel at all and must keep working without one.
 
 `/webhooks/retell` verifies Retell's `X-Retell-Signature` (`RETELL_VERIFY_WEBHOOKS=true`
 by default), so a forged POST is rejected with 401. Retell only signs with the API key
@@ -160,11 +205,15 @@ uv run python scripts/check_custom_llm.py
 
 It walks the same chain Retell walks (config → tunnel → LLM → websocket, ending with a
 real completion over `wss://` from the public internet) and tells you which link is
-broken, without spending a phone call.
+broken, without spending a phone call. Its tunnel-reachability step (step 2) shares code
+with the preflight check `place_test_call` now runs automatically before every custom-LLM
+dial (`backend/services/tunnel_check.py`), so the two can't drift apart.
 
-The usual culprit is a stale `PUBLIC_BASE_URL`. **A dead tunnel still reports `Up` in
-`docker compose ps`** — it sits in a silent reconnect loop. Trust
-`curl $PUBLIC_BASE_URL/health`, not the container status.
+The usual culprit is a stale `PUBLIC_BASE_URL` — most common on the quick tunnel (Option
+B above), whose hostname changes every restart and which **can still report `Up` in
+`docker compose ps` while actually dead**, sitting in a silent reconnect loop. Trust
+`curl $PUBLIC_BASE_URL/health`, not the container status. The named tunnel (Option A)
+doesn't have this problem — its healthcheck reflects real connection state.
 
 ## Trying an agent without a phone call
 

@@ -58,15 +58,49 @@ services:
       --proxy-headers --forwarded-allow-ips=*
 
   # Public ingress for local dev — Retell has to reach this backend from the internet
-  # (webhooks today, the custom-LLM websocket next). Opt-in by design:
-  #     docker compose --profile tunnel up
-  # Starting it publishes your local API to a public URL, so only run it once auth is
-  # working (backend/api/deps.py) and never leave it running unattended. Prints a
-  # https://<random>.trycloudflare.com URL in its logs; the wss:// form of that same
-  # host is what a Retell custom-LLM agent would be pointed at.
+  # (webhooks, and the custom-LLM websocket). Opt-in by design: starting either service
+  # below publishes your local API to a public URL, so only run one once auth is working
+  # (backend/api/deps.py) and never leave it running unattended.
+  #
+  # Two options, pick one profile:
+  #
+  #   docker compose --profile tunnel up -d        # named tunnel, permanent hostname
+  #   docker compose --profile tunnel-quick up -d  # quick tunnel, zero setup
+  #
+  # `tunnel` (recommended) needs a one-time Cloudflare setup that produces CF_TUNNEL_TOKEN
+  # in .env — see RUN.md "Named tunnel setup". The payoff: PUBLIC_BASE_URL never changes,
+  # so it's set once and never has to be updated again.
+  #
+  # `tunnel-quick` needs no account, but its https://<random>.trycloudflare.com hostname
+  # changes on every restart, AND the tunnel can silently die mid-session while
+  # `docker compose ps` still reports it as Up (see RUN.md) — that exact failure mode is
+  # what caused custom-LLM calls to go to dead air on 2026-08-04. Fine for a quick check,
+  # not for anything you want to leave running.
   tunnel:
     image: cloudflare/cloudflared:latest
     profiles: ["tunnel"]
+    # CF_TUNNEL_TOKEN comes from the project's .env, substituted here by `docker compose`
+    # itself (not passed into the container as an env var) — see RUN.md for how to mint
+    # one. --metrics exposes the /ready endpoint the healthcheck below calls.
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 run --token ${CF_TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - api
+    healthcheck:
+      # `cloudflared tunnel ready` hits its own /ready endpoint and only exits 0 once a
+      # connection is actually registered — unlike `docker compose ps`, this catches the
+      # "stuck in a silent reconnect loop while still reporting Up" failure documented in
+      # RUN.md and CONTEXT.md ADR-007. cloudflared's image has no shell, so this has to be
+      # its own subcommand rather than a curl/wget one-liner.
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "0.0.0.0:20241", "ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  tunnel-quick:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel-quick"]
     command: tunnel --no-autoupdate --url http://api:8000
     depends_on:
       - api

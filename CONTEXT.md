@@ -77,6 +77,7 @@ voiceagent/
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
+│   │   ├── tunnel_check.py       # PUBLIC_BASE_URL reachability probe, shared by the custom-LLM preflight guard and scripts/check_custom_llm.py
 │   │   ├── llm_service.py        # Provider-agnostic LLM calls (DeepSeek/OpenAI, ADR-008), tool execution
 │   │   ├── sandbox_service.py    # Text-chat agent testing sandbox — no phone call, see "Agent testing sandbox" flow
 │   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
@@ -273,6 +274,16 @@ Signature verification (`X-Retell-Signature`, HMAC-SHA256 over the raw body with
 `RetellAdapter.verify_webhook_signature`. It must run against the **raw** request bytes,
 which is why `webhooks.py` reads the body itself rather than taking a parsed Pydantic
 model as a route parameter.
+
+Reconciliation repairs a dead tunnel after the fact; it doesn't stop one from wasting a
+call in the first place. The custom-LLM path (below) additionally *preflights*
+`PUBLIC_BASE_URL` reachability before dialing (`backend/services/tunnel_check.py`,
+called from `test_call_service._provision_custom_llm_agent`) — a dead tunnel fails the
+test-call request immediately with a 422 instead of Retell dialing a websocket nobody's
+listening on. Same root cause the fix above targets (a quick tunnel can die mid-session
+while `docker compose ps` still reports `Up`), different point in time: this catches it
+*before* the call, reconciliation catches it *after*. Hosted-LLM agents are exempt —
+that path is designed to work with no tunnel at all.
 
 ### ADR-008: Provider-agnostic LLM, chosen per agent
 `llm_service.py` was hardcoded to one module-level `AsyncOpenAI(base_url="https://api.deepseek.com")`

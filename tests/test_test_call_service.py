@@ -248,6 +248,10 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
     with (
         patch("backend.services.test_call_service.settings") as mock_settings,
         patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
     ):
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
@@ -347,6 +351,10 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
     with (
         patch("backend.services.test_call_service.settings") as mock_settings,
         patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
     ):
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
@@ -365,3 +373,73 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         to_number="+491701234567",
         agent_external_id="fresh_agent",
     )
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_fails_fast_when_tunnel_unreachable(
+    db_session, tenant_id
+):
+    """A quick tunnel's hostname can stop resolving, or the tunnel can die while
+    `docker compose ps` still reports it as Up (see RUN.md/CONTEXT.md ADR-007) — Retell
+    would then dial a websocket it can't reach and the caller gets dead air. This must be
+    caught before a real, billed call is placed, not after.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+
+    mock_adapter = AsyncMock()
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value="cannot connect to https://dead-tunnel.trycloudflare.com/health"),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.public_base_url = "https://dead-tunnel.trycloudflare.com"
+
+        with pytest.raises(test_call_service.TestCallError, match="not reachable"):
+            await test_call_service.place_test_call(
+                db_session, agent.id, tenant_id, "+491701234567"
+            )
+
+    # The whole point: no agent provisioned, no call dialed, no telephony spend.
+    mock_adapter.create_agent_with_custom_llm.assert_not_awaited()
+    mock_adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_hosted_llm_ignores_tunnel_reachability(db_session, tenant_id):
+    """The hosted-LLM path is designed to work with no tunnel at all (lifecycle events
+    just don't arrive until POST /api/calls/sync) — it must not start requiring one.
+    """
+    agent = await agent_service.create_agent(
+        db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Hi")
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_llm.return_value = "llm_1"
+    mock_adapter.create_agent_with_llm.return_value = "agent_1"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+    unreachable = AsyncMock(return_value="cannot connect (unused on this path)")
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch("backend.services.tunnel_check.check_public_url_reachable", new=unreachable),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://dead-tunnel.trycloudflare.com"
+
+        result = await test_call_service.place_test_call(
+            db_session, agent.id, tenant_id, "+491701234567"
+        )
+
+    assert result["status"] == "dialing"
+    unreachable.assert_not_awaited()
