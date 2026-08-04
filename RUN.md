@@ -3,6 +3,17 @@
 Two ways to run this locally: full Docker Compose stack, or manual (backend/frontend
 in your own terminals). Pick one.
 
+## Troubleshooting quick reference
+
+| Symptom | What to do |
+|---|---|
+| Calls stuck at "In progress", 0s duration | Press **Sync status** on the Calls page (or `POST /api/calls/sync`) — see ["When calls are stuck"](#when-calls-are-stuck-showing-in-progress) |
+| `docker compose ps` shows `tunnel` as `Up` but nothing works | Don't trust it — check `docker compose logs tunnel` for the *current* `https://*.trycloudflare.com` URL, or `curl $PUBLIC_BASE_URL/health`. A dead tunnel sits in a silent reconnect loop while still reporting `Up`. |
+| Changed `PUBLIC_BASE_URL` in `.env` but nothing changed | `docker compose restart api` does **not** re-read `.env` — run `docker compose up -d api` to recreate the container. |
+| Custom-LLM (DeepSeek) call gives dead air, nothing in the logs | `uv run python scripts/check_custom_llm.py` — walks config → tunnel → LLM → websocket and prints which link is broken |
+| Webhooks returning 401 | Confirm `RETELL_API_KEY` is the key with the **webhook badge** in Retell's dashboard — only that one signs requests |
+| Need to see what a caller actually said | `GET /api/calls/{id}/transcript` or the Calls page → call detail — see ["Transcripts"](#transcripts) below |
+
 ## Option A — Docker Compose (everything, including the worker)
 
 ```bash
@@ -109,6 +120,21 @@ restarted mid-call all mean the `call_ended` event is simply lost, and the row s
 Press **Sync status** on the Calls page (or `POST /api/calls/sync`) to pull authoritative
 state — status, duration, transcript, sentiment — straight from the voice platform for
 every still-in-progress call. See ADR-007 in `CONTEXT.md`.
+
+## Transcripts
+
+Every call gets a transcript, written two ways depending on the path:
+
+- **Custom-LLM (DeepSeek) calls** write it live, turn-by-turn, as the conversation
+  happens (`retell_ws.py` → `call_service.record_turns`).
+- **Every call** — custom-LLM or Retell's hosted LLM — also gets Retell's own post-call
+  `transcript_object` written as the authoritative final version once `call_ended` /
+  `call_analyzed` arrives. This is the *only* writer for hosted-LLM calls, which have no
+  live websocket.
+
+View it on a call's detail page (`/calls/{id}`) or `GET /api/calls/{id}/transcript`. A
+call that never resolves (stuck `in_progress`, see above) never gets the final write
+either — reconciling it is what unblocks both the status and the transcript.
 
 ## Using a Custom LLM instead of Retell's built-in LLM
 

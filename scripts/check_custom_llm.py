@@ -212,8 +212,18 @@ async def check_websocket() -> None:
     finally:
         from sqlalchemy import delete
 
+        from backend.models.call import Transcript
+
         async with AsyncSessionLocal() as db:
-            await db.execute(delete(Call).where(Call.external_id == external_id))
+            # retell_ws.py writes a Transcript row turn-by-turn during the exchange above
+            # (no cascade on transcripts.call_id), so it must go before the Call or the FK
+            # delete fails and leaves both rows orphaned.
+            call_row = (
+                await db.execute(select(Call).where(Call.external_id == external_id))
+            ).scalar_one_or_none()
+            if call_row is not None:
+                await db.execute(delete(Transcript).where(Transcript.call_id == call_row.id))
+                await db.execute(delete(Call).where(Call.id == call_row.id))
             await db.execute(delete(Agent).where(Agent.id == agent_id))
             if created_tenant:
                 await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
