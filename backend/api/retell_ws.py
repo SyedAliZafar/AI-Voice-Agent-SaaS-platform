@@ -65,11 +65,28 @@ _LEDGER_ARG_KEYS: dict[str, tuple[str, ...]] = {
     "book_appointment": ("start_time", "attendee_email"),
     "create_lead": ("email",),
     "send_sms": ("to_number", "message"),
+    # cancel/reschedule identify WHICH booking they act on, not a date/email like
+    # book_appointment — the booking_uid itself is the identifying argument
+    # (outliers.md §5).
+    "cancel_appointment": ("booking_uid",),
+    "reschedule_appointment": ("booking_uid",),
 }
 _LEDGER_RESULT_ID_KEYS: dict[str, str] = {
     "book_appointment": "confirmation_id",
     "create_lead": "contact_id",
     "send_sms": "message_id",
+    "reschedule_appointment": "confirmation_id",
+    # cancel_appointment has no separate id worth displaying — its own target
+    # booking_uid (already in `args` above) is the only reference that matters.
+}
+# Additional result fields worth carrying in a ledger entry beyond the single
+# display-oriented result_id above. Currently only booking_uid: cancel/reschedule need
+# Cal.com's string uid to act on a booking, never the numeric id result_id stores —
+# without this, the model has no way to reference "the appointment I just booked" from
+# the ledger note it already reads every turn (outliers.md §5).
+_LEDGER_EXTRA_RESULT_KEYS: dict[str, tuple[str, ...]] = {
+    "book_appointment": ("booking_uid",),
+    "reschedule_appointment": ("booking_uid",),
 }
 _LEDGER_MAX_ARG_LEN = 40
 _LEDGER_MAX_ENTRIES = 10
@@ -91,12 +108,28 @@ def _ledger_entry(
     tool: str, arguments: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any] | None:
     """Builds one ledger entry for a completed tool call, or None if `tool` isn't one
-    the ledger tracks (see the module-level comment above _LEDGER_ARG_KEYS)."""
+    the ledger tracks (see the module-level comment above _LEDGER_ARG_KEYS), or if the
+    result is an unconfirmed outcome (backend.tools.base.uncertain_result — a timeout
+    that may or may not have actually happened server-side, outliers.md §5). An
+    unconfirmed dispatch must not be recorded as completed: the ledger's whole purpose is
+    telling the model "this is already done," which isn't true here, and a caller
+    retrying it must not be blocked as a duplicate of something we never confirmed."""
+    if result.get("status") == "uncertain":
+        return None
     args = _ledger_args_key(tool, arguments)
     if args is None:
         return None
     result_id = result.get(_LEDGER_RESULT_ID_KEYS.get(tool, ""), "")
-    return {"tool": tool, "args": args, "result_id": str(result_id)[:_LEDGER_MAX_ARG_LEN]}
+    extras = {
+        k: str(result.get(k, ""))[:_LEDGER_MAX_ARG_LEN]
+        for k in _LEDGER_EXTRA_RESULT_KEYS.get(tool, ())
+    }
+    return {
+        "tool": tool,
+        "args": args,
+        "result_id": str(result_id)[:_LEDGER_MAX_ARG_LEN],
+        "extras": extras,
+    }
 
 
 def _find_duplicate_ledger_entry(
@@ -131,14 +164,23 @@ def _duplicate_tool_result(tool: str, entry: dict[str, Any]) -> dict[str, Any]:
     negative) not to repeat it. "instruction" here tells the model what to SAY, at the
     exact moment — inside the tool result it's about to reason over — that it needs it,
     rather than relying on it remembering a system message from earlier in the prompt.
+
+    Includes the matched entry's extras (currently only booking_uid) alongside
+    result_id — a duplicate reschedule_appointment request matches on the OLD
+    booking_uid it was asked to act on, but the model needs the NEW one (issued by the
+    first, successful call) for anything further, not the stale value it just sent.
     """
+    extras = entry.get("extras") or {}
     return {
         "already_completed": True,
         "reference": entry["result_id"],
+        **extras,
         "instruction": (
             f"This {tool} request was already completed earlier in this call "
-            f"(reference {entry['result_id']}). Do not call {tool} again for it — tell "
-            f"the caller it's already done, and confirm the details back to them."
+            f"(reference {entry['result_id']}"
+            + (f", {', '.join(f'{k}={v}' for k, v in extras.items())}" if extras else "")
+            + f"). Do not call {tool} again for it — tell the caller it's already done, "
+            f"and confirm the details back to them."
         ),
     }
 
@@ -169,10 +211,12 @@ def _ledger_note(entries: list[dict[str, Any]]) -> str:
 
     tail = deduped[-_LEDGER_MAX_ENTRIES:]
     omitted = len(deduped) - len(tail)
-    lines = [
-        f"- {e['tool']}({', '.join(f'{k}={v}' for k, v in e['args'].items())}) -> {e['result_id']}"
-        for e in tail
-    ]
+    lines = []
+    for e in tail:
+        extras = e.get("extras") or {}
+        extras_suffix = f" [{', '.join(f'{k}={v}' for k, v in extras.items())}]" if extras else ""
+        args_str = ", ".join(f"{k}={v}" for k, v in e["args"].items())
+        lines.append(f"- {e['tool']}({args_str}) -> {e['result_id']}{extras_suffix}")
     if omitted > 0:
         lines.insert(0, f"...and {omitted} earlier actions")
     return "Already completed on this call — do NOT repeat these:\n" + "\n".join(lines)

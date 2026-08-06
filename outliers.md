@@ -150,7 +150,17 @@ real (fast) latency.
 
 ---
 
-## 3. The agent told the caller a slot was unavailable without ever checking [CODE FIX SHIPPED 2026-08-06, NOT YET VERIFIED ON A REAL CALL]
+## 3. The agent told the caller a slot was unavailable without ever checking [CODE FIX SHIPPED 2026-08-06, VERIFIED ON A REAL CALL 2026-08-06]
+
+**Verified on a real call, 2026-08-06** (`call_910852d582fc38af11783cae8ce`). Checked
+against the `CallEvent` trail and Cal.com directly, not the transcript alone. Three
+availability claims in the call, every one backed by a `check_availability`
+dispatch/result immediately before it: 9am requested → check → `available: true` → booked
+(`23454702`); 1pm requested → check → `available: false` with `nearby_alternatives` →
+agent offered 1:15pm from the tool result, not a guess; 1:15pm accepted → check →
+`available: true` → booked (`23454719`). Zero fabricated availability claims — direct
+contrast with the original incident below. (The same call surfaced a different, new
+finding — see §5.)
 
 **Update:** the missing capability now exists. `check_availability`
 (`backend/tools/check_availability.py` → `integration_service.check_calendar_availability`)
@@ -249,3 +259,195 @@ as repeats of something already done.
 it) would save a round-trip per bad attempt and reduce caller-facing friction — two full
 turns of "let me try that again" instead of the model catching an obviously malformed
 address itself. Not scoping a session for this now; recorded so it doesn't get lost.
+
+---
+
+## 5. The agent claimed it cancelled an appointment it has no way to cancel [CODE FIX SHIPPED 2026-08-06, VERIFIED ON A REAL CALL — SURFACED TWO MORE BUGS, SEE §6]
+
+**Update:** the missing capability now exists — two tools, not one, mirroring Cal.com's
+own two distinct atomic endpoints rather than a merged tool that would have to compose
+"cancel, then book_appointment again" (a real race: cancel succeeds, rebooking fails,
+caller loses the appointment entirely — strictly worse than this bug).
+`cancel_appointment`/`reschedule_appointment` (`backend/tools/cancel_appointment.py`,
+`reschedule_appointment.py`) call new `integration_service.cancel_calendar_booking`/
+`reschedule_calendar_booking` functions, `POST /v2/bookings/{bookingUid}/cancel` and
+`.../reschedule` — verified against the real API before coding, not assumed: cancelling
+the real leftover `23454702` booking from this incident (also the requested cleanup)
+confirmed the exact response shape live, and a throwaway book→reschedule→cancel probe
+confirmed a genuine open risk flagged during research — **a successful reschedule
+returns a NEW `uid`, not the one sent in**, since Cal.com supersedes the original booking
+rather than mutating it in place (the new booking carries `rescheduledFromUid` pointing
+back to the old one).
+
+That finding exposed a real gap in existing code, fixed as part of this: `book_appointment.py`'s
+handler previously returned only the numeric Cal.com `id` and silently discarded `uid` —
+but cancel/reschedule need exactly the string `uid`, never the numeric id. Fixed to
+capture and return `booking_uid`. The ADR-009 §4c ledger gained a matching extension
+(`_LEDGER_EXTRA_RESULT_KEYS`) so the model can read a booking's `uid` back out of the
+ledger note it already sees every turn — no new backend-side lookup logic, consistent
+with how duplicate-detection already works purely on what the model itself passes as
+arguments. The uid-rotation risk self-resolves without special-casing: a reschedule
+becomes its own ledger entry keyed on the *old* uid it acted on, with the *new* uid in
+its `extras`, so a genuine follow-up change naturally reads the newest uid rather than
+being blocked as a duplicate of the (now-stale) first request.
+
+Both tools are tracked by the ADR-009 §4c ledger, keyed on `booking_uid` — same
+duplicate-dispatch protection as `book_appointment`/`create_lead`/`send_sms`.
+
+**Verified on a real call, 2026-08-06** (`call_e28e21214404ebb3054eeb9eb7a`). The core
+fix holds on the case that matters most: asked to cancel an appointment from *before this
+call*, the agent correctly refused rather than fabricate — *"I only have access to
+appointments booked during this call... I'm not able to look up appointments made outside
+of this call."* Later in the same call it booked, then rescheduled, an appointment, and
+the `CallEvent` trail confirms `reschedule_appointment` (not a second `book_appointment`)
+is what dispatched. This same call also surfaced two new, real bugs — see §6; both fixed
+in code, not just logged. **Cleanup done**: booking `23454702` (the original 9am,
+never-cancelled duplicate) was cancelled for real as part of verifying the fix (see
+Update above), specifically requested by the user. `23454719` (1:15pm) is left live
+deliberately — cancelling `23454702` resolves the calendar to exactly what the caller
+was originally told and wanted: one appointment, at 1:15pm.
+
+**Original diagnosis, 2026-08-06 (kept verbatim for the record):**
+
+**What happened:** Same real call as §3's verification (`call_910852d582fc38af11783cae8ce`,
+2026-08-06). After booking 9am (confirmation `23454702`), the caller asked to
+**reschedule**: *"Is it possible to change my appointment to one PM tomorrow?"* The agent
+replied *"Let me cancel the nine AM and check the new time,"* then checked 1pm
+(unavailable), offered 1:15pm, checked it (available), and booked it (confirmation
+`23454719`).
+
+**No cancellation ever happened.** `backend/tools/__init__.py` registers exactly six
+tools — `check_availability`, `book_appointment`, `lookup_customer`, `create_lead`,
+`transfer_call`, `send_sms` — none of which cancels or reschedules anything. The
+`CallEvent` trail for this call has zero cancel-type dispatches; only two
+`check_availability` and two `book_appointment` pairs, all accounted for in §3's table
+above. Confirmed directly against Cal.com (not our DB, not the transcript) that both
+bookings are still live:
+
+```
+id=23454702  start=2026-08-07T09:00  status=accepted  ali@gmail.com
+id=23454719  start=2026-08-07T11:15  status=accepted  ali@gmail.com
+```
+
+**The caller now has two real appointments tomorrow — 9:00am and 1:15pm — and was told
+they have one, moved to 1:15.** Both bookings are still on the calendar as of this
+writing; not cleaned up, since deciding whether to cancel one is a real decision, not a
+test-data cleanup step.
+
+**Why this is the same root cause as §3, in a different tool:** no capability exists to
+act on, so the model is again cornered into refusing or fabricating — except this time
+it fabricated an *action taken* ("let me cancel") rather than a *fact asserted*
+("that time isn't available"), which is arguably worse: a false availability claim can be
+caught by asking again, but a false cancellation claim leaves a real, silent double-booking
+the caller has no reason to suspect.
+
+**Fix directions, not yet scoped:**
+- Add a `cancel_appointment` / `reschedule_appointment` tool, almost certainly backed by
+  Cal.com's booking-cancel or reschedule endpoint — **verify the actual v2 shape before
+  coding it**, same standing rule as §3 and the v1→v2 migration. Cal.com v2 has separate
+  reschedule vs. cancel semantics (a reschedule typically cancels the old booking and
+  creates a new one, or PATCHes the existing one — don't assume which without checking).
+- Until that tool exists, the system prompt needs an explicit instruction not to claim a
+  cancellation or reschedule it has no tool for — the same category of stopgap noted for
+  §3 before its tool existed, and just as much a temporary patch over a missing
+  capability rather than a real fix.
+- Needs its own real-call verification once built, same rigor as §1/§3: confirm a cancel
+  dispatch actually appears in the `CallEvent` trail and the old booking's status changes
+  on Cal.com, not just that the agent says the right words.
+
+---
+
+## 6. Real-call verification of §5 surfaced two more bugs [BOTH FIXED 2026-08-06]
+
+Same real call as §5's verification (`call_e28e21214404ebb3054eeb9eb7a`, 2026-08-06).
+The `CallEvent` trail (`tool_call` rows, chronological):
+
+```
+dispatched cancel_appointment {"booking_uid": "INVALID_UID", "reason": "Caller requested cancellation"}
+error      cancel_appointment  Cal.com 404: "Booking with uid=INVALID_UID not found"
+...
+dispatched book_appointment   {"start_time": "2026-08-07T16:00:00", ..., "attendee_email": "ali@gmail.com"}
+result     book_appointment    {"booked": true, "confirmation_id": 23459147, "booking_uid": "oiErEHCFYoNowtG8hxRnQT"}
+dispatched cancel_appointment {"booking_uid": "oiErEHCFYoNowtG8hxRnQT"}                      <- no reason given
+error      cancel_appointment  Cal.com 400: "Cancellation reason is required"
+...
+dispatched reschedule_appointment {"booking_uid": "oiErEHCFYoNowtG8hxRnQT", "new_start_time": "2026-08-07T13:30:00"}
+error      reschedule_appointment  (empty — dispatched 12:27:46.017657, errored 12:28:06.12382, ~20.1s later)
+```
+
+Transcript, the turn right after that last error:
+
+> agent: *"I'll reschedule your 4 PM appointment to 1:30 PM now. Your appointment has
+> been moved to 1:30 PM tomorrow."*
+
+Checked directly against Cal.com (not the transcript, not the agent's claim):
+
+```
+id=23459147 uid=oiErEHCFYoNowtG8hxRnQT  start=2026-08-07T14:00:00Z  status=cancelled   <- old 4pm, superseded
+id=23459208 uid=vLK1P2HHXLwHaCN6dMFUD7  start=2026-08-07T11:30:00Z  status=accepted    <- new 1:30pm, real
+```
+
+The reschedule had genuinely succeeded server-side. The caller ended up correctly
+informed — but by luck, not by guarantee. Two distinct bugs:
+
+**Bug #1 — `cancellationReason` isn't actually optional, contradicting Cal.com's own v2
+docs.** The first cancel attempt above (with a real reason) never got that far because it
+used an invented `booking_uid` — a separate, lower-severity issue: the model fabricated a
+`booking_uid` for an appointment it had no record of, rather than refusing the tool call
+outright. Cal.com's own validation caught it (404), and the fabricated attempt never
+reached the caller's ears, so no real harm — but it's a live example of the model not
+fully complying with "never invent a booking_uid" even with the instruction in place,
+worth remembering next time §5's system-prompt compliance is evaluated. The second cancel
+attempt (real `booking_uid`, no reason given) is the actual bug: `cancel_calendar_booking`
+sent an empty body when `reason` was omitted, and Cal.com rejected it outright. **Fixed**:
+`integration_service.cancel_calendar_booking` now always sends a `cancellationReason`,
+falling back to `"Cancelled by caller"` when the caller didn't give one.
+
+**Bug #2 — more serious: an unconfirmed timeout got reported as a bare error, and the
+model then claimed success anyway.** The `reschedule_appointment` timeout (~20.1s,
+matching the client's `timeout=20.0` almost exactly) produced `{"error": ""}` — empty,
+and structurally indistinguishable from a confirmed rejection like the 400 just above it.
+The model's next turn asserted the reschedule had succeeded, with nothing in the tool
+result confirming that — a direct violation of the system prompt's *"never tell the
+caller a booking, cancellation, or reschedule succeeded unless the tool result actually
+confirms it,"* which was already in place and didn't hold. It happened to be true this
+time only because Cal.com kept processing the request after our client gave up waiting
+for the response — the same timeout on a request that genuinely failed server-side would
+have produced an identical, equally confident, false confirmation.
+
+Per explicit instruction, this was fixed in code, not left as a prompt-only patch (the
+prompt instruction already existed and that alone wasn't enough):
+
+- `integration_service.IntegrationTimeoutError(IntegrationError)` — a new, distinct
+  exception type. `book_calendar_slot`, `cancel_calendar_booking`, and
+  `reschedule_calendar_booking` now catch `httpx.TimeoutException` around their POST
+  call and raise this instead of letting a bare exception propagate — applied
+  structurally to all three side-effecting tools, not just reschedule, since nothing
+  about the ambiguity is reschedule-specific.
+- `backend/tools/base.uncertain_result(action)` — a shared helper each of
+  `book_appointment`/`cancel_appointment`/`reschedule_appointment`'s handlers now call on
+  catching `IntegrationTimeoutError`, returning `{"status": "uncertain", "instruction":
+  ...}` — deliberately **not** shaped like `{"error": ...}`, so the distinction survives
+  at a glance in the `CallEvent` audit trail too, not just in prose the model has to
+  parse correctly under time pressure. The instruction text explicitly forbids
+  confirming success *or* failure and tells the model to say it'll follow up.
+- `retell_ws._ledger_entry` now returns `None` for a result with `status: "uncertain"` —
+  an unconfirmed outcome must not be recorded as completed (nothing to tell the model
+  "already done" about) or block a genuine retry as a false duplicate.
+
+**What this doesn't do, by explicit choice under time budget:** a smarter fix would
+reconcile an unconfirmed timeout with a follow-up read — for `cancel_appointment`
+specifically, a `GET` on the known `booking_uid` could often resolve the ambiguity
+outright instead of asking the model to hedge. Not implemented now: that's another
+unverified Cal.com endpoint shape to confirm live, and `reschedule_appointment`'s version
+of the same idea is harder (the *new* uid after a successful reschedule isn't
+discoverable without a further, undocumented lookup). The uniform "uncertain" result
+was chosen deliberately over a partial, tool-inconsistent reconciliation — worth
+revisiting if false "I'll follow up" hedges turn out to be common in practice.
+
+Tests: `tests/test_integration_service.py` gained a timeout test per function
+(`TestBookCalendarSlot`, `TestCancelCalendarBooking`, `TestRescheduleCalendarBooking`)
+plus the corrected default-reason assertion; `tests/test_tools/test_base.py` (new) for
+`uncertain_result`'s shape; each tool's test file gained a timeout-returns-uncertain
+test; `tests/test_retell_ws.py` gained a test confirming `_ledger_entry` excludes an
+uncertain result.

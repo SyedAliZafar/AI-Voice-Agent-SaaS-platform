@@ -9,6 +9,7 @@ path targets v2; these lock in the parts of that contract that are easy to regre
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from backend.services import integration_service
@@ -90,6 +91,28 @@ class TestBookCalendarSlot:
 
         assert result == {"id": 456}
 
+    @pytest.mark.asyncio
+    async def test_timeout_raises_integration_timeout_error_not_a_bare_failure(self):
+        """outliers.md §5: a timeout is not a confirmed failure — Cal.com may have
+        created the booking before our client gave up waiting."""
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            with pytest.raises(integration_service.IntegrationTimeoutError) as exc_info:
+                await integration_service.book_calendar_slot(
+                    calendar_id="1",
+                    start_time="2026-08-05T14:00:00Z",
+                    duration_min=30,
+                    attendee_email="c@example.com",
+                    api_key="k",
+                )
+
+        assert "not a confirmed failure" in str(exc_info.value)
+
 
 class TestErrorSurfacing:
     """The provider's own message must reach the caller — it becomes the tool result the
@@ -151,6 +174,218 @@ class TestErrorSurfacing:
             )
 
         assert "crm_api_key" in str(exc_info.value)
+
+
+class TestCancelCalendarBooking:
+    """outliers.md §5. Response shape below matches a real cancellation captured
+    2026-08-06 (booking 23454702, cancelled as part of this session's verification —
+    HTTP 200, {status, data: {id, uid, status: "cancelled", ...}})."""
+
+    @pytest.mark.asyncio
+    async def test_posts_cancel_with_bookings_api_version(self):
+        ctx, client = _mock_client(
+            {"status": "success", "data": {"id": 23454702, "uid": "abc123", "status": "cancelled"}}
+        )
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            result = await integration_service.cancel_calendar_booking(
+                booking_uid="abc123", api_key="cal_live_x", reason="caller changed plans"
+            )
+
+        url = client.post.call_args.args[0]
+        headers = client.post.call_args.kwargs["headers"]
+        body = client.post.call_args.kwargs["json"]
+
+        assert url == "https://api.cal.com/v2/bookings/abc123/cancel"
+        assert headers["Authorization"] == "Bearer cal_live_x"
+        # Same version as POST /v2/bookings, confirmed on two independent doc fetches —
+        # NOT SLOTS_API_VERSION.
+        assert headers["cal-api-version"] == integration_service.CAL_API_VERSION
+        assert body == {"cancellationReason": "caller changed plans"}
+        assert result == {"id": 23454702, "uid": "abc123", "status": "cancelled"}
+
+    @pytest.mark.asyncio
+    async def test_no_reason_sends_a_default_not_an_empty_body(self):
+        """Cal.com's real API rejects an empty cancel body with "Cancellation reason is
+        required" — confirmed live on 2026-08-06 (outliers.md §5), contradicting the v2
+        docs, which describe cancellationReason as optional. Sending a default keeps a
+        no-reason cancel from failing over something this minor."""
+        ctx, client = _mock_client({"status": "success", "data": {"status": "cancelled"}})
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            await integration_service.cancel_calendar_booking(booking_uid="abc123", api_key="k")
+
+        assert client.post.call_args.kwargs["json"] == {"cancellationReason": "Cancelled by caller"}
+
+    @pytest.mark.asyncio
+    async def test_given_reason_is_used_verbatim(self):
+        ctx, client = _mock_client({"status": "success", "data": {"status": "cancelled"}})
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            await integration_service.cancel_calendar_booking(
+                booking_uid="abc123", api_key="k", reason="caller changed plans"
+            )
+
+        assert client.post.call_args.kwargs["json"] == {
+            "cancellationReason": "caller changed plans"
+        }
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_integration_timeout_error_not_a_bare_failure(self):
+        """outliers.md §5: a timeout is not a confirmed failure — Cal.com may have
+        cancelled the booking before our client gave up waiting. Must raise the
+        distinct IntegrationTimeoutError, not plain IntegrationError, so callers
+        (backend/tools/cancel_appointment.py) can tell the two apart."""
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            with pytest.raises(integration_service.IntegrationTimeoutError) as exc_info:
+                await integration_service.cancel_calendar_booking(booking_uid="abc123", api_key="k")
+
+        assert "not a confirmed failure" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_missing_booking_uid_fails_before_any_request(self):
+        with pytest.raises(integration_service.IntegrationError) as exc_info:
+            await integration_service.cancel_calendar_booking(booking_uid="", api_key="k")
+        assert "booking_uid" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_missing_calendar_key_fails_with_actionable_message(self):
+        with pytest.raises(integration_service.IntegrationError) as exc_info:
+            await integration_service.cancel_calendar_booking(booking_uid="abc123", api_key="")
+        message = str(exc_info.value)
+        assert "calendar_api_key" in message
+        assert "cancel_appointment" in message
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_surfaced(self):
+        response = MagicMock()
+        response.is_success = False
+        response.status_code = 404
+        response.text = '{"error":{"message":"Booking not found"}}'
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            with pytest.raises(integration_service.IntegrationError) as exc_info:
+                await integration_service.cancel_calendar_booking(
+                    booking_uid="nonexistent", api_key="k"
+                )
+
+        assert "Booking not found" in str(exc_info.value)
+
+
+class TestRescheduleCalendarBooking:
+    """outliers.md §5. Response shape below matches a real reschedule captured
+    2026-08-06 via a throwaway probe (booked, rescheduled, then cancelled) — HTTP 201,
+    and critically the response's uid genuinely differs from the uid sent in the path
+    (Cal.com supersedes the original booking rather than mutating it in place; the new
+    booking carries rescheduledFromUid pointing back to the old one)."""
+
+    @pytest.mark.asyncio
+    async def test_posts_reschedule_with_new_start_and_bookings_api_version(self):
+        ctx, client = _mock_client(
+            {
+                "status": "success",
+                "data": {
+                    "id": 23458118,
+                    "uid": "7Nkg5eeZcBYhKBSVJ5Q4Bf",
+                    "rescheduledFromUid": "apDZg7ypUAabseubCCF8as",
+                    "status": "accepted",
+                },
+            }
+        )
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            result = await integration_service.reschedule_calendar_booking(
+                booking_uid="apDZg7ypUAabseubCCF8as",
+                new_start_time="2026-08-10T10:00:00",
+                api_key="cal_live_x",
+                time_zone="Europe/Berlin",
+            )
+
+        url = client.post.call_args.args[0]
+        headers = client.post.call_args.kwargs["headers"]
+        body = client.post.call_args.kwargs["json"]
+
+        assert url == "https://api.cal.com/v2/bookings/apDZg7ypUAabseubCCF8as/reschedule"
+        assert headers["cal-api-version"] == integration_service.CAL_API_VERSION
+        # Naive input resolved in the agent's configured timezone, same as book_calendar_slot.
+        assert body == {"start": "2026-08-10T08:00:00Z"}
+        # THE uid IN THE RESULT IS NOT THE ONE THAT WAS PASSED IN — confirmed against a
+        # real reschedule, not assumed. Callers (reschedule_appointment.py, the ADR-009
+        # ledger) must treat this as the appointment's new current identifier.
+        assert result["uid"] == "7Nkg5eeZcBYhKBSVJ5Q4Bf"
+        assert result["uid"] != "apDZg7ypUAabseubCCF8as"
+
+    @pytest.mark.asyncio
+    async def test_missing_booking_uid_fails_before_any_request(self):
+        with pytest.raises(integration_service.IntegrationError) as exc_info:
+            await integration_service.reschedule_calendar_booking(
+                booking_uid="", new_start_time="2026-08-10T10:00:00", api_key="k"
+            )
+        assert "booking_uid" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_missing_calendar_key_fails_with_actionable_message(self):
+        with pytest.raises(integration_service.IntegrationError) as exc_info:
+            await integration_service.reschedule_calendar_booking(
+                booking_uid="abc123", new_start_time="2026-08-10T10:00:00", api_key=""
+            )
+        message = str(exc_info.value)
+        assert "calendar_api_key" in message
+        assert "reschedule_appointment" in message
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_surfaced(self):
+        response = MagicMock()
+        response.is_success = False
+        response.status_code = 400
+        response.text = (
+            '{"error":{"message":"User either already has booking at this time '
+            'or is not available"}}'
+        )
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            with pytest.raises(integration_service.IntegrationError) as exc_info:
+                await integration_service.reschedule_calendar_booking(
+                    booking_uid="abc123", new_start_time="2026-08-10T10:00:00", api_key="k"
+                )
+
+        assert "not available" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_integration_timeout_error_not_a_bare_failure(self):
+        """This exact case happened on a real call, 2026-08-06 (outliers.md §5): the
+        reschedule request timed out client-side, and Cal.com had genuinely completed
+        it before our client gave up waiting. Must raise the distinct
+        IntegrationTimeoutError so callers know this isn't a confirmed failure."""
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=client)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(integration_service.httpx, "AsyncClient", return_value=ctx):
+            with pytest.raises(integration_service.IntegrationTimeoutError) as exc_info:
+                await integration_service.reschedule_calendar_booking(
+                    booking_uid="abc123", new_start_time="2026-08-10T10:00:00", api_key="k"
+                )
+
+        assert "not a confirmed failure" in str(exc_info.value)
 
 
 class TestToUtcIso:

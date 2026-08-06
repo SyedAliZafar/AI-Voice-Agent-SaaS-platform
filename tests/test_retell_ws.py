@@ -41,6 +41,8 @@ from starlette.websockets import WebSocketDisconnect
 from backend.api.retell_ws import (
     _duplicate_tool_result,
     _find_duplicate_ledger_entry,
+    _ledger_entry,
+    _ledger_note,
     _to_conversation_history,
 )
 from backend.main import app
@@ -811,6 +813,79 @@ class TestFindDuplicateLedgerEntry:
     def test_empty_ledger_never_matches(self):
         assert _find_duplicate_ledger_entry("book_appointment", {"start_time": "t"}, []) is None
 
+    def test_cancel_and_reschedule_match_on_booking_uid(self):
+        """outliers.md §5: cancel/reschedule identify WHICH booking they act on, not a
+        date/email like book_appointment — booking_uid is the identifying argument."""
+        completed = [
+            {"tool": "cancel_appointment", "args": {"booking_uid": "abc123"}, "result_id": ""},
+            {
+                "tool": "reschedule_appointment",
+                "args": {"booking_uid": "old-uid"},
+                "result_id": "23458118",
+                "extras": {"booking_uid": "new-uid"},
+            },
+        ]
+        assert (
+            _find_duplicate_ledger_entry("cancel_appointment", {"booking_uid": "abc123"}, completed)
+            is not None
+        )
+        assert (
+            _find_duplicate_ledger_entry(
+                "reschedule_appointment", {"booking_uid": "old-uid"}, completed
+            )
+            is not None
+        )
+
+    def test_reschedule_using_the_new_post_reschedule_uid_is_not_a_duplicate(self):
+        """The uid-rotation self-resolution the plan relies on: after a successful
+        reschedule the ledger entry is keyed on the OLD uid it acted on, so a genuine
+        follow-up reschedule of the SAME appointment — using the NEW uid the first call
+        returned — is a different key and must not be blocked."""
+        completed = [
+            {
+                "tool": "reschedule_appointment",
+                "args": {"booking_uid": "old-uid"},
+                "result_id": "23458118",
+                "extras": {"booking_uid": "new-uid"},
+            }
+        ]
+        entry = _find_duplicate_ledger_entry(
+            "reschedule_appointment", {"booking_uid": "new-uid"}, completed
+        )
+        assert entry is None
+
+
+class TestLedgerEntry:
+    def test_book_appointment_captures_booking_uid_as_an_extra(self):
+        """outliers.md §5: without this, cancel_appointment/reschedule_appointment have
+        no way to identify which real Cal.com booking to act on — the numeric
+        confirmation_id alone is insufficient (Cal.com's cancel/reschedule endpoints key
+        on the string uid)."""
+        entry = _ledger_entry(
+            "book_appointment",
+            {"start_time": "2026-08-07T09:00:00", "attendee_email": "a@b.com"},
+            {"booked": True, "confirmation_id": 23454702, "booking_uid": "1WU1GSoy6wKwjwq69nSA4U"},
+        )
+        assert entry["extras"] == {"booking_uid": "1WU1GSoy6wKwjwq69nSA4U"}
+
+    def test_cancel_appointment_has_no_extras(self):
+        entry = _ledger_entry(
+            "cancel_appointment", {"booking_uid": "abc123"}, {"status": "cancelled"}
+        )
+        assert entry["extras"] == {}
+
+    def test_uncertain_result_is_not_recorded_as_completed(self):
+        """outliers.md §5: a timeout means the outcome is unconfirmed, not that it
+        completed. Recording it in the ledger would tell the model something is "already
+        done" that we don't actually know happened, and would block a genuine retry as a
+        false duplicate."""
+        entry = _ledger_entry(
+            "reschedule_appointment",
+            {"booking_uid": "old-uid"},
+            {"status": "uncertain", "instruction": "..."},
+        )
+        assert entry is None
+
 
 class TestDuplicateToolResult:
     def test_gives_a_positive_instruction_not_just_a_prohibition(self):
@@ -827,6 +902,42 @@ class TestDuplicateToolResult:
         # A positive action, not only a negative constraint.
         assert "tell the caller" in instruction
         assert "already done" in instruction or "already completed" in instruction
+
+    def test_surfaces_extras_so_a_duplicate_reschedule_gets_the_current_uid(self):
+        """outliers.md §5: a duplicate reschedule_appointment request matches on the OLD
+        booking_uid it was asked to act on, but anything the model does next needs the
+        NEW uid the first, successful call already returned — not the stale value it
+        just sent again."""
+        entry = {
+            "tool": "reschedule_appointment",
+            "args": {"booking_uid": "old-uid"},
+            "result_id": "23458118",
+            "extras": {"booking_uid": "new-uid"},
+        }
+        result = _duplicate_tool_result("reschedule_appointment", entry)
+
+        assert result["booking_uid"] == "new-uid"
+        assert "new-uid" in result["instruction"]
+
+
+class TestLedgerNote:
+    def test_renders_extras_inline(self):
+        entries = [
+            _ledger_entry(
+                "book_appointment",
+                {"start_time": "2026-08-07T09:00:00", "attendee_email": "a@b.com"},
+                {"confirmation_id": 23454702, "booking_uid": "1WU1GSoy6wKwjwq69nSA4U"},
+            )
+        ]
+        note = _ledger_note(entries)
+        assert "booking_uid=1WU1GSoy6wKwjwq69nSA4U" in note
+
+    def test_entry_without_extras_renders_without_brackets(self):
+        entries = [
+            _ledger_entry("cancel_appointment", {"booking_uid": "abc123"}, {"status": "cancelled"})
+        ]
+        note = _ledger_note(entries)
+        assert "[" not in note.split("\n", 1)[1]
 
 
 def test_llm_websocket_duplicate_request_skips_real_dispatch_and_reaches_check_duplicate(

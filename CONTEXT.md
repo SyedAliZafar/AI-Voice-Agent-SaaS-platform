@@ -92,6 +92,8 @@ voiceagent/
 │   │   ├── base.py               # BaseTool abstract class
 │   │   ├── book_appointment.py
 │   │   ├── check_availability.py # read-only "is this slot free?" (see ADR-009 note)
+│   │   ├── cancel_appointment.py     # (ADR-009 §4c, outliers.md §5)
+│   │   ├── reschedule_appointment.py # (ADR-009 §4c, outliers.md §5)
 │   │   ├── lookup_customer.py
 │   │   ├── create_lead.py
 │   │   ├── transfer_call.py
@@ -409,6 +411,57 @@ slice of phase4.md Session 8 (server-enforced confirmation gating) — the
 This still isn't a substitute for real idempotency keys in `integration_service` — the
 duplicate check only catches a *repeat* dispatch our own process observed; it can't help
 if the process restarts between attempts. That remains open.
+
+**§4c update, 2026-08-06 — the ledger needed a capability, not just a check, for
+cancel/reschedule.** A different real call hit a gap the above fix doesn't cover: the
+caller asked to reschedule a booking, the agent said "let me cancel the nine AM," but no
+cancel/reschedule tool existed at all — the model fabricated an *action taken*, not just
+a fact, leaving a silent real double-booking. Full writeup: `outliers.md` §5.
+
+Fix: two new tools, `cancel_appointment`/`reschedule_appointment`
+(`backend/tools/cancel_appointment.py`, `reschedule_appointment.py`), backed by new
+`integration_service.cancel_calendar_booking`/`reschedule_calendar_booking` functions —
+`POST /v2/bookings/{bookingUid}/cancel` and `.../reschedule`, same `CAL_API_VERSION` as
+booking creation. Deliberately two tools mirroring Cal.com's own two atomic endpoints,
+not a merged tool composing "cancel then book_appointment again," which would reintroduce
+a real race (cancel succeeds, rebooking fails, caller loses the appointment entirely).
+Verified against the real API before coding — a live cancel and a throwaway
+book→reschedule→cancel probe, not docs alone — and that probe surfaced a real,
+easy-to-miss contract detail: **a successful reschedule returns a NEW `uid`, not the one
+sent in** (Cal.com supersedes the original booking rather than mutating it; the new
+booking carries `rescheduledFromUid` back to the old one).
+
+That in turn exposed a pre-existing gap: `book_appointment.py`'s handler returned only
+the numeric Cal.com `id`, discarding `uid` — but cancel/reschedule need exactly the
+string `uid`. Now captured and returned as `booking_uid`. The ledger gained
+`_LEDGER_EXTRA_RESULT_KEYS`, a second per-entry field alongside the existing
+`result_id`, so the model can read a booking's `uid` straight out of the ledger note it
+already sees every turn — no new backend-side lookup, same principle as the rest of
+§4c: the model supplies identifying arguments, the backend only matches/enforces. The
+uid-rotation risk self-resolves without special-casing: a reschedule is its own ledger
+entry keyed on the *old* uid it acted on, carrying the *new* uid in `extras`, so a
+genuine follow-up change reads the current uid rather than being blocked as a duplicate
+of the now-stale original request. Both new tools are tracked by the same
+`check_duplicate` mechanism above, keyed on `booking_uid`.
+
+**§4c update, 2026-08-06 (later same day) — a timeout is not a confirmed failure, and
+the prompt instruction alone didn't hold.** Real-call verification of the fix above
+found a `reschedule_appointment` request time out client-side; the bare error result
+this produced was indistinguishable from a confirmed rejection, and the model told the
+caller it succeeded anyway. It happened to be true — Cal.com had processed the request
+before the client gave up waiting — but only by luck; the same timeout on a genuinely
+failed request would have produced an identical false confirmation, despite the system
+prompt already saying not to claim success without tool confirmation. Full writeup:
+`outliers.md` §6.
+
+Fixed in code: `integration_service.IntegrationTimeoutError`, raised when
+`httpx.TimeoutException` interrupts the POST in `book_calendar_slot`/
+`cancel_calendar_booking`/`reschedule_calendar_booking` — applied to all three, since
+nothing about the ambiguity is specific to reschedule. `backend/tools/base.uncertain_result`
+gives each tool's handler a result shaped `{"status": "uncertain", ...}`, deliberately
+not `{"error": ...}`, so the distinction survives in the `CallEvent` audit trail at a
+glance, not only in prose the model has to parse correctly mid-call. `retell_ws._ledger_entry`
+excludes it from the ledger — an unconfirmed outcome isn't "already done."
 
 **Instrumentation.** `llm_events` keeps the same `{stage, model, duration_ms,
 prompt_tokens, completion_tokens}` shape the Session 4 baseline established — no schema

@@ -35,11 +35,32 @@ SLOTS_API_VERSION = "2024-09-04"
 # without reading a list at the caller.
 _MAX_ALTERNATIVES = 3
 
+# Shared by every Cal.com-mutating call (book/cancel/reschedule) so the timeout value in
+# an IntegrationTimeoutError's message can never drift from the client's actual timeout.
+_CALCOM_TIMEOUT_SECONDS = 20.0
+
 
 class IntegrationError(Exception):
     """A third-party API rejected the request, or it isn't configured. Carries the
     provider's own error text so the LLM can react to it (e.g. offer another time when a
     slot is taken) instead of guessing from a status code."""
+
+
+class IntegrationTimeoutError(IntegrationError):
+    """The request timed out waiting for a response — NOT a confirmed failure.
+
+    A live call on 2026-08-06 (outliers.md §5) confirmed exactly why this distinction
+    matters: a reschedule_appointment dispatch timed out client-side after
+    _CALCOM_TIMEOUT_SECONDS with no response, our code reported a bare error, and the
+    model told the caller it succeeded anyway — which happened to be true (Cal.com had
+    processed the request and moved the booking before our client gave up waiting for
+    the response), but only by luck. The same timeout on a request that genuinely failed
+    server-side would produce an identical, equally confident, false claim.
+
+    Callers (backend/tools/base.py's uncertain_result) must not treat this the same as a
+    definite rejection (a 400/404, which raises plain IntegrationError) — the request may
+    have been received and processed by Cal.com even though we never saw the response.
+    """
 
 
 def _raise_for_status_with_body(resp: httpx.Response, provider: str) -> None:
@@ -133,25 +154,31 @@ async def book_calendar_slot(
     """
     _require(api_key, "calendar_api_key", "book_appointment")
     _require(calendar_id, "calendar_id", "book_appointment")
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            "https://api.cal.com/v2/bookings",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "cal-api-version": CAL_API_VERSION,
-                "Content-Type": "application/json",
-            },
-            json={
-                # eventTypeId is numeric in v2; ToolConfig.config stores it as a string.
-                "eventTypeId": int(calendar_id),
-                "start": _to_utc_iso(start_time, time_zone),
-                "attendee": {
-                    "name": attendee_name,
-                    "email": attendee_email,
-                    "timeZone": time_zone,
+    async with httpx.AsyncClient(timeout=_CALCOM_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                "https://api.cal.com/v2/bookings",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "cal-api-version": CAL_API_VERSION,
+                    "Content-Type": "application/json",
                 },
-            },
-        )
+                json={
+                    # eventTypeId is numeric in v2; ToolConfig.config stores it as a string.
+                    "eventTypeId": int(calendar_id),
+                    "start": _to_utc_iso(start_time, time_zone),
+                    "attendee": {
+                        "name": attendee_name,
+                        "email": attendee_email,
+                        "timeZone": time_zone,
+                    },
+                },
+            )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError(
+                f"Cal.com did not respond within {_CALCOM_TIMEOUT_SECONDS}s to a booking "
+                f"request — it may have been created anyway; this is not a confirmed failure."
+            ) from exc
         _raise_for_status_with_body(resp, "Cal.com")
         payload = resp.json()
         # Successful v2 responses wrap the booking as {"status": "success", "data": {...}}.
@@ -192,7 +219,7 @@ async def check_calendar_availability(
     # whose seconds/millis/offset formatting we don't want to depend on.
     requested_key = requested.strftime("%Y-%m-%dT%H:%M")
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=_CALCOM_TIMEOUT_SECONDS) as client:
         resp = await client.get(
             "https://api.cal.com/v2/slots",
             headers={
@@ -238,3 +265,103 @@ async def check_calendar_availability(
         ]
 
     return result
+
+
+async def cancel_calendar_booking(
+    booking_uid: str,
+    api_key: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Cancels a booking via Cal.com's v2 API — outliers.md §5.
+
+    booking_uid, not the numeric id: cancel and reschedule both key on Cal.com's string
+    `uid` in the URL path, confirmed against the real API (`POST
+    /v2/bookings/{bookingUid}/cancel`, verified 2026-08-06 by actually cancelling a real
+    leftover test booking rather than trusting docs alone — response envelope, `data.id`/
+    `data.uid`, and `data.status == "cancelled"` all matched the documented shape exactly).
+    Same cal-api-version as book_calendar_slot (2026-02-25, confirmed on two independent
+    doc fetches) — NOT check_calendar_availability's SLOTS_API_VERSION.
+
+    Returns the booking object itself (the `data` envelope member), same convention as
+    book_calendar_slot/check_calendar_availability — callers read `result["status"]`.
+
+    reason is NOT actually optional against the real API, despite Cal.com's own v2 docs
+    describing cancellationReason as optional. Confirmed live on 2026-08-06: a real call
+    let the caller cancel with no reason given, this sent an empty body as the docs
+    implied was fine, and Cal.com rejected it with "Cancellation reason is required".
+    Falls back to a generic reason rather than failing the whole cancellation over
+    something this minor.
+    """
+    _require(api_key, "calendar_api_key", "cancel_appointment")
+    _require(booking_uid, "booking_uid", "cancel_appointment")
+    async with httpx.AsyncClient(timeout=_CALCOM_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"https://api.cal.com/v2/bookings/{booking_uid}/cancel",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "cal-api-version": CAL_API_VERSION,
+                    "Content-Type": "application/json",
+                },
+                json={"cancellationReason": reason or "Cancelled by caller"},
+            )
+        except httpx.TimeoutException as exc:
+            raise IntegrationTimeoutError(
+                f"Cal.com did not respond within {_CALCOM_TIMEOUT_SECONDS}s to a cancel "
+                f"request — it may have been cancelled anyway; this is not a confirmed failure."
+            ) from exc
+        _raise_for_status_with_body(resp, "Cal.com")
+        payload = resp.json()
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
+
+
+async def reschedule_calendar_booking(
+    booking_uid: str,
+    new_start_time: str,
+    api_key: str,
+    time_zone: str = "UTC",
+) -> dict[str, Any]:
+    """Moves a booking to a new time via Cal.com's v2 API — outliers.md §5.
+
+    One atomic call (`POST /v2/bookings/{bookingUid}/reschedule`) — no separate
+    cancel-then-create orchestration on our side, so no client-side race where a
+    cancellation could succeed while the rebooking fails and the caller loses the
+    appointment entirely.
+
+    booking_uid IN THE RETURNED RESULT IS A NEW VALUE, NOT THE ONE PASSED IN. Confirmed
+    empirically 2026-08-06 (not assumed from docs, which read ambiguously — "the booking
+    is moved" could imply an in-place mutation): a real reschedule probe showed the
+    response's `data.uid` genuinely differs from the `booking_uid` argument — Cal.com
+    auto-cancels the original and issues a new booking (carrying `rescheduledFromUid`
+    pointing back to the old one) in the same call. Callers of this function MUST treat
+    the returned `uid` as the appointment's current identifier for anything that acts on
+    it afterward (retell_ws.py's ledger does this — see reschedule_appointment.py).
+
+    duration_min is not a parameter here: rescheduling doesn't change an event type's
+    length, only its start time.
+    """
+    _require(api_key, "calendar_api_key", "reschedule_appointment")
+    _require(booking_uid, "booking_uid", "reschedule_appointment")
+    async with httpx.AsyncClient(timeout=_CALCOM_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"https://api.cal.com/v2/bookings/{booking_uid}/reschedule",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "cal-api-version": CAL_API_VERSION,
+                    "Content-Type": "application/json",
+                },
+                json={"start": _to_utc_iso(new_start_time, time_zone)},
+            )
+        except httpx.TimeoutException as exc:
+            # This exact case happened live on 2026-08-06 (outliers.md §5): the request
+            # timed out here, and Cal.com had genuinely completed the reschedule before
+            # our client gave up waiting. See IntegrationTimeoutError's docstring.
+            raise IntegrationTimeoutError(
+                f"Cal.com did not respond within {_CALCOM_TIMEOUT_SECONDS}s to a "
+                f"reschedule request — it may have completed anyway; this is not a "
+                f"confirmed failure."
+            ) from exc
+        _raise_for_status_with_body(resp, "Cal.com")
+        payload = resp.json()
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
