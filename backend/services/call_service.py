@@ -34,7 +34,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models.call import Call, Transcript
+from backend.models.call import Call, CallEvent, Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,39 @@ async def record_turns(
         transcript.full_text = "\n".join(f"{t['role']}: {t['text']}" for t in new_turns)
 
 
+async def record_llm_events(db: AsyncSession, call: Call, llm_events: list[dict]) -> None:
+    """One CallEvent(event_type="llm_timing") row per llm_service.get_agent_response()
+    completions.create() call for this turn (see llm_service's llm_events param) — the
+    before/after baseline requested ahead of the streaming-architecture work.
+
+    Caller commits. No-op on an empty list so a text-only turn (no tool calls, or
+    llm_events never populated) doesn't write empty rows.
+    """
+    if not llm_events:
+        return
+    now = datetime.now(UTC)
+    for event in llm_events:
+        db.add(CallEvent(call_id=call.id, event_type="llm_timing", payload=event, ts=now))
+
+
+async def record_tool_event(db: AsyncSession, call: Call, event: dict) -> None:
+    """One CallEvent(event_type="tool_call") row per llm_service._execute_tool_calls
+    on_tool_event callback — a "dispatched" row written before the tool's handler runs
+    and a "result"/"error" row after (see event["phase"]). This is the durable trace that
+    survives a barge-in cancelling the surrounding generation task (ADR-009): the
+    "dispatched" row proves a side-effecting call (e.g. book_appointment's Cal.com POST)
+    was made even if the turn that made it never reaches _persist_and_publish_turn.
+
+    Caller commits. retell_ws.py calls this from a tracked, fire-and-forget task (never
+    inline) — a DB round-trip in front of the tool call itself would put Postgres latency
+    on the turn path, the same reason _persist_and_publish_turn runs after the response
+    frame is sent. Swallows nothing itself; the caller's task wrapper is responsible for
+    catching and logging so a Postgres hiccup can't take down a live call.
+    """
+    db.add(CallEvent(call_id=call.id, event_type="tool_call", payload=event, ts=datetime.now(UTC)))
+    await db.commit()
+
+
 async def handle_transcript_update(
     db: AsyncSession, external_call_id: str, transcript_text: str
 ) -> None:
@@ -285,9 +318,7 @@ def _status_for(call_status: str, disconnection_reason: str | None) -> str | Non
     return "resolved"
 
 
-async def apply_retell_call_state(
-    db: AsyncSession, call: Call, payload: dict[str, Any]
-) -> bool:
+async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[str, Any]) -> bool:
     """Single writer for terminal call state, shared by the webhook and reconcile paths.
 
     `payload` is Retell's call object — the nested "call" from a webhook, or the body of

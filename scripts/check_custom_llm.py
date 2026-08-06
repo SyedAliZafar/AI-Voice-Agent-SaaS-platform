@@ -70,8 +70,10 @@ def check_config() -> None:
     print(f"{OK}   PUBLIC_BASE_URL = {settings.public_base_url}")
     print(f"{OK}   DEEPSEEK_API_KEY set ({len(settings.deepseek_api_key)} chars)")
     if not settings.retell_from_number:
-        print(f"{WARN} RETELL_FROM_NUMBER is empty — fine for this check, but test calls "
-              "will fail until it's set.")
+        print(
+            f"{WARN} RETELL_FROM_NUMBER is empty — fine for this check, but test calls "
+            "will fail until it's set."
+        )
 
 
 async def check_tunnel() -> None:
@@ -184,10 +186,33 @@ async def check_websocket() -> None:
                     }
                 )
             )
-            reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
-            if reply.get("response_type") != "response":
-                _fail(f"expected a response frame, got {reply}", "check retell_ws.py")
-            print(f"{OK}   DeepSeek answered over the socket: {reply.get('content', '')[:80]!r}")
+            # ADR-009: streaming sends one partial frame per token (content_complete:
+            # False) followed by exactly one closing frame (content_complete: True) —
+            # accumulate until that closing frame instead of expecting the whole reply
+            # in a single frame. An overall 60s deadline, same as before.
+            started_at = asyncio.get_event_loop().time()
+            deadline = started_at + 60
+            content_parts: list[str] = []
+            first_frame_at: float | None = None
+            frame_count = 0
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    _fail("no closing response frame within 60s", "check retell_ws.py")
+                reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                if reply.get("response_type") != "response":
+                    _fail(f"expected a response frame, got {reply}", "check retell_ws.py")
+                if first_frame_at is None:
+                    first_frame_at = asyncio.get_event_loop().time()
+                frame_count += 1
+                content_parts.append(reply.get("content", ""))
+                if reply.get("content_complete"):
+                    break
+            ttfb_ms = round((first_frame_at - started_at) * 1000, 1) if first_frame_at else None
+            print(
+                f"{OK}   DeepSeek answered over the socket ({frame_count} frame(s), "
+                f"time-to-first-frame ~{ttfb_ms}ms): {''.join(content_parts)[:80]!r}"
+            )
 
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -213,17 +238,19 @@ async def check_websocket() -> None:
     finally:
         from sqlalchemy import delete
 
-        from backend.models.call import Transcript
+        from backend.models.call import CallEvent, Transcript
 
         async with AsyncSessionLocal() as db:
-            # retell_ws.py writes a Transcript row turn-by-turn during the exchange above
-            # (no cascade on transcripts.call_id), so it must go before the Call or the FK
-            # delete fails and leaves both rows orphaned.
+            # retell_ws.py writes a Transcript row turn-by-turn during the exchange above,
+            # and (since Session 4's llm_timing baseline) a CallEvent row per LLM call via
+            # record_llm_events — neither cascades on call_id, so both must go before the
+            # Call or the FK delete fails and leaves every row orphaned.
             call_row = (
                 await db.execute(select(Call).where(Call.external_id == external_id))
             ).scalar_one_or_none()
             if call_row is not None:
                 await db.execute(delete(Transcript).where(Transcript.call_id == call_row.id))
+                await db.execute(delete(CallEvent).where(CallEvent.call_id == call_row.id))
                 await db.execute(delete(Call).where(Call.id == call_row.id))
             await db.execute(delete(Agent).where(Agent.id == agent_id))
             if created_tenant:

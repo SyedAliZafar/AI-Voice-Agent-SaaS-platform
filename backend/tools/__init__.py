@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.tools.base import BaseTool
 from backend.tools.book_appointment import BookAppointmentTool
+from backend.tools.check_availability import CheckAvailabilityTool
 from backend.tools.create_lead import CreateLeadTool
 from backend.tools.lookup_customer import LookupCustomerTool
 from backend.tools.send_sms import SendSmsTool
@@ -15,6 +16,7 @@ from backend.tools.transfer_call import TransferCallTool
 _REGISTRY: dict[str, BaseTool] = {
     tool.name: tool
     for tool in [
+        CheckAvailabilityTool(),
         BookAppointmentTool(),
         LookupCustomerTool(),
         CreateLeadTool(),

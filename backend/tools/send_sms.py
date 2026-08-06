@@ -19,4 +19,7 @@ class SendSmsTool(BaseTool):
 
     async def handler(self, input: dict, caller_context: dict[str, Any]) -> dict:
         # Wire up Twilio's Messages API here
-        return {"sent": True}
+        raise NotImplementedError(
+            "send_sms has no real Twilio integration wired up yet; "
+            "it must not report success to the caller."
+        )

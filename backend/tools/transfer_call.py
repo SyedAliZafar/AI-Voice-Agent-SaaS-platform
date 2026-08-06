@@ -28,4 +28,7 @@ class TransferCallTool(BaseTool):
     async def handler(self, input: dict, caller_context: dict[str, Any]) -> dict:
         # Wire up your voice platform's call-transfer API here (Retell/Vapi
         # both expose a transfer/forward action via their call control API)
-        return {"transferred": True, "reason": input["reason"]}
+        raise NotImplementedError(
+            "transfer_call has no real voice-platform integration wired up yet; "
+            "it must not report success to the caller."
+        )

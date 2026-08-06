@@ -82,7 +82,11 @@ services:
     # CF_TUNNEL_TOKEN comes from the project's .env, substituted here by `docker compose`
     # itself (not passed into the container as an env var) — see RUN.md for how to mint
     # one. --metrics exposes the /ready endpoint the healthcheck below calls.
-    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 run --token ${CF_TUNNEL_TOKEN}
+    # --protocol http2: see the tunnel-quick service below for why QUIC is not the default
+    # here. Same network, same failure mode.
+    command: >
+      tunnel --no-autoupdate --protocol http2 --metrics 0.0.0.0:20241
+      run --token ${CF_TUNNEL_TOKEN}
     restart: unless-stopped
     depends_on:
       - api
@@ -101,7 +105,16 @@ services:
   tunnel-quick:
     image: cloudflare/cloudflared:latest
     profiles: ["tunnel-quick"]
-    command: tunnel --no-autoupdate --url http://api:8000
+    # --protocol http2 forces the tunnel onto TCP instead of cloudflared's default QUIC,
+    # which runs over UDP. On 2026-08-05 the quick tunnel here reconnect-looped roughly
+    # every 60-90s ("failed to accept QUIC stream: timeout: no recent network activity",
+    # "Failed to dial a quic connection"), taking PUBLIC_BASE_URL down with it mid-request
+    # and making the custom-LLM websocket unusable. cloudflared also logged
+    # "failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB,
+    # got: 416 kiB)" — Docker Desktop on Windows can't give QUIC the UDP buffers it wants,
+    # and restrictive networks frequently drop or throttle UDP outright. HTTP/2 is slightly
+    # slower in theory but actually stays connected, which matters rather more.
+    command: tunnel --no-autoupdate --protocol http2 --url http://api:8000
     depends_on:
       - api
 

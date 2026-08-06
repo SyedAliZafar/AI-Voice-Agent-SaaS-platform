@@ -195,6 +195,9 @@ Carried over, unchanged by this phase:
 - The Custom LLM websocket is **non-streaming**: one blocking `get_agent_response()` per
   turn. phase0.md measured 1.389s p95 non-streaming against a 1.5s budget, and noted a
   single tool call doubles the round-trips. This is the next thing that will hurt.
+  [RESOLVED — phase4.md Session 5 / CONTEXT.md ADR-009]: streaming +
+  barge-in cancellation shipped; `get_agent_response()` is now only the kill-switch-off
+  fallback path.
 - `system_prompt_override` (per-prospect personalization) is rejected on the custom-LLM
   path — the WS handler reads `Agent.system_prompt` fresh from the DB per call, so a
   call-time override has nowhere to live. (The text sandbox added below *does* support an

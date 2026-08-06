@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # for the list of ids this can be and services/llm_service.py's provider_for for how
     # a model id maps to a provider/client.
     default_llm_model: str = "deepseek-chat"
+    # Kill switch for the streaming custom-LLM path (backend/api/retell_ws.py). False
+    # restores the pre-streaming single-frame blocking behavior via
+    # llm_service.get_agent_response — see CONTEXT.md's ADR-009.
+    llm_streaming_enabled: bool = True
 
     # Voice platforms
     retell_api_key: str = ""

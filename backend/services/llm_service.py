@@ -13,11 +13,14 @@ phase0.md measured ~2.5s of dead air on a cold client (DNS + TLS), so constructi
 one per call/turn is not an option.
 """
 
+import asyncio
 import json
+import time
+from collections.abc import AsyncIterator, Callable, Coroutine
 from functools import lru_cache
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from backend.config import get_settings
 from backend.tools import get_tool_definitions, get_tool_handler
@@ -79,8 +82,7 @@ def _client_for_provider(provider: str) -> AsyncOpenAI:
     api_key = getattr(settings, key_attr)
     if not api_key:
         raise LLMConfigError(
-            f"Model provider '{provider}' has no API key configured "
-            f"(settings.{key_attr} is empty)"
+            f"Model provider '{provider}' has no API key configured (settings.{key_attr} is empty)"
         )
     kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
@@ -117,6 +119,143 @@ def _to_openai_tools() -> list[dict]:
     ]
 
 
+def _record_llm_timing(
+    llm_events: list[dict[str, Any]] | None,
+    *,
+    stage: str,
+    model: str,
+    started_at: float,
+    response: Any,
+) -> None:
+    """Append one timing/usage sample for a single completions.create() call.
+    No-op when llm_events is None — callers that don't care about the baseline
+    (tests, sandbox) don't pay for this or change behavior. usage is None for
+    some providers/mock responses, hence the getattr guards."""
+    if llm_events is None:
+        return
+    usage = getattr(response, "usage", None)
+    llm_events.append(
+        {
+            "stage": stage,
+            "model": model,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+        }
+    )
+
+
+def _record_stream_timing(
+    llm_events: list[dict[str, Any]] | None,
+    *,
+    stage: str,
+    model: str,
+    started_at: float,
+    first_token_at: float | None,
+    usage: Any,
+) -> None:
+    """Streaming counterpart to _record_llm_timing — same {stage, model, duration_ms,
+    prompt_tokens, completion_tokens} shape (so CallEvent(event_type="llm_timing") rows
+    and call_service.record_llm_events need no schema change), plus two additive keys:
+    ttfb_ms (time to the first content delta — the metric streaming exists to improve;
+    duration_ms is the full round-trip and should stay roughly flat) and streamed=True
+    (so before/after rows are distinguishable in the same table). See CONTEXT.md ADR-009.
+    """
+    if llm_events is None:
+        return
+    now = time.perf_counter()
+    llm_events.append(
+        {
+            "stage": stage,
+            "model": model,
+            "duration_ms": round((now - started_at) * 1000, 2),
+            "ttfb_ms": round((first_token_at - started_at) * 1000, 2)
+            if first_token_at is not None
+            else None,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "streamed": True,
+        }
+    )
+
+
+# Per-provider memory of whether stream_options={"include_usage": True} is accepted.
+# Both OpenAI and DeepSeek support it, but an OpenAI-compatible endpoint we haven't
+# tested might 400 on it — see _create_stream. Starts optimistic (True == "try it").
+_provider_stream_options_ok: dict[str, bool] = {}
+
+
+async def _create_stream(
+    client: AsyncOpenAI, *, model: str, messages: list, tool_kwargs: dict
+) -> Any:
+    """chat.completions.create(stream=True) with a one-time-per-provider fallback if
+    stream_options isn't accepted. Without this guard, an unsupported provider would 400
+    on every single turn and every one of those turns would surface as the caller-facing
+    error fallback line — a degraded call for what's meant to be a metrics-only addition.
+    """
+    provider = provider_for(model)
+    use_stream_options = _provider_stream_options_ok.get(provider, True)
+    kwargs: dict[str, Any] = dict(
+        model=model, max_tokens=MAX_TOKENS, messages=messages, stream=True, **tool_kwargs
+    )
+    if use_stream_options:
+        kwargs["stream_options"] = {"include_usage": True}
+    try:
+        return await client.chat.completions.create(**kwargs)
+    except BadRequestError:
+        if not use_stream_options:
+            raise
+        _provider_stream_options_ok[provider] = False
+        kwargs.pop("stream_options", None)
+        return await client.chat.completions.create(**kwargs)
+
+
+def _normalize_tool_calls(sdk_tool_calls: list) -> list[dict[str, Any]]:
+    """Maps the non-streaming SDK's ChatCompletionMessageToolCall objects to the same
+    {"id", "name", "arguments"} dict shape stream_agent_response accumulates from
+    fragmented deltas — the one shape _execute_tool_calls and _run_tool_calls_shielded
+    both take, so the tool-execution/shielding/event-sink logic is shared by both
+    paths."""
+    return [
+        {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+        for tc in sdk_tool_calls
+    ]
+
+
+def _default_spawn_tracked(coro: Coroutine) -> "asyncio.Task":
+    """Fallback used when a caller (sandbox, scripts/check_custom_llm.py, tests) doesn't
+    pass its own spawn_tracked — a plain untracked task. retell_ws.py always passes its
+    own, which registers the task in a per-connection set so it survives a barge-in
+    cancellation and gets drained on disconnect (ADR-009)."""
+    return asyncio.create_task(coro)
+
+
+async def _run_tool_calls_shielded(
+    tool_calls: list[dict[str, Any]],
+    caller_context: dict[str, Any],
+    on_tool_event: Callable[[dict[str, Any]], None] | None,
+    spawn_tracked: Callable[[Coroutine], "asyncio.Task"],
+    check_duplicate: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> list[dict]:
+    """Runs _execute_tool_calls on a tracked task and shields the await.
+
+    Barge-in cancellation (retell_ws.py cancelling a generation task on a new
+    response_id) must interrupt speech, never an in-flight side effect — a caller
+    hanging up mid-book_appointment must not leave Cal.com with a half-sent request and
+    us with no record of it (ADR-009). asyncio.shield(coro) alone isn't enough: it gives
+    no handle on the inner task, so completion becomes unobservable and a failure only
+    surfaces as an unretrieved-exception warning. Creating the task explicitly via
+    spawn_tracked gives both the shield and the reference, and registers it in the
+    caller's per-connection pending-task set so it's drained on disconnect too.
+
+    check_duplicate: see _execute_tool_calls — threaded through unchanged.
+    """
+    task = spawn_tracked(
+        _execute_tool_calls(tool_calls, caller_context, on_tool_event, check_duplicate)
+    )
+    return await asyncio.shield(task)
+
+
 async def get_agent_response(
     system_prompt: str,
     conversation_history: list[dict[str, str]],
@@ -124,6 +263,10 @@ async def get_agent_response(
     *,
     model: str | None = None,
     tools_enabled: bool = True,
+    llm_events: list[dict[str, Any]] | None = None,
+    on_tool_event: Callable[[dict[str, Any]], None] | None = None,
+    spawn_tracked: Callable[[Coroutine], "asyncio.Task"] | None = None,
+    check_duplicate: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> str:
     """Send the conversation to the configured LLM, execute any tool calls, return
     final text.
@@ -136,9 +279,21 @@ async def get_agent_response(
     tools_enabled: False sends no tool definitions at all and skips the
     tool-call loop entirely — used by the sandbox so a text chat can't
     accidentally hit real integrations (book_appointment, create_lead, ...).
+    llm_events: optional list the caller provides to collect a per-call timing/usage
+    sample (stage, model, duration_ms, prompt_tokens, completion_tokens) for the
+    initial call and, if the LLM calls a tool, each follow-up call. Baseline
+    instrumentation ahead of the streaming-architecture work — see CONTEXT.md.
+    on_tool_event / spawn_tracked / check_duplicate: optional, additive — see
+    stream_agent_response and _run_tool_calls_shielded/_execute_tool_calls. None of the
+    existing non-retell_ws callers (sandbox_service, scripts/check_custom_llm.py) pass
+    these, so this function's behavior for them is unchanged; retell_ws.py passes all
+    three on the kill-switch-off path so a barge-in — and a repeat request for an
+    already-completed side effect — get the same handling as the streaming path
+    (ADR-009).
     """
     model = model or settings.default_llm_model
     client = get_client(model)
+    spawn_tracked = spawn_tracked or _default_spawn_tracked
     # The SDK's `tools` param isn't Optional (Iterable | Omit, not Iterable | None |
     # Omit) — passing tools=None would serialize as a literal "tools": null in the
     # request body instead of being omitted. Build kwargs conditionally so
@@ -146,11 +301,15 @@ async def get_agent_response(
     tool_kwargs = {"tools": _to_openai_tools()} if tools_enabled else {}
     messages = [{"role": "system", "content": system_prompt}, *conversation_history]
 
+    started_at = time.perf_counter()
     response = await client.chat.completions.create(
         model=model,
         max_tokens=MAX_TOKENS,
         messages=messages,
         **tool_kwargs,
+    )
+    _record_llm_timing(
+        llm_events, stage="initial", model=model, started_at=started_at, response=response
     )
     choice = response.choices[0]
 
@@ -158,18 +317,150 @@ async def get_agent_response(
     # it produces a final text response.
     while choice.finish_reason == "tool_calls":
         messages.append(choice.message)
-        tool_results = await _execute_tool_calls(choice.message.tool_calls, caller_context)
+        normalized = _normalize_tool_calls(choice.message.tool_calls)
+        tool_results = await _run_tool_calls_shielded(
+            normalized, caller_context, on_tool_event, spawn_tracked, check_duplicate
+        )
         messages.extend(tool_results)
 
+        started_at = time.perf_counter()
         response = await client.chat.completions.create(
             model=model,
             max_tokens=MAX_TOKENS,
             messages=messages,
             **tool_kwargs,
         )
+        _record_llm_timing(
+            llm_events, stage="tool_followup", model=model, started_at=started_at, response=response
+        )
         choice = response.choices[0]
 
     return choice.message.content or "I'm sorry, I didn't catch that. Could you repeat it?"
+
+
+async def stream_agent_response(
+    system_prompt: str,
+    conversation_history: list[dict[str, str]],
+    caller_context: dict[str, Any],
+    *,
+    model: str | None = None,
+    tools_enabled: bool = True,
+    llm_events: list[dict[str, Any]] | None = None,
+    on_tool_event: Callable[[dict[str, Any]], None] | None = None,
+    spawn_tracked: Callable[[Coroutine], "asyncio.Task"] | None = None,
+    check_duplicate: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> AsyncIterator[str]:
+    """Streaming counterpart to get_agent_response (ADR-009) — same parameters, yields
+    text deltas as they arrive instead of returning the whole reply at once. A deliberate
+    separate function rather than a stream=True branch inside get_agent_response: that
+    function has three other callers (sandbox_service.chat, scripts/check_custom_llm.py,
+    and retell_ws.py's own kill-switch-off path) that must keep today's exact blocking
+    behavior, and duplicating the tool-call loop here is a smaller risk than threading a
+    stream flag through it.
+
+    Yields "" -> never; on an empty completion (no content, no tool calls) yields the
+    same "I'm sorry, I didn't catch that..." fallback get_agent_response returns, so both
+    paths behave identically on that edge case.
+
+    on_tool_event: see _execute_tool_calls — invoked synchronously, twice per tool call
+    ("dispatched" before the handler runs, "result"/"error" after), so a side-effecting
+    tool call leaves a durable trace even if this generator is later cancelled.
+    spawn_tracked: see _run_tool_calls_shielded — registers the tool-execution task in
+    the caller's per-connection pending-task set so a barge-in cancellation interrupts
+    speech, never an in-flight side effect, and so disconnect can drain it to completion.
+    retell_ws.py always passes its own; callers that don't care about cancellation
+    (currently none, but tests exercise this) get an untracked asyncio.create_task.
+    check_duplicate: see _execute_tool_calls — lets the caller intercept a repeat request
+    for something already completed this call and short-circuit it instead of dispatching
+    again (outliers.md §1 / phase4.md Session 8, server-enforced confirmation gating).
+    """
+    model = model or settings.default_llm_model
+    client = get_client(model)
+    spawn_tracked = spawn_tracked or _default_spawn_tracked
+    tool_kwargs = {"tools": _to_openai_tools()} if tools_enabled else {}
+    messages: list[Any] = [{"role": "system", "content": system_prompt}, *conversation_history]
+
+    any_content = False
+    stage = "initial"
+
+    while True:
+        started_at = time.perf_counter()
+        first_token_at: float | None = None
+        content_parts: list[str] = []
+        tool_call_acc: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        usage: Any = None
+
+        stream = await _create_stream(
+            client, model=model, messages=messages, tool_kwargs=tool_kwargs
+        )
+        async for chunk in stream:
+            # The include_usage trailer chunk (see _create_stream) carries usage but an
+            # EMPTY choices list — read usage first, then guard, or it's silently missed.
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if delta.content:
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                content_parts.append(delta.content)
+                any_content = True
+                yield delta.content
+            if delta.tool_calls:
+                # Fragmented across chunks: id/name usually arrive once, arguments in
+                # pieces — accumulate by index, not by id (id may be empty on later
+                # fragments of the same call).
+                for tc in delta.tool_calls:
+                    entry = tool_call_acc.setdefault(
+                        tc.index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if tc.id:
+                        entry["id"] = tc.id
+                    if tc.function is not None and tc.function.name:
+                        entry["name"] = tc.function.name
+                    if tc.function is not None and tc.function.arguments:
+                        entry["arguments"] += tc.function.arguments
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        _record_stream_timing(
+            llm_events,
+            stage=stage,
+            model=model,
+            started_at=started_at,
+            first_token_at=first_token_at,
+            usage=usage,
+        )
+
+        if finish_reason != "tool_calls":
+            break
+
+        normalized = [tool_call_acc[i] for i in sorted(tool_call_acc)]
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "".join(content_parts) or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in normalized
+                ],
+            }
+        )
+        tool_results = await _run_tool_calls_shielded(
+            normalized, caller_context, on_tool_event, spawn_tracked, check_duplicate
+        )
+        messages.extend(tool_results)
+        stage = "tool_followup"
+
+    if not any_content:
+        yield "I'm sorry, I didn't catch that. Could you repeat it?"
 
 
 async def complete_json(
@@ -194,20 +485,116 @@ async def complete_json(
     return json.loads(content)
 
 
-async def _execute_tool_calls(tool_calls: list, caller_context: dict[str, Any]) -> list[dict]:
+async def _execute_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    caller_context: dict[str, Any],
+    on_tool_event: Callable[[dict[str, Any]], None] | None = None,
+    check_duplicate: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> list[dict]:
+    """tool_calls: normalized {"id", "name", "arguments"} dicts — see _normalize_tool_calls
+    for how the non-streaming SDK response's tool_calls map to this shape, and
+    stream_agent_response for how streaming deltas accumulate directly into it. Kept
+    dict-shaped (not the SDK's ChatCompletionMessageToolCall objects) so this one function
+    serves both paths.
+
+    on_tool_event, if given, fires synchronously (never awaited — see ADR-009) twice per
+    tool call: once with phase="dispatched" right before the handler runs, once with
+    phase="result"/"error" after. This is what lets a side-effecting tool call (e.g.
+    book_appointment's Cal.com POST) leave a durable trace even if the surrounding
+    generation is cancelled by a barge-in before this function returns — retell_ws.py's
+    sink writes each event as a CallEvent(event_type="tool_call") row.
+
+    check_duplicate, if given, is consulted BEFORE dispatch for every tool call —
+    signature (tool_name, parsed_arguments) -> synthetic_result | None. A non-None return
+    means "don't call the real handler; use this instead" and the tool_call_id gets that
+    synthetic result fed back to the LLM as its "tool" message, with phase="dispatched"
+    never firing (nothing was actually dispatched). This is retell_ws.py's server-enforced
+    ledger check (ADR-009 §4c / phase4.md Session 8) — a real double-booking on
+    2026-08-05 (outliers.md §1) showed the ledger's system-prompt note alone doesn't
+    reliably stop a model from re-attempting a side effect it already completed; this is
+    the code-level backstop that doesn't depend on the model choosing to comply.
+
+    Deliberately runs sequentially (phase4.md Session 6 is where parallel tool execution
+    is planned) and is called by both get_agent_response and stream_agent_response only
+    via _run_tool_calls_shielded, which is what protects an in-flight call here from
+    being abandoned mid-flight.
+    """
     results = []
     for tool_call in tool_calls:
-        handler = get_tool_handler(tool_call.function.name)
+        name = tool_call["name"]
+        tool_call_id = tool_call["id"]
+        raw_arguments = tool_call["arguments"]
+
+        if check_duplicate is not None:
+            try:
+                parsed_for_check = json.loads(raw_arguments)
+            except (TypeError, ValueError):
+                parsed_for_check = None
+            duplicate_result = (
+                check_duplicate(name, parsed_for_check) if parsed_for_check is not None else None
+            )
+            if duplicate_result is not None:
+                if on_tool_event:
+                    on_tool_event(
+                        {
+                            "phase": "skipped_duplicate",
+                            "tool": name,
+                            "tool_call_id": tool_call_id,
+                            "arguments": raw_arguments,
+                            "result": duplicate_result,
+                        }
+                    )
+                results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": str(duplicate_result),
+                    }
+                )
+                continue
+
+        if on_tool_event:
+            on_tool_event(
+                {
+                    "phase": "dispatched",
+                    "tool": name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": raw_arguments,
+                }
+            )
+        started_at = time.perf_counter()
         try:
-            tool_input = json.loads(tool_call.function.arguments)
+            handler = get_tool_handler(name)
+            tool_input = json.loads(raw_arguments)
             result = await handler(tool_input, caller_context)
         except Exception as exc:  # noqa: BLE001 — log and surface to LLM, don't crash the call
             result = {"error": str(exc)}
+            if on_tool_event:
+                on_tool_event(
+                    {
+                        "phase": "error",
+                        "tool": name,
+                        "tool_call_id": tool_call_id,
+                        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                        "error": str(exc),
+                    }
+                )
+        else:
+            if on_tool_event:
+                on_tool_event(
+                    {
+                        "phase": "result",
+                        "tool": name,
+                        "tool_call_id": tool_call_id,
+                        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                        "result": result,
+                    }
+                )
 
         results.append(
             {
                 "role": "tool",
-                "tool_call_id": tool_call.id,
+                "tool_call_id": tool_call_id,
                 "content": str(result),
             }
         )

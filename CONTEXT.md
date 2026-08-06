@@ -91,6 +91,7 @@ voiceagent/
 │   │   ├── __init__.py
 │   │   ├── base.py               # BaseTool abstract class
 │   │   ├── book_appointment.py
+│   │   ├── check_availability.py # read-only "is this slot free?" (see ADR-009 note)
 │   │   ├── lookup_customer.py
 │   │   ├── create_lead.py
 │   │   ├── transfer_call.py
@@ -223,6 +224,22 @@ Tool execution happens in our backend, NOT in the voice platform. This gives us:
 - Ability to add guardrails before and after tool execution
 - No vendor lock-in on the tool layer
 
+Per-tool integration credentials (`calendar_id`/`calendar_api_key` for
+`book_appointment`, `crm_api_key` for `create_lead`) live in `ToolConfig.config`
+(one row per `agent_id` + `tool_type`, see `models/agent.py`). `retell_ws.py` loads
+every `ToolConfig` row for the call's agent via `agent_service.get_tool_configs` and
+flattens each `config` dict into `caller_context` before the LLM call, so tool
+handlers read them via `caller_context.get(...)`. There's no CRUD route for
+`tool_configs` yet — rows have to be inserted directly (seed script or DB) until one
+exists.
+
+Because that flattening ignores `tool_type` — every row's `config` lands in one shared
+`caller_context` — a tool can read credentials a *different* tool's row supplied.
+`check_availability` does exactly this on purpose: it reads the same
+`calendar_id`/`calendar_api_key`/`calendar_timezone` the `book_appointment` row already
+provides, so adding it needed no new `ToolConfig` row and no seed-script change. Worth
+knowing before assuming a row is scoped to the tool it's named after.
+
 ### ADR-004: WebSocket for live call monitoring
 The dashboard's live call view uses WebSocket (not SSE) because we need bidirectional:
 the operator can barge-in, whisper, or force-transfer. Redis PubSub distributes call
@@ -306,6 +323,99 @@ chat-completions protocol, so "which provider" reduces to `api_key` + `base_url`
   serialize as `"tools": null`). This is what lets the sandbox (below) run a text chat
   without risking a real `book_appointment`/`create_lead` call.
 
+### ADR-009: Streaming custom-LLM responses with barge-in cancellation
+
+phase4.md Session 5. `backend/api/retell_ws.py`'s Custom LLM websocket handler used to
+be fully blocking: one `llm_service.get_agent_response()` call per turn, then a single
+`content_complete: True` frame — dead air until the whole reply (plus any tool
+round-trips) was ready, and no way to react to a caller talking over the agent, since the
+receive loop couldn't even process Retell's `ping_pong` while the LLM call was in flight.
+
+**Streaming.** `llm_service.stream_agent_response()` is a new async generator, not a
+`stream=True` branch inside `get_agent_response` — that function has three other callers
+(`sandbox_service.chat`, `scripts/check_custom_llm.py`, and retell_ws's own kill-switch-off
+path below) that must keep its exact blocking behavior, and duplicating the tool-call loop
+was a smaller risk than threading a stream flag through code with correctness properties
+(the tool-call loop, the fallback text, `llm_events` instrumentation) other callers depend
+on. `retell_ws._generate` sends one `{"content": chunk, "content_complete": False}` frame
+per delta, then exactly one terminal frame (empty on success — content already streamed;
+a fallback message if something failed, so an error before any delta produces the same
+single-frame wire shape the old blocking path did).
+
+**Kill switch.** `settings.llm_streaming_enabled` (default `true`) — `false` makes
+`_generate` call the untouched `get_agent_response` instead, restoring the pre-streaming
+behavior byte-for-byte. Given this is the highest-risk change in the codebase, the escape
+hatch is a config flag + container recreate, not a git revert.
+
+**Barge-in cancellation.** Each `response_required`/`reminder_required` turn runs on its
+own `asyncio.Task`. If a new one arrives with a *different* `response_id` while a turn is
+still generating, the receive loop cancels and awaits the stale task before starting the
+new one — deliberately only on a response_id change, not on `update_only` interim speech,
+which fires on noise/backchannel ("mhm") too often to safely mean "the caller is talking."
+The receive loop no longer blocks on generation, so `ping_pong` keeps being answered while
+a turn streams.
+
+**Barge-in must interrupt speech, never a side effect.** This is the part worth
+remembering: `asyncio.CancelledError` lands wherever a cancelled task is currently
+suspended, and if that happens to be `await client.post("https://api.cal.com/v1/bookings")`
+inside `book_appointment`'s handler, the request may already be on the wire — cancelling
+the task doesn't un-book it, it just makes us lose track of whether it happened, and
+because the result never re-enters the message history, Retell's transcript for the next
+turn has no idea a booking fired, so the model can re-attempt it. So tool execution is run
+on its own task and the outer await is `asyncio.shield()`ed
+(`llm_service._run_tool_calls_shielded`) — a barge-in stops the audio immediately but lets
+an in-flight tool call finish. That shielded task, and the fire-and-forget
+`CallEvent(event_type="tool_call")` write for each tool-call phase
+(`call_service.record_tool_event`, via `_execute_tool_calls`'s `on_tool_event` sink), are
+tracked in one per-connection set and drained (with a bounded wait, re-checked rather than
+a single `gather`, since the "result" write task is only created after the drain begins)
+in `llm_websocket`'s `finally` on disconnect. The same shielding now also covers
+`_persist_and_publish_turn` once a turn's terminal frame has gone out — a turn that's
+already fully spoken must survive a same-instant barge-in or disconnect too.
+
+Even with all of that, a barge-in mid-tool-call still leaves the *next* turn with no
+built-in reason not to re-attempt the same action, since Retell owns the transcript and it
+carries no record the first call happened. `retell_ws.py` keeps a connection-scoped ledger
+of completed side-effecting tool calls (`book_appointment`, `create_lead`, `send_sms`;
+deliberately not `lookup_customer` or `check_availability` — repeating a read is harmless,
+and for availability it's actively *correct*, since a slot can be taken by someone else
+mid-call) and injects a bounded "already completed, do NOT repeat" note ahead
+of `conversation_history` on every turn.
+
+**§4c update, 2026-08-05 — that note alone isn't enough, so it's now enforced in code
+too.** A real test call hit exactly the gap this paragraph originally left open: the model
+re-dispatched `book_appointment` for a slot it had *just* booked, in a completely ordinary
+sequential turn — no barge-in, no cancellation involved. It happened because the caller
+talked over the agent's own confirmation and the follow-up ("four PM?") read as ambiguous;
+the ledger note, being pure prohibition with no alternative action, lost to what looked
+like a live request. Cal.com's own conflict check caught that specific repeat, but the
+model then booked a *different* slot instead — two real bookings for one appointment. Full
+writeup: `outliers.md` §1.
+
+Fix: `llm_service._execute_tool_calls` takes an optional `check_duplicate(tool,
+arguments) -> synthetic_result | None` callback, consulted *before* every side-effecting
+dispatch — a match means the real handler never runs at all. `retell_ws.py` wires this to
+`_find_duplicate_ledger_entry`, matching against `completed_tool_calls` with the exact same
+identifying-argument normalization `_ledger_entry` used to store it (`_ledger_args_key`,
+shared by both so the two sides of the comparison can't drift). On a match, the LLM gets a
+synthetic tool result (`_duplicate_tool_result`) instead of dispatching — and that result
+carries an explicit instruction ("tell the caller it's already done"), not just a
+negative, because the same real call showed a bare prohibition isn't salient enough at the
+moment the model actually needs to act on it. This is the code-level backstop the prompt
+note was missing: it doesn't depend on the model choosing to comply. It's also the first
+slice of phase4.md Session 8 (server-enforced confirmation gating) — the
+`requires_confirmation`-before-first-attempt half of that session is still open.
+
+This still isn't a substitute for real idempotency keys in `integration_service` — the
+duplicate check only catches a *repeat* dispatch our own process observed; it can't help
+if the process restarts between attempts. That remains open.
+
+**Instrumentation.** `llm_events` keeps the same `{stage, model, duration_ms,
+prompt_tokens, completion_tokens}` shape the Session 4 baseline established — no schema
+change to `CallEvent(event_type="llm_timing")` — plus two additive keys: `ttfb_ms` (time to
+the first content delta, the metric streaming exists to move) and `streamed: True` (so
+before/after rows are distinguishable in the same table).
+
 ### ADR-006: Prospecting pipeline (Prospector + Researcher agents)
 Before a call can happen, something has to decide *who* to call. The prospecting
 pipeline sources and ranks call targets, upstream of everything else in this doc:
@@ -357,7 +467,12 @@ in `transcript_tasks.py` — worth fixing there too if it bites.
 ### Error handling
 - All API errors return structured JSON: `{"detail": "...", "code": "AGENT_NOT_FOUND"}`
 - Voice platform webhook failures retry 3x with exponential backoff
-- LLM failures fall back to a static "I'm having trouble, let me transfer you" response
+- LLM failures fall back to a static spoken response in `retell_ws.py`'s
+  `response_required`/`reminder_required` handling — `LLMConfigError` (bad model/missing
+  key) gets "I'm having trouble, let me transfer you"; any other exception from the
+  call (SDK timeout, rate limit, 5xx) is caught separately and gets "I'm having some
+  trouble, let me get someone to help you". Both branches log and keep the websocket
+  alive — never let an LLM-side failure kill a live call.
 
 ### Environment variables (required)
 ```
@@ -471,6 +586,18 @@ System prompt per agent follows this structure:
 - WebSocket latency: < 100ms for call event propagation
 - Dashboard API: < 300ms for paginated queries
 - Concurrent calls per agent: 50+ (limited by voice platform plan)
+
+`llm_service.get_agent_response()`/`stream_agent_response()` take an optional `llm_events`
+list; if passed, it appends one `{stage, model, duration_ms, prompt_tokens,
+completion_tokens}` sample per `completions.create()` call (`stage` is `"initial"` or
+`"tool_followup"`, one per LLM round-trip within a turn) — the streaming path adds
+`ttfb_ms`/`streamed` (see ADR-009). `retell_ws.py` passes one in and, after the terminal
+response frame is sent, persists the samples via `call_service.record_llm_events()` as
+`CallEvent(event_type="llm_timing")` rows — the first real writer of `CallEvent`, which
+had been a defined-but-unused model. This was the before/after baseline for ADR-009's
+streaming work; `ttfb_ms` (time to first content delta) is now the primary metric against
+the LLM round-trip target above, since `duration_ms` (the full round-trip) stays roughly
+flat between the two paths by design.
 
 ## What NOT to build (for now)
 - Custom STT/TTS — use the voice platform's built-in. Don't reinvent.

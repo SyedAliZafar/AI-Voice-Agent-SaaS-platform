@@ -5,7 +5,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models.agent import Agent
+from backend.models.agent import Agent, ToolConfig
 from backend.schemas.agent import AgentCreate, AgentUpdate
 
 
@@ -54,3 +54,10 @@ async def delete_agent(db: AsyncSession, agent_id: uuid.UUID, tenant_id: uuid.UU
     if agent:
         await db.delete(agent)
         await db.commit()
+
+
+async def get_tool_configs(db: AsyncSession, agent_id: uuid.UUID) -> list[ToolConfig]:
+    """Per-agent integration settings (calendar/CRM API keys, etc) for the tools this
+    agent can call — see retell_ws.py's caller_context construction."""
+    result = await db.execute(select(ToolConfig).where(ToolConfig.agent_id == agent_id))
+    return list(result.scalars().all())
