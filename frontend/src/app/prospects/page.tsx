@@ -2,9 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Field, TextInput } from "@/components/form";
 import { RefreshIcon, SearchIcon, TargetIcon } from "@/components/icons";
-import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
+import { Badge, Button, Card, EmptyState, Field, PageHeader, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { Agent, OutreachStatus, Prospect, ResearchStatus } from "@/lib/types";
 

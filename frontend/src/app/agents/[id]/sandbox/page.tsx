@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { PromptEditor } from "@/components/PromptEditor";
+import { PromptEditor } from "@/components/features/agents/PromptEditor";
 import { ArrowLeftIcon, RefreshIcon, SparkleIcon } from "@/components/icons";
 import { Button, Card, Skeleton } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";

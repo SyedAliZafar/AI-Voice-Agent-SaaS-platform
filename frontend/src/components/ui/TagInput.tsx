@@ -1,59 +1,8 @@
 "use client";
 
-import {
-  InputHTMLAttributes,
-  ReactNode,
-  SelectHTMLAttributes,
-  TextareaHTMLAttributes,
-  useState,
-} from "react";
+import { useState } from "react";
 
-function cx(...parts: (string | false | undefined | null)[]) {
-  return parts.filter(Boolean).join(" ");
-}
-
-const inputBase =
-  "w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-brand-300 focus:outline-none";
-
-/* ------------------------------------------------------------------ Field */
-
-export function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="mb-4">
-      <label className="mb-1.5 block text-sm font-medium text-slate-700">{label}</label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-slate-400">{hint}</p>}
-    </div>
-  );
-}
-
-/* -------------------------------------------------------------- TextInput */
-
-export function TextInput(props: InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...props} className={cx(inputBase, props.className)} />;
-}
-
-/* --------------------------------------------------------------- TextArea */
-
-export function TextArea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea {...props} className={cx(inputBase, "resize-y", props.className)} />;
-}
-
-/* ----------------------------------------------------------------- Select */
-
-export function Select(props: SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...props} className={cx(inputBase, "bg-white", props.className)} />;
-}
-
-/* --------------------------------------------------------------- TagInput */
+import { inputBase } from "./inputBase";
 
 export function TagInput({
   value,

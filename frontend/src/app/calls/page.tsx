@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import { CallTable } from "@/components/CallTable";
+import { CallTable } from "@/components/features/calls/CallTable";
 import { CallsIcon, SearchIcon } from "@/components/icons";
 import { Button, Card, EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";

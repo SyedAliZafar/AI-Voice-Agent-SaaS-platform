@@ -3,10 +3,9 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
-import { CallTable } from "@/components/CallTable";
-import { MetricCard } from "@/components/MetricCard";
+import { CallTable } from "@/components/features/calls/CallTable";
 import { CallsIcon, ClockIcon, CheckIcon, LiveIcon } from "@/components/icons";
-import { Button, Card, PageHeader, Skeleton } from "@/components/ui";
+import { Button, Card, MetricCard, PageHeader, Skeleton } from "@/components/ui";
 import { useCallMetrics } from "@/hooks/useCallMetrics";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { formatDuration } from "@/lib/format";

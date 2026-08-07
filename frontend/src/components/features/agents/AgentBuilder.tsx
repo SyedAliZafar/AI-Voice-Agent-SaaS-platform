@@ -3,10 +3,9 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { Stepper } from "@/components/Stepper";
-import { Field, Select, TagInput, TextArea, TextInput } from "@/components/form";
+import { Stepper } from "@/components/features/agents/Stepper";
 import { SparkleIcon } from "@/components/icons";
-import { Badge, Button, Card } from "@/components/ui";
+import { Badge, Button, Card, Field, Select, TagInput, TextArea, TextInput } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
   agentDisplayName,

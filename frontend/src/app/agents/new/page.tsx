@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 
-import { AgentBuilder } from "@/components/AgentBuilder";
+import { AgentBuilder } from "@/components/features/agents/AgentBuilder";
 import { ArrowLeftIcon } from "@/components/icons";
 
 export default function NewAgentPage() {

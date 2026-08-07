@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { AgentCard } from "@/components/AgentCard";
+import { AgentCard } from "@/components/features/agents/AgentCard";
 import { AgentsIcon, PlusIcon } from "@/components/icons";
 import { Button, EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";

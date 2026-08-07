@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { LiveCallPanel } from "@/components/LiveCallPanel";
+import { LiveCallPanel } from "@/components/features/calls/LiveCallPanel";
 import { LiveIcon } from "@/components/icons";
 import { Button, Card, EmptyState, PageHeader } from "@/components/ui";
 

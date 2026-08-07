@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { TranscriptViewer } from "@/components/TranscriptViewer";
+import { TranscriptViewer } from "@/components/features/calls/TranscriptViewer";
 import { ArrowLeftIcon } from "@/components/icons";
 import { Card, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";

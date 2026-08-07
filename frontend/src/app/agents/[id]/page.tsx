@@ -3,10 +3,9 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { PromptEditor } from "@/components/PromptEditor";
+import { PromptEditor } from "@/components/features/agents/PromptEditor";
 import { ArrowLeftIcon, PhoneIcon, SparkleIcon } from "@/components/icons";
-import { TextInput } from "@/components/form";
-import { Badge, Button, Card, Skeleton } from "@/components/ui";
+import { Badge, Button, Card, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { OBJECTIVE_LABELS, type CampaignIntake } from "@/lib/builder";
 import { Agent, LlmModel } from "@/lib/types";

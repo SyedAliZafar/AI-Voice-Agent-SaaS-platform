@@ -357,7 +357,36 @@ the caller has no reason to suspect.
 
 ---
 
-## 6. Real-call verification of §5 surfaced two more bugs [BOTH FIXED 2026-08-06]
+## 6. Real-call verification of §5 surfaced two more bugs [BOTH FIXED 2026-08-06, BUG #1 VERIFIED ON A REAL CALL 2026-08-07]
+
+**Bug #1 (default cancellation reason) verified on a real call, 2026-08-07**
+(`call_1368a69c8f28ea4c9d8e140e610`). Booked Monday 4:45pm (`confirmation_id 23505354`,
+`booking_uid p3ZyCJfURj2mXFaJwtU12b`), then asked to cancel it giving no reason at all —
+the `CallEvent` trail shows `cancel_appointment` dispatched with only
+`{"booking_uid": "p3ZyCJfURj2mXFaJwtU12b"}`, no `reason` key present, and got back
+`{"cancelled": true, "booking_uid": "p3ZyCJfURj2mXFaJwtU12b"}`. Checked directly against
+Cal.com's own API afterward (not our DB, not the transcript): `GET /v2/bookings/{uid}`
+returns `status: "cancelled"`, `cancellationReason: "Cancelled by caller"` — the exact
+default value the fix supplies. Confirms the full path: no caller-given reason →
+`cancel_calendar_booking`'s fallback fires → Cal.com accepts it → the booking is really
+cancelled server-side, not just reported as cancelled. No cleanup needed — the booking's
+end state (cancelled) is the correct one for this test, not a leftover.
+
+**Decision (2026-08-07):** bug #2 (timeout honesty) is accepted as unit-verified only,
+same pattern as §2's barge-in-shielding acceptance — a deliberate call, not an
+oversight. Forcing a genuine client-side timeout requires Cal.com's real API to actually
+take longer than the client's `timeout=20.0` setting, which isn't practical to trigger
+on demand against its normal (~1-4s observed) latency without adding an artificial delay
+purely for the test (the same tradeoff §2 already made this call on, for the same
+reason). The existing `IntegrationTimeoutError`/`uncertain_result` unit tests
+(`tests/test_integration_service.py`'s `TestBookCalendarSlot`/`TestCancelCalendarBooking`/
+`TestRescheduleCalendarBooking` timeout cases) are accepted as sufficient verification of
+the mechanism itself. This call's own `cancel_appointment` round-trip completed normally
+(~3.7s, no timeout), confirming no regression on the ordinary path, but that is not
+timeout-path verification and shouldn't be read as such. If real-call reproduction
+matters later, §2's own suggested approach applies here too: a temporary artificial delay
+in `cancel_calendar_booking`/`reschedule_calendar_booking` for one test run, to force the
+client past its timeout deliberately rather than relying on Cal.com's real latency.
 
 Same real call as §5's verification (`call_e28e21214404ebb3054eeb9eb7a`, 2026-08-06).
 The `CallEvent` trail (`tool_call` rows, chronological):

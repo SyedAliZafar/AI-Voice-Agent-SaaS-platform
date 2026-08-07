@@ -145,18 +145,24 @@ capability, then the timeout-honesty fix). This file (`session5.md`) is new.
 | 3 | Agent fabricated an availability claim, never checked | Fixed (`check_availability`) + verified on a real call |
 | 4 | STT email misfires reached Cal.com before validation | Logged, lower severity, not scoped — still open |
 | 5 | Agent claimed a cancellation it had no tool to perform | Fixed (`cancel_appointment`/`reschedule_appointment`) + verified on a real call |
-| 6 | That verification surfaced 2 more bugs (reason-required, timeout→false-success) | Both fixed this session |
+| 6 | That verification surfaced 2 more bugs (reason-required, timeout→false-success) | Both fixed this session; reason-required verified on a real call 2026-08-07 (see below), timeout→uncertain remains unit-verified only |
 
 ## What's left — pick up here
 
-1. **Real-call reverification of §6's two fixes specifically.** §5's tools were
-   verified; the §6 fixes (default cancellation reason, timeout → uncertain result)
-   were built and unit-tested but **not yet exercised on a real call** the way every
-   other fix in this series has been. Natural test: book something, then ask to cancel
-   it *without giving a reason* — confirms bug #1's fix fires. Forcing a real timeout on
-   demand isn't really possible; the honest verification is that the existing
-   `TestBookCalendarSlot`/`TestCancelCalendarBooking`/`TestRescheduleCalendarBooking`
-   timeout tests pass and nothing regressed on a normal call.
+1. ~~**Real-call reverification of §6's two fixes specifically.**~~ **Done 2026-08-07**
+   for the reproducible half. Bug #1 (default cancellation reason) verified on a real
+   call (`call_1368a69c8f28ea4c9d8e140e610`): booked, then asked to cancel with no
+   reason given; `CallEvent` trail shows `cancel_appointment` dispatched with no
+   `reason` argument, result `cancelled: true`; checked directly against Cal.com's own
+   API afterward — `status: "cancelled"`, `cancellationReason: "Cancelled by caller"`,
+   the exact fallback value. Full detail in `outliers.md` §6. Bug #2 (timeout → uncertain
+   result) is **still unit-verified only** — a real client-side timeout against Cal.com's
+   normal (~1-4s observed) latency isn't reproducible on demand, exactly as anticipated
+   here. This call's own `cancel_appointment` round-trip completed normally (~3.7s),
+   which only confirms no regression on the ordinary path, not the uncertain-result path
+   itself. If that matters more later, the way to actually force it is an artificial
+   delay in `cancel_calendar_booking`/`reschedule_calendar_booking` for one test run
+   (same idea outliers.md §2 suggested for barge-in timing) — not attempted here.
 2. **§4 (STT email misfires)** — logged, not scoped, still open, lower severity.
 3. **§6's own noted follow-up** — timeout reconciliation via a follow-up read (verify
    `GET /v2/bookings/{uid}` empirically first) instead of the current blanket
@@ -212,6 +218,21 @@ uv run python scripts/dev_token.py   # reseeds the demo tenant, prints a fresh b
 - One real leftover booking from this session's original incident, `23454719`
   (2026-08-07 11:15 Berlin), is still live/uncancelled — left deliberately, see
   `outliers.md` §5's cleanup note for why.
+
+**2026-08-07 follow-up session:** started from a fully cold stack (no containers
+running) and the `.env` `PUBLIC_BASE_URL` was already dead. Recreating `tunnel-quick`
+once was NOT enough — it died again (Cloudflare returned "Unauthorized: Tunnel not
+found") within the same session, between the infra green-check and actually placing
+the call, requiring a second recreate/URL-swap/`api` restart before the real test call
+would go through. Concrete new evidence for this project's existing "expect to
+redo the tunnel almost every session, sometimes more than once" warning — not a new
+failure mode, just a sharper data point on how often it bites. Test agent
+`c921a011-...` and its `ToolConfig` survived this session's DB intact (no reseed
+needed); the `[AVAILABILITY - NEVER GUESS]` header text doesn't literally contain the
+substring `[AVAILABILITY]` (worth remembering if grepping the prompt programmatically
+again). `PUBLIC_BASE_URL` as of the end of this session is whatever the *second*
+`tunnel-quick` recreate printed — treat it as dead by default, same as always, and
+re-verify with `check_custom_llm.py` first.
 
 ## Standing rules this series has established (apply them to whatever comes next)
 
