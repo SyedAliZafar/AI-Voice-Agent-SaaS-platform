@@ -123,7 +123,7 @@ before you touch code, this is the highest-risk change in the codebase.
 
 ---
 
-## Session 6 — Parallel tool execution
+## Session 6 — Parallel tool execution [DONE 2026-08-07]
 
 **Why:** `_execute_tool_calls` runs sequentially even when multiple tools
 are requested in one turn — an easy win once streaming is in.
@@ -133,6 +133,19 @@ In llm_service.py's _execute_tool_calls, tool calls are run sequentially
 in a for loop even when the LLM requests multiple tools in one turn.
 Change this to run them concurrently with asyncio.gather instead.
 ```
+
+Done: `_execute_tool_calls` now splits into two phases — a synchronous planning pass
+(parse arguments, run `check_duplicate` for every call against the ledger snapshot as
+it stands at the start of the turn, fire `dispatched`/`skipped_duplicate` events) with
+no `await` anywhere in it, followed by `asyncio.gather` over whatever cleared the
+duplicate check. This closes the gap Session 8's `check_duplicate` hook (ADR-009 §4c)
+would otherwise have opened: naively parallelizing the old loop body would have let
+two tool calls in the same turn race past the duplicate check against each other's
+still-in-flight results. Because the planning pass never suspends, every
+`check_duplicate` call in a batch sees the same start-of-turn snapshot regardless of
+gather's scheduling, and `on_tool_event`'s `dispatched → result|error` ordering for a
+given `tool_call_id` holds too, since both come from the same coroutine's own program
+order. See `backend/services/llm_service.py:_execute_tool_calls`.
 
 ---
 

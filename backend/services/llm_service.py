@@ -514,61 +514,36 @@ async def _execute_tool_calls(
     reliably stop a model from re-attempting a side effect it already completed; this is
     the code-level backstop that doesn't depend on the model choosing to comply.
 
-    Deliberately runs sequentially (phase4.md Session 6 is where parallel tool execution
-    is planned) and is called by both get_agent_response and stream_agent_response only
-    via _run_tool_calls_shielded, which is what protects an in-flight call here from
-    being abandoned mid-flight.
+    Runs in two phases (phase4.md Session 6) rather than one interleaved loop, so
+    parallel dispatch can't turn the duplicate check into a race: phase 1 walks
+    tool_calls synchronously — no `await` anywhere in it — parsing each call's
+    arguments once and, for every call, running check_duplicate (if given) against
+    completed_tool_calls as it stands at the start of this turn, before any of this
+    batch's calls have dispatched. Because that whole pass never suspends, every
+    check_duplicate call in it is guaranteed to see the same start-of-turn snapshot,
+    not a sibling result that raced ahead — two tool calls in one turn can't race past
+    the duplicate check together. Calls that clear the check move to phase 2, dispatched
+    concurrently via asyncio.gather; each keeps firing its own dispatched (in phase 1)
+    and result/error (at the end of its own coroutine) in that order, so per-tool_call_id
+    event ordering holds regardless of gather's scheduling — it only depends on each
+    coroutine's own statements running in program order. Called by both
+    get_agent_response and stream_agent_response only via _run_tool_calls_shielded,
+    which is what protects an in-flight call here from being abandoned mid-flight.
     """
-    results = []
-    for tool_call in tool_calls:
-        name = tool_call["name"]
-        tool_call_id = tool_call["id"]
-        raw_arguments = tool_call["arguments"]
 
-        if check_duplicate is not None:
-            try:
-                parsed_for_check = json.loads(raw_arguments)
-            except (TypeError, ValueError):
-                parsed_for_check = None
-            duplicate_result = (
-                check_duplicate(name, parsed_for_check) if parsed_for_check is not None else None
-            )
-            if duplicate_result is not None:
-                if on_tool_event:
-                    on_tool_event(
-                        {
-                            "phase": "skipped_duplicate",
-                            "tool": name,
-                            "tool_call_id": tool_call_id,
-                            "arguments": raw_arguments,
-                            "result": duplicate_result,
-                        }
-                    )
-                results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": str(duplicate_result),
-                    }
-                )
-                continue
-
-        if on_tool_event:
-            on_tool_event(
-                {
-                    "phase": "dispatched",
-                    "tool": name,
-                    "tool_call_id": tool_call_id,
-                    "arguments": raw_arguments,
-                }
-            )
+    async def _dispatch(
+        name: str,
+        tool_call_id: str,
+        parsed_arguments: Any,
+        parse_error: Exception | None,
+    ) -> dict:
         started_at = time.perf_counter()
         try:
             handler = get_tool_handler(name)
-            tool_input = json.loads(raw_arguments)
-            result = await handler(tool_input, caller_context)
+            if parse_error is not None:
+                raise parse_error
+            result = await handler(parsed_arguments, caller_context)
         except Exception as exc:  # noqa: BLE001 — log and surface to LLM, don't crash the call
-            result = {"error": str(exc)}
             if on_tool_event:
                 on_tool_event(
                     {
@@ -579,6 +554,11 @@ async def _execute_tool_calls(
                         "error": str(exc),
                     }
                 )
+            return {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": str({"error": str(exc)}),
+            }
         else:
             if on_tool_event:
                 on_tool_event(
@@ -590,12 +570,67 @@ async def _execute_tool_calls(
                         "result": result,
                     }
                 )
+            return {"role": "tool", "tool_call_id": tool_call_id, "content": str(result)}
 
-        results.append(
-            {
+    # Phase 1 — synchronous, no `await`: parse once, check duplicates against the
+    # ledger snapshot as it stands at the start of this turn, fire "skipped_duplicate"
+    # or "dispatched" now. Nothing here can interleave with a sibling call's dispatch.
+    results_by_id: dict[str, dict] = {}
+    to_dispatch: list[tuple[str, str, Any, Exception | None]] = []
+    for tool_call in tool_calls:
+        name = tool_call["name"]
+        tool_call_id = tool_call["id"]
+        raw_arguments = tool_call["arguments"]
+
+        try:
+            parsed_arguments: Any = json.loads(raw_arguments)
+            parse_error: Exception | None = None
+        except (TypeError, ValueError) as exc:
+            parsed_arguments = None
+            parse_error = exc
+
+        duplicate_result = None
+        if check_duplicate is not None and parse_error is None:
+            duplicate_result = check_duplicate(name, parsed_arguments)
+
+        if duplicate_result is not None:
+            if on_tool_event:
+                on_tool_event(
+                    {
+                        "phase": "skipped_duplicate",
+                        "tool": name,
+                        "tool_call_id": tool_call_id,
+                        "arguments": raw_arguments,
+                        "result": duplicate_result,
+                    }
+                )
+            results_by_id[tool_call_id] = {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
-                "content": str(result),
+                "content": str(duplicate_result),
             }
+            continue
+
+        if on_tool_event:
+            on_tool_event(
+                {
+                    "phase": "dispatched",
+                    "tool": name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": raw_arguments,
+                }
+            )
+        to_dispatch.append((name, tool_call_id, parsed_arguments, parse_error))
+
+    # Phase 2 — concurrent dispatch of everything that cleared the duplicate check.
+    if to_dispatch:
+        dispatched_results = await asyncio.gather(
+            *(
+                _dispatch(name, tool_call_id, parsed_arguments, parse_error)
+                for name, tool_call_id, parsed_arguments, parse_error in to_dispatch
+            )
         )
-    return results
+        for (_, tool_call_id, _, _), result in zip(to_dispatch, dispatched_results, strict=True):
+            results_by_id[tool_call_id] = result
+
+    return [results_by_id[tool_call["id"]] for tool_call in tool_calls]

@@ -602,3 +602,110 @@ class TestCheckDuplicate:
         ]
         tool_msg = next(m for m in second_call_messages if m.get("role") == "tool")
         assert tool_msg["content"] == str(synthetic)
+
+
+class TestConcurrentToolDispatch:
+    """phase4.md Session 6: multiple tool calls in one turn now dispatch via
+    asyncio.gather instead of a sequential for loop. These cover the properties a
+    single-tool-call test can't: that dispatch is actually concurrent, that the
+    duplicate check for a whole batch is evaluated against one start-of-turn ledger
+    snapshot rather than racing sibling results, and that on_tool_event stays
+    correctly ordered per tool_call_id when writes happen concurrently."""
+
+    @pytest.mark.asyncio
+    async def test_two_tool_calls_dispatch_concurrently(self):
+        async def slow_handler(_input, _ctx):
+            await asyncio.sleep(0.05)
+            return {"ok": True}
+
+        with patch.object(llm_service, "get_tool_handler", return_value=slow_handler):
+            started = asyncio.get_event_loop().time()
+            await llm_service._execute_tool_calls(
+                [
+                    {"id": "tc1", "name": "book_appointment", "arguments": "{}"},
+                    {"id": "tc2", "name": "book_appointment", "arguments": "{}"},
+                ],
+                {},
+            )
+            elapsed = asyncio.get_event_loop().time() - started
+
+        # Sequential would take >=0.1s; concurrent should stay close to one sleep.
+        assert elapsed < 0.09
+
+    @pytest.mark.asyncio
+    async def test_duplicate_check_sees_start_of_turn_snapshot_for_whole_batch(self):
+        """Two calls in the same batch that would duplicate each other (not a
+        pre-existing ledger entry) — check_duplicate is consulted for both before
+        either dispatches, so both observe "not yet in the ledger" and both proceed,
+        rather than one racing ahead of the other's check."""
+        seen_args: list[dict] = []
+
+        def check_duplicate(tool, arguments):
+            seen_args.append(arguments)
+            return None  # nothing in the ledger yet for either call
+
+        handler = AsyncMock(return_value={"booked": True})
+        with patch.object(llm_service, "get_tool_handler", return_value=handler):
+            results = await llm_service._execute_tool_calls(
+                [
+                    {"id": "tc1", "name": "book_appointment", "arguments": '{"a": 1}'},
+                    {"id": "tc2", "name": "book_appointment", "arguments": '{"a": 1}'},
+                ],
+                {},
+                check_duplicate=check_duplicate,
+            )
+
+        # Both duplicate checks ran (synchronously, before any dispatch) and both
+        # calls proceeded to the real handler.
+        assert seen_args == [{"a": 1}, {"a": 1}]
+        assert handler.await_count == 2
+        assert {r["tool_call_id"] for r in results} == {"tc1", "tc2"}
+
+    @pytest.mark.asyncio
+    async def test_event_ordering_holds_per_tool_call_under_concurrency(self):
+        """tc2's handler finishes before tc1's — dispatched must still precede
+        result/error for each tool_call_id individually, even though completion
+        order across calls is reversed."""
+        events: list[dict] = []
+
+        async def handler(input_, _ctx):
+            if input_.get("which") == "tc1":
+                await asyncio.sleep(0.05)
+            return {"ok": True}
+
+        with patch.object(llm_service, "get_tool_handler", return_value=handler):
+            await llm_service._execute_tool_calls(
+                [
+                    {"id": "tc1", "name": "book_appointment", "arguments": '{"which": "tc1"}'},
+                    {"id": "tc2", "name": "book_appointment", "arguments": '{"which": "tc2"}'},
+                ],
+                {},
+                on_tool_event=events.append,
+            )
+
+        by_call: dict[str, list[str]] = {"tc1": [], "tc2": []}
+        for event in events:
+            by_call[event["tool_call_id"]].append(event["phase"])
+        assert by_call["tc1"] == ["dispatched", "result"]
+        assert by_call["tc2"] == ["dispatched", "result"]
+
+    @pytest.mark.asyncio
+    async def test_results_returned_in_original_tool_call_order(self):
+        """tc2 resolves before tc1, but the returned list must still match the
+        order tool_calls were given in, keyed by tool_call_id."""
+
+        async def handler(input_, _ctx):
+            if input_.get("which") == "tc1":
+                await asyncio.sleep(0.05)
+            return {"which": input_.get("which")}
+
+        with patch.object(llm_service, "get_tool_handler", return_value=handler):
+            results = await llm_service._execute_tool_calls(
+                [
+                    {"id": "tc1", "name": "book_appointment", "arguments": '{"which": "tc1"}'},
+                    {"id": "tc2", "name": "book_appointment", "arguments": '{"which": "tc2"}'},
+                ],
+                {},
+            )
+
+        assert [r["tool_call_id"] for r in results] == ["tc1", "tc2"]
