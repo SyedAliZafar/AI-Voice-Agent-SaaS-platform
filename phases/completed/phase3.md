@@ -95,7 +95,7 @@ moment a tunnel is opened — and the DeepSeek path *requires* an open tunnel.
 
 ### DeepSeek path reachable
 - `Agent.use_custom_llm` added to `frontend/src/lib/types.ts` (it was missing — the
-  hand-sync drift FRONTEND.md warns about).
+  hand-sync drift ../../FRONTEND.md warns about).
 - A "Conversation engine" card on the agent detail page switches between Retell's hosted
   LLM and DeepSeek, and the Test call copy now reflects which brain will actually answer,
   including the tunnel requirement.
@@ -104,7 +104,7 @@ moment a tunnel is opened — and the DeepSeek path *requires* an open tunnel.
 
 ### Contract tightening
 `CallResponse.status` is now a `Literal[...]` instead of a bare `str`, matching what
-`frontend/src/lib/types.ts` already assumed. FRONTEND.md flagged this drift with the
+`frontend/src/lib/types.ts` already assumed. ../../FRONTEND.md flagged this drift with the
 frontend as the stricter side; the backend has been brought up to it.
 
 ## The third bug, found during verification: a dead tunnel is invisible
@@ -195,7 +195,7 @@ Carried over, unchanged by this phase:
 - The Custom LLM websocket is **non-streaming**: one blocking `get_agent_response()` per
   turn. phase0.md measured 1.389s p95 non-streaming against a 1.5s budget, and noted a
   single tool call doubles the round-trips. This is the next thing that will hurt.
-  [RESOLVED — phase4.md Session 5 / CONTEXT.md ADR-009]: streaming +
+  [RESOLVED — ../in-progress/phase4.md Session 5 / ../../CONTEXT.md ADR-009]: streaming +
   barge-in cancellation shipped; `get_agent_response()` is now only the kill-switch-off
   fallback path.
 - `system_prompt_override` (per-prospect personalization) is rejected on the custom-LLM

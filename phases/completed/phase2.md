@@ -1,7 +1,7 @@
 # Phase 2 — Outbound Test Call: from-number setup
 
 Status: **resolved and verified end-to-end.** This picks up right after the Agent Builder +
-`/agents/{id}/test-call` endpoint (see `CONTEXT.md` for architecture,
+`/agents/{id}/test-call` endpoint (see `../../CONTEXT.md` for architecture,
 `backend/services/test_call_service.py` for the call-placement logic).
 
 > **Decision (superseding the "two ways forward" below): take Option A.**
@@ -21,7 +21,7 @@ uv run python scripts/setup_retell_number.py
 **Bug #1 (fixed):** `ModuleNotFoundError: No module named 'backend'`. Running a script file
 directly (`python scripts/setup_retell_number.py`) puts `scripts/` on `sys.path`, not the repo
 root, so the local `backend` package wasn't importable. Fixed in
-[scripts/setup_retell_number.py](scripts/setup_retell_number.py) by inserting the repo root onto
+[scripts/setup_retell_number.py](../../scripts/setup_retell_number.py) by inserting the repo root onto
 `sys.path` before the `backend` imports.
 
 **Bug #2 (real, still open):** after the fix, the script correctly found the Twilio number
@@ -33,7 +33,7 @@ ERROR: Retell import failed: {"status":"error","message":"Internal Server Error"
 ### Root cause
 
 `RetellAdapter.import_twilio_number()` (in
-[backend/services/retell_adapter.py](backend/services/retell_adapter.py)) sends the raw Twilio
+[backend/services/retell_adapter.py](../../backend/services/retell_adapter.py)) sends the raw Twilio
 **Account SID / Auth Token** as `sip_trunk_auth_username` / `sip_trunk_auth_password`. That's
 wrong — Retell's `/import-phone-number` endpoint expects credentials for a **Twilio Elastic SIP
 Trunk** pointed at Retell's SIP domain, not your Twilio account API credentials. Those are two

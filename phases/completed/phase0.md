@@ -77,7 +77,7 @@ cannot read, delete, or place a call against another tenant's agent.
 `docker compose --profile tunnel up` starts a cloudflared quick tunnel fronting the API.
 Opt-in on purpose: starting it publishes the local backend to the internet. `uvicorn` now
 runs with `--proxy-headers --forwarded-allow-ips=*` so it builds correct https/wss URLs
-behind it. Documented in `RUN.md`.
+behind it. Documented in `../../RUN.md`.
 
 ### Task 4 — latency (GO)
 
@@ -89,7 +89,7 @@ after 2 discarded warmup runs:
 | Time to first token (streaming) | 0.688s | 0.951s |
 | Total completion (today's non-streaming behaviour) | 1.105s | 1.389s |
 
-Budget is 1.5s (`CONTEXT.md`). Both pass — **but read the second row carefully.**
+Budget is 1.5s (`../../CONTEXT.md`). Both pass — **but read the second row carefully.**
 Non-streaming total sits at 1.389s p95 with ~0.1s of headroom, and a single tool call
 doubles the LLM round-trips. Non-streaming will blow the budget the moment tools are in
 play; streaming holds first-audio at ~0.7s regardless of total length. So the model choice
@@ -121,7 +121,7 @@ live and being verified against a real call:
   they can't disagree about the same call's outcome.
 - The frontend has a real toggle for `use_custom_llm` (`frontend/src/app/agents/[id]/page.tsx`)
   — this isn't curl-only anymore.
-- ~~`llm_service.py` hardcoded to DeepSeek~~ — ADR-008 (CONTEXT.md): provider-agnostic
+- ~~`llm_service.py` hardcoded to DeepSeek~~ — ADR-008 (../../CONTEXT.md): provider-agnostic
   (`provider_for`/`get_client`, one cached `AsyncOpenAI` per provider), model chosen
   per-agent (`Agent.llm_model`) via the "Conversation engine" card, `GET /api/agents/models`
   reports the catalog and which providers are configured.

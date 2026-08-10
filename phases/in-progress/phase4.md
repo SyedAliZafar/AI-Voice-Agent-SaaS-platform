@@ -1,5 +1,12 @@
 # Phase 4 — Voice Agent Remediation Plan
 
+> **Status: in progress** — this file lives in `phases/in-progress/` deliberately.
+> Sessions 1–7 are done, and 1–6 are real-call verified; **Session 7 still needs a
+> real-call pass**, Session 8 is only partially scoped, and Sessions 9–11 haven't
+> started. Move this file to `phases/completed/` with `git mv` only once *every*
+> session is both done **and** real-call verified — passing tests is not the bar
+> (see `promptstotest.md`, and every outliers.md finding that unit tests missed).
+
 Source: Claude Code audit (2026-08-04) + ChatGPT cross-review. Two real
 findings from the ChatGPT pass were folded into this queue (Session 2 and
 Session 3) — everything else from that pass was repackaging, not new
@@ -36,7 +43,7 @@ integration yet — just stop the fake success response.
 
 Credentials now come from per-agent `ToolConfig.config` rows (`models/agent.py`),
 loaded via `agent_service.get_tool_configs` and flattened into `caller_context` in
-`retell_ws.py`. See CONTEXT.md's ADR-003 note. Open gap: no CRUD route to actually
+`retell_ws.py`. See ../../CONTEXT.md's ADR-003 note. Open gap: no CRUD route to actually
 create `ToolConfig` rows yet — they have to be inserted directly.
 
 **Why:** `book_appointment` and `create_lead` make real HTTP calls but
@@ -90,7 +97,7 @@ baseline before I touch the streaming architecture.
 ## Session 5 — Streaming + interruption handling (highest risk) [DONE 2026-08-04]
 
 Shipped as `llm_service.stream_agent_response()` (a separate function from
-`get_agent_response`, not a `stream=True` branch inside it — see CONTEXT.md's ADR-009 for
+`get_agent_response`, not a `stream=True` branch inside it — see ../../CONTEXT.md's ADR-009 for
 why) plus a restructured `retell_ws.py`: each turn runs on its own cancellable task, a new
 `response_id` cancels the stale one, and `settings.llm_streaming_enabled` (default on) is
 the kill switch back to the old blocking behavior.
@@ -149,7 +156,7 @@ order. See `backend/services/llm_service.py:_execute_tool_calls`.
 
 ---
 
-## Session 7 — Filler audio during tool calls
+## Session 7 — Filler audio during tool calls [DONE 2026-08-07]
 
 **Why:** Callers currently sit in dead silence during any tool call. Needs
 the streaming slot from Session 5 to exist first.
@@ -161,6 +168,24 @@ pre-recorded filler phrases ("let me check on that", "one moment") sent
 as an early content frame before the tool result comes back, so callers
 don't sit in silence during a Cal.com or HubSpot round-trip.
 ```
+
+Done, with one deliberate deviation: **text, not audio.** ../../CONTEXT.md's "what not to
+build" rules out custom TTS, and every frame retell_ws.py sends carries a `content`
+*string* that Retell's own voice synthesizes — there is no pre-synthesized-audio field
+in this codebase's Retell integration. So "cached, pre-recorded phrases" shipped as a
+fixed tuple of pre-written phrases (`llm_service._FILLER_PHRASES`) picked in-process:
+no LLM call, no synthesis on our side, so a filler still costs no latency of its own,
+and it needs no protocol change — it rides the same content-frame path as every other
+delta.
+
+Implementation: `_run_tool_calls_shielded` was split so `_start_tool_calls_shielded`
+returns the shielded future without awaiting it, letting `stream_agent_response` race
+it against `TOOL_CALL_FILLER_DELAY_SECONDS` (0.3) via `asyncio.wait` and `yield` a
+filler if the tool round hasn't finished. The shield still wraps the future that's
+awaited during the wait, so a barge-in mid-filler stops the speech without abandoning
+the in-flight tool call (ADR-009) — covered by a test. Fires once per slow tool round,
+so a turn with two sequential slow rounds gets one filler each. No changes to
+retell_ws.py.
 
 ---
 
@@ -176,7 +201,7 @@ regardless of whether the model complies with the system-prompt note. Not done: 
 `requires_confirmation` ToolConfig field and checking the caller's most recent turn for
 an affirmative confirmation *before* a first-time dispatch, which is what this session
 was originally about — this only stops *repeats* of something already done, it doesn't
-gate the first attempt. See CONTEXT.md ADR-009 §4c for the implementation.
+gate the first attempt. See ../../CONTEXT.md ADR-009 §4c for the implementation.
 
 **Why:** Consequential tool calls (bookings, CRM writes) fire the instant
 the LLM decides to, with no code-level check that the caller confirmed.

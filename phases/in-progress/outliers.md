@@ -35,7 +35,7 @@ same identifying-argument normalization `_ledger_entry` used to store it
 (`_ledger_args_key`, shared so the two sides can't drift). A match skips the real handler
 entirely and feeds the LLM `_duplicate_tool_result(tool, entry)` instead — which
 deliberately gives the model something to *say* ("tell the caller it's already done"),
-not just a prohibition, addressing the second half of the diagnosis below. See CONTEXT.md
+not just a prohibition, addressing the second half of the diagnosis below. See ../../CONTEXT.md
 ADR-009 §4c's 2026-08-05 update for the full writeup, and phase4.md Session 8 (marked
 `[PARTIAL]`) for how this relates to that session's original, broader scope.
 

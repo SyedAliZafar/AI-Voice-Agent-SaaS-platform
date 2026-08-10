@@ -2,7 +2,7 @@
 
 Written 2026-08-06 so a fresh Claude session can pick this up cold, with the same
 context this session had. Read this first; it points at the deeper writeups
-(`outliers.md`, `CONTEXT.md` ADR-009 §4c) rather than repeating them in full.
+(`outliers.md`, `../../CONTEXT.md` ADR-009 §4c) rather than repeating them in full.
 
 ## Where this fits
 
@@ -133,7 +133,7 @@ functions, corrected default-reason assertion, new `TestCancelCalendarBooking`/
 yet verified"); §5 added, then marked verified with the two new bugs cross-referenced;
 §6 added with full real evidence (`CallEvent` trail excerpt, the transcript quote, the
 actual Cal.com booking IDs proving the reschedule really did land server-side despite
-the timeout). `CONTEXT.md` ADR-009 §4c has two dated addenda (the cancel/reschedule
+the timeout). `../../CONTEXT.md` ADR-009 §4c has two dated addenda (the cancel/reschedule
 capability, then the timeout-honesty fix). This file (`session5.md`) is new.
 
 ## Full outliers.md status (all findings, for a fast orientation)
@@ -181,7 +181,7 @@ capability, then the timeout-honesty fix). This file (`session5.md`) is new.
 
 This project's dev tunnel is a Cloudflare **quick tunnel**, which dies routinely (DNS
 failure, or Cloudflare invalidating a tunnel left running too long) — expect to
-recreate it almost every session. See `RUN.md` and `CONTEXT.md` ADR-007 for the full
+recreate it almost every session. See `RUN.md` and `../../CONTEXT.md` ADR-007 for the full
 story; short version:
 
 ```powershell
