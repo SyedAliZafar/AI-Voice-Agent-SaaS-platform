@@ -72,6 +72,20 @@ class CsvImportResult(BaseModel):
     errors: list[str] = Field(default_factory=list)  # per-row reasons, truncated
 
 
+class ProspectStats(BaseModel):
+    """Per-status row counts for the /prospects counts strip. Every field defaults to 0
+    so a status with no rows still renders as a number rather than a gap.
+    """
+
+    total: int = 0
+    not_called: int = 0
+    called: int = 0
+    booked: int = 0
+    flagged: int = 0
+    no_answer: int = 0
+    do_not_call: int = 0
+
+
 class ProspectCallRequest(BaseModel):
     agent_id: uuid.UUID
     to_number: str | None = None  # defaults to the prospect's stored phone if omitted

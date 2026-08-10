@@ -10,6 +10,7 @@ import {
   CsvImportResult,
   OutreachStatus,
   Prospect,
+  ProspectStats,
   ProspectStatus,
   ResearchStatus,
 } from "@/lib/types";
@@ -48,8 +49,20 @@ const STATUS_ORDER: ProspectStatus[] = [
   "do_not_call",
 ];
 
+// Counts shown in the strip, in order. "total" plus the four outcomes worth watching —
+// not_called and do_not_call are deliberately left off (they're the residue, and the
+// per-row dropdown already shows them).
+const STAT_TILES: { key: keyof ProspectStats; label: string }[] = [
+  { key: "total", label: "Total" },
+  { key: "called", label: "Called" },
+  { key: "booked", label: "Booked" },
+  { key: "flagged", label: "Flagged" },
+  { key: "no_answer", label: "No answer" },
+];
+
 export default function ProspectsPage() {
   const [prospects, setProspects] = useState<Prospect[]>([]);
+  const [stats, setStats] = useState<ProspectStats | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [discovering, setDiscovering] = useState(false);
@@ -72,6 +85,12 @@ export default function ProspectsPage() {
   const fetchProspects = useCallback(async () => {
     const res = await api.get<Prospect[]>("/prospects");
     setProspects(res.data);
+    // Counts come from their own aggregate endpoint rather than the fetched page, which
+    // is capped at 100 rows. Fire-and-forget so a stats hiccup can't blank the list.
+    api
+      .get<ProspectStats>("/prospects/stats")
+      .then((s) => setStats(s.data))
+      .catch(() => {});
     return res.data;
   }, []);
 
@@ -204,6 +223,19 @@ export default function ProspectsPage() {
         title="Prospects"
         subtitle="Discovery finds companies, research builds their knowledge base — you just pick who to call."
       />
+
+      {stats && (
+        <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-5">
+          {STAT_TILES.map(({ key, label }) => (
+            <Card key={key} className="p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
+              <p className="mt-0.5 text-2xl font-semibold tabular-nums text-slate-900">
+                {stats[key]}
+              </p>
+            </Card>
+          ))}
+        </div>
+      )}
 
       <Card className="mb-6 p-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_1fr_auto]">

@@ -118,6 +118,61 @@ async def test_set_status_rejects_other_tenant(db_session, tenant_id, other_tena
     assert unchanged.status == "not_called"
 
 
+# --- counts strip ----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stats_counts_by_status(client, db_session, tenant_id, auth_headers):
+    a = await _make_prospect(db_session, tenant_id, "A", "p_a")
+    b = await _make_prospect(db_session, tenant_id, "B", "p_b")
+    await _make_prospect(db_session, tenant_id, "C", "p_c")  # stays not_called
+
+    await prospect_service.set_status(db_session, a.id, tenant_id, "booked")
+    await prospect_service.set_status(db_session, b.id, tenant_id, "no_answer")
+
+    resp = await client.get("/api/prospects/stats", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "total": 3,
+        "not_called": 1,
+        "called": 0,
+        "booked": 1,
+        "flagged": 0,
+        "no_answer": 1,
+        "do_not_call": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stats_is_empty_for_a_tenant_with_no_prospects(client, auth_headers):
+    resp = await client.get("/api/prospects/stats", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stats_does_not_count_other_tenants(
+    client, db_session, tenant_id, other_tenant_id, auth_headers
+):
+    await _make_prospect(db_session, tenant_id, "Mine", "p_mine")
+    await _make_prospect(db_session, other_tenant_id, "Theirs", "p_theirs")
+
+    resp = await client.get("/api/prospects/stats", headers=auth_headers)
+
+    assert resp.json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_path_is_not_swallowed_by_the_uuid_route(client, auth_headers):
+    """/stats is declared before /{prospect_id}; if that ordering ever flips, this
+    returns 422 (bad UUID) instead of the counts.
+    """
+    resp = await client.get("/api/prospects/stats", headers=auth_headers)
+    assert resp.status_code == 200
+
+
 # --- CSV import ------------------------------------------------------------------
 
 

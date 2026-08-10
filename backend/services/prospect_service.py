@@ -12,7 +12,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
@@ -214,6 +214,23 @@ async def list_prospects(
 
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+async def count_by_status(db: AsyncSession, tenant_id: uuid.UUID) -> dict[str, int]:
+    """Row counts per `status` for this tenant, plus a "total" key. A status with no
+    rows is simply absent — the caller supplies the zeros (see schemas.ProspectStats).
+
+    Aggregated in SQL rather than by counting a fetched page, so the numbers stay right
+    past list_prospects()' default 100-row limit.
+    """
+    rows = await db.execute(
+        select(Prospect.status, func.count())
+        .where(Prospect.tenant_id == tenant_id)
+        .group_by(Prospect.status)
+    )
+    counts = {status: count for status, count in rows.all()}
+    counts["total"] = sum(counts.values())
+    return counts
 
 
 async def get_prospect_unscoped(db: AsyncSession, prospect_id: uuid.UUID) -> Prospect | None:

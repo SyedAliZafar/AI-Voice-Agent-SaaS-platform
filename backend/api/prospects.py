@@ -19,6 +19,7 @@ from backend.schemas.prospect import (
     DiscoverRequest,
     ProspectCallRequest,
     ProspectResponse,
+    ProspectStats,
     ProspectUpdate,
 )
 from backend.services import agent_service, prospect_service, script_service, test_call_service
@@ -84,6 +85,20 @@ async def list_prospects(
     return await prospect_service.list_prospects(
         db, tenant_id, research_status, outreach_status, limit, offset
     )
+
+
+@router.get("/stats", response_model=ProspectStats)
+async def prospect_stats(
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Counts for the /prospects strip. Declared above /{prospect_id} so the literal
+    path wins the route match rather than being parsed as a UUID.
+    """
+    counts = await prospect_service.count_by_status(db, tenant_id)
+    # Filter to known fields: a status value that predates or outlives VALID_STATUSES
+    # should not turn this endpoint into a 500.
+    return ProspectStats(**{k: v for k, v in counts.items() if k in ProspectStats.model_fields})
 
 
 @router.get("/{prospect_id}", response_model=ProspectResponse)

@@ -97,6 +97,16 @@ export type ProspectStatus =
   | "no_answer"
   | "do_not_call";
 
+export interface ProspectStats {
+  total: number;
+  not_called: number;
+  called: number;
+  booked: number;
+  flagged: number;
+  no_answer: number;
+  do_not_call: number;
+}
+
 export interface CsvImportResult {
   imported: number;
   skipped_duplicates: number;
