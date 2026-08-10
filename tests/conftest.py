@@ -53,6 +53,25 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def queued_research(monkeypatch) -> list[str]:
+    """Capture research_prospect.delay() instead of dispatching it, and yield the ids.
+
+    Autouse because CELERY_TASK_ALWAYS_EAGER is false in this environment, so a bare
+    .delay() would try to reach the real Redis broker — every test that uploads a CSV or
+    hits /discover would depend on a running broker and stall on the publish retry when
+    there isn't one. Tests that care about enqueueing assert on this list.
+    """
+    from backend.workers import prospect_tasks
+
+    queued: list[str] = []
+    monkeypatch.setattr(
+        prospect_tasks.research_prospect, "delay", lambda prospect_id: queued.append(prospect_id)
+    )
+    monkeypatch.setattr(prospect_tasks.discover_prospects, "delay", lambda *a, **kw: None)
+    return queued
+
+
 @pytest.fixture
 def tenant_id() -> uuid.UUID:
     return uuid.uuid4()

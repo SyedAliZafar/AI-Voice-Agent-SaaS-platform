@@ -9,7 +9,31 @@ import uuid
 
 import pytest
 
-from backend.services import prospect_service
+from backend.schemas.prospect import CompanyResearch
+from backend.services import prospect_service, research_service
+from backend.workers import prospect_tasks
+
+
+def _session_factory(session):
+    """Stand-in for prospect_tasks.AsyncSessionLocal that hands back the test session.
+
+    The worker opens its own sessions (`async with AsyncSessionLocal() as db`) because it
+    has no HTTP request to borrow one from, so exercising the real task body means
+    substituting the factory. __aexit__ deliberately does not close: the fixture owns the
+    session's lifetime, and _research() opens the factory three times in one run.
+    """
+
+    class _Factory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    return _Factory()
 
 
 async def _make_prospect(db_session, tenant_id, name="Acme HVAC", place_id="p_api"):
@@ -20,6 +44,7 @@ async def _make_prospect(db_session, tenant_id, name="Acme HVAC", place_id="p_ap
 
 
 CSV_HEADER = "business_name,phone,city,source,niche\n"
+CSV_HEADER_FULL = "business_name,phone,city,source,niche,website,address\n"
 
 
 def _upload(content: str) -> dict:
@@ -211,6 +236,8 @@ async def test_import_csv_creates_prospects(client, db_session, tenant_id, auth_
         "skipped_duplicates": 0,
         "skipped_invalid": 0,
         "errors": [],
+        "with_website": 0,  # this header has no website column at all
+        "without_website": 2,
     }
 
     rows = await prospect_service.list_prospects(db_session, tenant_id)
@@ -313,3 +340,128 @@ async def test_import_csv_is_tenant_scoped(
     assert resp.json()["imported"] == 1
     assert len(await prospect_service.list_prospects(db_session, tenant_id)) == 1
     assert len(await prospect_service.list_prospects(db_session, other_tenant_id)) == 1
+
+
+# --- CSV import: website/address and the research handoff -------------------------
+
+
+@pytest.mark.asyncio
+async def test_import_csv_stores_website_and_address(client, db_session, tenant_id, auth_headers):
+    """The richer `address` column wins over `city`, and a bare domain is made fetchable
+    so research_service doesn't silently degrade the row to name-only research.
+    """
+    content = CSV_HEADER_FULL + (
+        "Acme HVAC,+491701234567,Berlin,cold-list,hvac,https://acme-hvac.de,Hauptstr. 5 Berlin\n"
+        "Sunbeam Solar,+491709876543,Munich,cold-list,solar,sunbeam.example,\n"
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    rows = {p.name: p for p in await prospect_service.list_prospects(db_session, tenant_id)}
+    assert rows["Acme HVAC"].website == "https://acme-hvac.de"
+    assert rows["Acme HVAC"].address == "Hauptstr. 5 Berlin"  # address beats city
+    assert rows["Sunbeam Solar"].website == "https://sunbeam.example"  # scheme added
+    assert rows["Sunbeam Solar"].address == "Munich"  # falls back to city
+
+
+@pytest.mark.asyncio
+async def test_import_csv_reports_website_coverage(client, auth_headers):
+    """The operator needs the degraded-research count up front, not after the briefs
+    come back thin.
+    """
+    content = CSV_HEADER_FULL + (
+        "Has Site,+491701234567,Berlin,cold-list,hvac,https://a.example,Berlin\n"
+        "No Site,+491709876543,Berlin,cold-list,hvac,,Berlin\n"
+        "Blank Site,+491700000002,Berlin,cold-list,hvac,   ,Berlin\n"
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    body = resp.json()
+    assert body["imported"] == 3
+    assert body["with_website"] == 1
+    assert body["without_website"] == 2
+    assert body["with_website"] + body["without_website"] == body["imported"]
+    assert "imported_ids" not in body  # internal handoff, not part of the report
+
+
+@pytest.mark.asyncio
+async def test_import_csv_enqueues_research_per_imported_row(
+    client, db_session, tenant_id, auth_headers, queued_research
+):
+    """Same one-task-per-prospect enqueue discovery does — and skipped rows must not
+    produce a task.
+    """
+    content = CSV_HEADER_FULL + (
+        "Good Co,+491701234567,Berlin,cold-list,hvac,https://a.example,Berlin\n"
+        "Bad Phone Co,banana,Berlin,cold-list,hvac,,Berlin\n"
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.json()["imported"] == 1
+    [prospect] = await prospect_service.list_prospects(db_session, tenant_id)
+    assert queued_research == [str(prospect.id)]
+
+
+@pytest.mark.asyncio
+async def test_imported_prospect_reaches_research_ready_via_the_pipeline(
+    client, db_session, tenant_id, auth_headers, queued_research, monkeypatch
+):
+    """End to end over the real Agent 2 body: import a row with website+address, then run
+    the same prospect_tasks._research() coroutine the discovery chain runs, and confirm
+    the row lands at research_status="ready" with the brief stored on it.
+
+    research_company itself is stubbed — it is the one step that makes a live HTTP scrape
+    and a paid DeepSeek call. Everything between the import and the stored result is the
+    production path, including the arguments the pipeline hands it.
+    """
+    content = CSV_HEADER_FULL + (
+        "Acme HVAC,+491701234567,Berlin,cold-list,hvac,https://acme-hvac.de,Hauptstr. 5 Berlin\n"
+    )
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+    assert resp.json() == {
+        "imported": 1,
+        "skipped_duplicates": 0,
+        "skipped_invalid": 0,
+        "errors": [],
+        "with_website": 1,
+        "without_website": 0,
+    }
+
+    [prospect] = await prospect_service.list_prospects(db_session, tenant_id)
+    assert prospect.research_status == "pending"
+    assert queued_research == [str(prospect.id)]
+
+    seen: dict[str, str | None] = {}
+
+    async def fake_research_company(name, website, address):
+        seen.update(name=name, website=website, address=address)
+        return CompanyResearch(summary="Family-run HVAC installer", industry="HVAC")
+
+    monkeypatch.setattr(research_service, "research_company", fake_research_company)
+    monkeypatch.setattr(prospect_tasks, "AsyncSessionLocal", _session_factory(db_session))
+
+    await prospect_tasks._research(queued_research[0])
+
+    # The pipeline must pass through what the CSV supplied — a dropped website here is
+    # exactly the silent degradation the with_website count exists to surface.
+    assert seen == {
+        "name": "Acme HVAC",
+        "website": "https://acme-hvac.de",
+        "address": "Hauptstr. 5 Berlin",
+    }
+
+    refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert refreshed.research_status == "ready"
+    assert refreshed.research_error is None
+    assert refreshed.research["summary"] == "Family-run HVAC installer"

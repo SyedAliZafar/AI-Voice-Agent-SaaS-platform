@@ -52,10 +52,18 @@ async def import_csv(
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
-    """Bulk-create prospects from an operator's list.
+    """Bulk-create prospects from an operator's list, then research each imported row.
 
-    Columns: business_name, phone (required); city, source, niche (optional). Bad rows
-    are skipped and counted rather than failing the upload — see CsvImportResult.
+    Columns: business_name, phone (required); city, source, niche, website, address
+    (optional). Bad rows are skipped and counted rather than failing the upload — see
+    CsvImportResult, whose with_website/without_website split says how many of the
+    imported rows will get degraded (name-only) research.
+
+    Research is enqueued per imported row, the same one-task-per-prospect pattern
+    discovery uses (prospect_tasks._discover). This is only non-blocking because
+    CELERY_TASK_ALWAYS_EAGER is false — under eager mode .delay() runs the task body
+    inline and this loop would hold the upload request open for a scrape + LLM call per
+    row. See RUN.md; eager mode is documented as local-dev-only for exactly this reason.
 
     Declared above /{prospect_id} so the literal path wins the route match.
     """
@@ -68,9 +76,13 @@ async def import_csv(
         raise HTTPException(status_code=422, detail="File must be UTF-8 encoded text") from exc
 
     try:
-        return await prospect_service.import_from_csv(db, tenant_id, content)
+        result = await prospect_service.import_from_csv(db, tenant_id, content)
     except prospect_service.CsvImportError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    for prospect_id in result.imported_ids:
+        research_prospect.delay(str(prospect_id))
+    return result
 
 
 @router.get("", response_model=list[ProspectResponse])

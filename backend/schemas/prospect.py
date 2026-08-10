@@ -71,6 +71,18 @@ class CsvImportResult(BaseModel):
     skipped_invalid: int = 0  # unusable phone or missing business_name
     errors: list[str] = Field(default_factory=list)  # per-row reasons, truncated
 
+    # Of the `imported` rows, how many carry a website. Research quality hinges on this:
+    # research_service scrapes the website and falls back to name/address-only ("degraded")
+    # research when it's absent, so the operator should see the split at upload time
+    # rather than discovering it later in thin CompanyResearch briefs.
+    with_website: int = 0
+    without_website: int = 0
+
+    # Ids of the rows just created, for the caller to enqueue research on. Excluded from
+    # the HTTP response — this is an internal handoff between import_from_csv() and the
+    # endpoint, not part of the operator-facing report.
+    imported_ids: list[uuid.UUID] = Field(default_factory=list, exclude=True)
+
 
 class ProspectStats(BaseModel):
     """Per-status row counts for the /prospects counts strip. Every field defaults to 0

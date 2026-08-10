@@ -101,7 +101,7 @@ class CsvImportError(Exception):
 
 
 CSV_REQUIRED_COLUMNS = ("business_name", "phone")
-CSV_OPTIONAL_COLUMNS = ("city", "source", "niche")
+CSV_OPTIONAL_COLUMNS = ("city", "source", "niche", "website", "address")
 CSV_MAX_ROWS = 5_000  # arbitrary sanity bound — an operator list, not a bulk data pipe
 CSV_MAX_REPORTED_ERRORS = 20  # keep the response readable; counts stay exact
 
@@ -117,6 +117,26 @@ def _cell(row: dict[str, str | None], name: str) -> str:
     return (row.get(name) or "").strip()
 
 
+def normalize_website(raw: str | None) -> str | None:
+    """Make an operator-typed website fetchable, or return None.
+
+    research_service._fetch_website_text() hands the value straight to httpx.get(), which
+    rejects a scheme-less "acme.com" outright — and that failure is swallowed into silent
+    name-only research, so a whole column of bare domains would degrade every brief with
+    nothing in the import report to show for it. Adding the scheme here is the difference
+    between "no website" and "website we couldn't use". Deliberately not real URL
+    validation: anything still unreachable at research time degrades as it always has.
+    """
+    if not raw:
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    return candidate
+
+
 def normalize_phone(raw: str | None) -> str | None:
     """Formatting-insensitive form used both to validate and to dedupe. None if unusable."""
     if not raw:
@@ -130,8 +150,15 @@ async def import_from_csv(
 ) -> CsvImportResult:
     """Create prospects from an operator-supplied CSV.
 
-    Columns: business_name, phone (required); city, source, niche (optional). Rows with
-    an unusable phone or no business_name are skipped and counted, not fatal.
+    Columns: business_name, phone (required); city, source, niche, website, address
+    (optional). Rows with an unusable phone or no business_name are skipped and counted,
+    not fatal. A missing website is NOT an invalid row — it just means that prospect gets
+    degraded (name/address-only) research, which the result's with_website/without_website
+    split reports up front.
+
+    address falls back to city when the richer `address` column is absent, so files
+    written against the older header keep working; a full street address is preferred
+    because research_service passes it to the LLM as a disambiguating signal.
 
     Dedupe is by normalized phone, within the tenant — both against rows already in the
     DB and against earlier rows in the same file, so re-uploading a list is a no-op
@@ -151,6 +178,7 @@ async def import_from_csv(
     seen_phones = {p for p in (normalize_phone(row) for row in existing.scalars()) if p}
 
     result = CsvImportResult()
+    created: list[Prospect] = []
 
     def note(row_num: int, reason: str) -> None:
         if len(result.errors) < CSV_MAX_REPORTED_ERRORS:
@@ -175,25 +203,38 @@ async def import_from_csv(
             result.skipped_duplicates += 1
             continue
 
+        website = normalize_website(_cell(row, "website"))
+        address = _cell(row, "address") or _cell(row, "city") or None
+
         seen_phones.add(phone)
-        db.add(
-            Prospect(
-                tenant_id=tenant_id,
-                # Not from Places, but the column is NOT NULL and (tenant, place_id) is
-                # the identity key the rest of the pipeline upserts on — keying it to the
-                # phone keeps that key meaningful for CSV rows too.
-                google_place_id=f"csv:{phone}",
-                name=name,
-                phone=phone,
-                address=_cell(row, "city") or None,
-                category=_cell(row, "niche") or None,
-                source_query=_cell(row, "source") or source_query,
-                priority_score=compute_priority(None, 0, None, phone),
-            )
+        prospect = Prospect(
+            tenant_id=tenant_id,
+            # Not from Places, but the column is NOT NULL and (tenant, place_id) is
+            # the identity key the rest of the pipeline upserts on — keying it to the
+            # phone keeps that key meaningful for CSV rows too.
+            google_place_id=f"csv:{phone}",
+            name=name,
+            phone=phone,
+            website=website,
+            address=address,
+            category=_cell(row, "niche") or None,
+            source_query=_cell(row, "source") or source_query,
+            # website is a scoring signal (see compute_priority), so a CSV row that
+            # carries one should outrank one that doesn't, same as a Places row.
+            priority_score=compute_priority(None, 0, website, phone),
         )
+        db.add(prospect)
+        created.append(prospect)
+
         result.imported += 1
+        if website:
+            result.with_website += 1
+        else:
+            result.without_website += 1
 
     await db.commit()
+    # Ids exist only after the flush that commit() performs.
+    result.imported_ids = [p.id for p in created]
     return result
 
 
