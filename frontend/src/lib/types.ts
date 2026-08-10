@@ -112,6 +112,10 @@ export interface CsvImportResult {
   skipped_duplicates: number;
   skipped_invalid: number;
   errors: string[];
+  // Of the `imported` rows, how many carry a website. Prospects without one get
+  // degraded (name-only) research, so the two always sum to `imported`.
+  with_website: number;
+  without_website: number;
 }
 
 export interface Prospect {
