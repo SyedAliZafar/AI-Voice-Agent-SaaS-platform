@@ -32,7 +32,7 @@ Investigate what it would take to support OpenAI's Realtime API (audio-native, s
 session — not the chat-completions models already in `backend/services/llm_service.py`'s
 `MODEL_CATALOG`) as a conversation engine option for voice agents in this repo.
 
-Read `CONTEXT.md` (architecture, ADRs, "what NOT to build"), `phase0.md`/`phase3.md`
+Read `CONTEXT.md` (architecture, ADRs, "what NOT to build"), `phases/completed/phase0.md`/`phases/completed/phase3.md`
 (the Custom LLM WebSocket migration and its latency findings), and
 `backend/api/retell_ws.py` + `backend/services/llm_service.py` (today's per-turn
 text-in/text-out design, ADR-008) first — this is genuinely new territory relative to
@@ -50,7 +50,7 @@ Specifically work out:
    concept from a `<select>` of model ids, e.g. a separate "engine" dimension alongside
    "model"?
 3. Cost and latency tradeoffs against the already-measured DeepSeek streaming numbers in
-   phase0.md (0.688s p50 TTFT) — Realtime's pitch is lower latency by skipping a
+   phases/completed/phase0.md (0.688s p50 TTFT) — Realtime's pitch is lower latency by skipping a
    round-trip, but that only holds if Retell is out of the loop; confirm rather than assume.
 4. Server-side tool execution (ADR-003) — Realtime has its own function-calling and
    turn-taking model; work out whether `backend/tools/` can plug into it without a

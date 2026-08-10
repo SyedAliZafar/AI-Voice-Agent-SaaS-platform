@@ -414,6 +414,89 @@ async def test_place_test_call_custom_llm_fails_fast_when_tunnel_unreachable(
 
 
 @pytest.mark.asyncio
+async def test_place_test_call_custom_llm_auto_self_heals_after_tunnel_restart(
+    db_session, tenant_id
+):
+    """PUBLIC_BASE_URL=auto: the quick tunnel restarted and minted a new hostname while
+    this process held the old one cached. The preflight should fail against the stale
+    URL, re-ask cloudflared once, and succeed against the fresh one — turning a tunnel
+    restart into a non-event instead of a failed call plus a manual .env edit. This is
+    the entire reason "auto" exists.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_custom_1"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    # First resolve returns the stale host, the forced refresh returns the live one.
+    resolved = AsyncMock(
+        side_effect=[
+            "https://stale-tunnel.trycloudflare.com",
+            "https://fresh-tunnel.trycloudflare.com",
+            "https://fresh-tunnel.trycloudflare.com",  # _webhook_url
+        ]
+    )
+    # Unreachable for the stale host, reachable once we're on the fresh one.
+    reachable = AsyncMock(
+        side_effect=lambda url, *a, **kw: None if "fresh" in url else "cannot connect"
+    )
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch("backend.services.public_url.get_public_base_url", new=resolved),
+        patch("backend.services.tunnel_check.check_public_url_reachable", new=reachable),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "auto"
+
+        result = await test_call_service.place_test_call(
+            db_session, agent.id, tenant_id, "+491701234567"
+        )
+
+    assert result["status"] == "dialing"
+    # Retell must be pointed at the FRESH tunnel, not the stale cached one.
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["llm_websocket_url"] == "wss://fresh-tunnel.trycloudflare.com/llm-websocket"
+    # And the refresh was actually forced rather than re-reading the same cached value.
+    assert resolved.await_args_list[1].kwargs.get("force_refresh") is True
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_non_auto_does_not_retry(db_session, tenant_id):
+    """The self-heal is auto-only. With a literal URL there's nothing to re-discover, so
+    a dead tunnel must still fail fast rather than silently probing twice."""
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    mock_adapter = AsyncMock()
+    reachable = AsyncMock(return_value="cannot connect")
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch("backend.services.tunnel_check.check_public_url_reachable", new=reachable),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.public_base_url = "https://dead-tunnel.trycloudflare.com"
+
+        with pytest.raises(test_call_service.TestCallError, match="not reachable"):
+            await test_call_service.place_test_call(
+                db_session, agent.id, tenant_id, "+491701234567"
+            )
+
+    assert reachable.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_place_test_call_hosted_llm_ignores_tunnel_reachability(db_session, tenant_id):
     """The hosted-LLM path is designed to work with no tunnel at all (lifecycle events
     just don't arrive until POST /api/calls/sync) — it must not start requiring one.

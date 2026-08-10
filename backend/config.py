@@ -40,11 +40,23 @@ class Settings(BaseSettings):
     # Our own public https URL (the dev tunnel's address, e.g. the cloudflared
     # trycloudflare.com host — see docker-compose.yml's "tunnel" profile). Retell's
     # Custom LLM WebSocket needs to dial wss://<this host>/llm-websocket, so this gets
-    # translated to wss:// when registering that URL with Retell. The quick tunnel's
-    # host changes every restart — update this and re-provision when that happens
-    # (backend/services/test_call_service.py detects the mismatch and re-provisions
-    # automatically the next time a call is placed).
+    # translated to wss:// when registering that URL with Retell.
+    #
+    # Set it to the literal sentinel "auto" to have the quick tunnel's current hostname
+    # discovered from cloudflared at use time (backend/services/public_url.py) — the
+    # quick tunnel changes host on every restart, and hand-editing this file after each
+    # one has cost four billed test calls. A literal URL still wins and is what a named
+    # tunnel or a real deployment should use. Either way,
+    # backend/services/test_call_service.py detects a changed URL and re-provisions the
+    # Retell agent automatically on the next call.
     public_base_url: str = ""
+    # Where cloudflared's metrics server is listening — only consulted when
+    # public_base_url == "auto". Defaults to localhost because host-run tooling
+    # (scripts/check_custom_llm.py) can't resolve compose service names; the api and
+    # worker containers get CLOUDFLARED_METRICS_URL=http://tunnel-quick:20241 injected
+    # in docker-compose.yml, exactly as DATABASE_URL/REDIS_URL are. The tunnel-quick
+    # service publishes 20241 so both routes work.
+    cloudflared_metrics_url: str = "http://localhost:20241"
     # Verify X-Retell-Signature on incoming /webhooks/retell requests. On by default —
     # the moment a tunnel is up, an unverified webhook lets anyone with the URL forge
     # call events. Turn off only to hand-post test payloads locally (tests do this via

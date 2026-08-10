@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
 from backend.models.agent import Agent
-from backend.services import agent_service, call_service, tunnel_check
+from backend.services import agent_service, call_service, public_url, tunnel_check
 from backend.services.retell_adapter import RetellAdapter
 
 settings = get_settings()
@@ -99,7 +99,7 @@ async def place_test_call(
     }
 
 
-def _webhook_url() -> str | None:
+async def _webhook_url() -> str | None:
     """Where Retell should POST call_started/call_ended/call_analyzed for agents we
     provision. None when there's no public URL — the hosted-LLM path is meant to work
     with no tunnel at all, so this stays optional rather than a hard requirement.
@@ -107,10 +107,19 @@ def _webhook_url() -> str | None:
     The cost of it being None: no call lifecycle events arrive, so calls sit at
     status="in_progress" until someone runs POST /api/calls/sync. That reconcile path
     exists precisely to cover this case.
+
+    Resolved via public_url rather than read off settings directly, so PUBLIC_BASE_URL
+    ="auto" picks up the live quick-tunnel hostname. A discovery failure is treated the
+    same as "no tunnel" here (rather than raised) to preserve exactly that: the hosted
+    path must keep working without one.
     """
-    if not settings.public_base_url:
+    try:
+        base = await public_url.get_public_base_url(settings.public_base_url)
+    except public_url.PublicUrlUnavailable:
         return None
-    return f"{settings.public_base_url.rstrip('/')}/webhooks/retell"
+    if not base:
+        return None
+    return f"{base}/webhooks/retell"
 
 
 async def _provision_hosted_llm_agent(
@@ -127,7 +136,7 @@ async def _provision_hosted_llm_agent(
     recreating mirrors what _provision_custom_llm_agent does for ws_url.
     """
     retell_ids: dict = dict((agent.voice_config or {}).get("retell") or {})
-    webhook_url = _webhook_url()
+    webhook_url = await _webhook_url()
 
     if retell_ids.get("llm_id"):
         await adapter.update_llm(retell_ids["llm_id"], prompt)
@@ -177,11 +186,17 @@ async def _provision_custom_llm_agent(
             "for now, or set agent.system_prompt directly instead of overriding per-call."
         )
 
-    if not settings.public_base_url:
+    try:
+        base_url = await public_url.get_public_base_url(settings.public_base_url)
+    except public_url.PublicUrlUnavailable as exc:
+        raise TestCallError(str(exc)) from exc
+
+    if not base_url:
         raise TestCallError(
             "PUBLIC_BASE_URL is not set. use_custom_llm requires a public tunnel so Retell "
             "can reach our websocket — start one (docker compose --profile tunnel up -d) "
-            "and set PUBLIC_BASE_URL to its https URL in .env."
+            "and set PUBLIC_BASE_URL to its https URL in .env, or to 'auto' to have the "
+            "quick tunnel's current URL discovered automatically."
         )
 
     # Being *set* isn't being *reachable*: a quick tunnel's hostname can stop resolving,
@@ -189,21 +204,35 @@ async def _provision_custom_llm_agent(
     # check we'd provision Retell against a dead websocket, return 200 "dialing", and the
     # operator would spend a real, billed call on dead air with nothing in our logs to
     # explain why.
-    unreachable_reason = await tunnel_check.check_public_url_reachable(settings.public_base_url)
+    unreachable_reason = await tunnel_check.check_public_url_reachable(base_url)
+    if unreachable_reason and public_url.is_auto(settings.public_base_url):
+        # Under "auto" an unreachable URL usually just means the tunnel restarted and
+        # minted a new hostname while we were holding the old one. Re-ask cloudflared
+        # once and retry before spending the operator's time on an error — this is the
+        # whole point of "auto": a tunnel restart should be a non-event, not a failed
+        # call plus a manual .env edit.
+        try:
+            base_url = await public_url.get_public_base_url(
+                settings.public_base_url, force_refresh=True
+            )
+        except public_url.PublicUrlUnavailable as exc:
+            raise TestCallError(str(exc)) from exc
+        unreachable_reason = await tunnel_check.check_public_url_reachable(base_url)
+
     if unreachable_reason:
         raise TestCallError(
-            f"PUBLIC_BASE_URL ({settings.public_base_url}) is not reachable: "
+            f"PUBLIC_BASE_URL ({base_url}) is not reachable: "
             f"{unreachable_reason}. Retell dials our websocket from the public internet, "
             "so this call would be dead air. Note a dead tunnel still shows as 'Up' in "
             "`docker compose ps` — check `docker compose logs tunnel` for the current "
             "URL, or run `uv run python scripts/check_custom_llm.py` for a full diagnosis."
         )
 
-    ws_base = settings.public_base_url.replace("https://", "wss://").replace("http://", "ws://")
+    ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_base}/llm-websocket"
 
     cached: dict = dict((agent.voice_config or {}).get("retell_custom") or {})
-    webhook_url = _webhook_url()
+    webhook_url = await _webhook_url()
 
     if (
         cached.get("agent_id")

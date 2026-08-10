@@ -41,7 +41,7 @@ docker-compose up        # postgres, redis, minio, api, worker
   bypass the `tenant_id` filter. (There used to be a `backend/middleware/tenant.py` —
   it was written, never registered, and deleted in favor of `deps.py`, since
   `BaseHTTPMiddleware` can't raise per-route 401s, can't participate in DI for tests to
-  override, and is skipped for WebSocket scopes. See `phase0.md` Task 2 for the full
+  override, and is skipped for WebSocket scopes. See `phases/completed/phase0.md` Task 2 for the full
   reasoning.) `/webhooks/*` routes are the deliberate exception — voice platforms can't
   send our JWT, so they stay unscoped by tenant middleware and rely on the payload's own
   ids instead.

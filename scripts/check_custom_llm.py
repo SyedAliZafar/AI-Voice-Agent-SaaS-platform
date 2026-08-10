@@ -36,7 +36,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.agent import Agent
 from backend.models.call import Call
 from backend.models.tenant import Tenant
-from backend.services import tunnel_check
+from backend.services import public_url, tunnel_check
 
 settings = get_settings()
 
@@ -56,18 +56,38 @@ def _fail(msg: str, fix: str) -> None:
     sys.exit(1)
 
 
-def check_config() -> None:
+# Resolved once by check_config and reused by the later steps, so every stage of this
+# diagnostic is talking about the same URL — under PUBLIC_BASE_URL=auto, re-resolving
+# per step could otherwise straddle a tunnel restart and report a confusing mix.
+BASE_URL = ""
+
+
+async def check_config() -> None:
+    global BASE_URL
     print("1. Config")
-    if not settings.public_base_url:
+    try:
+        # Same resolver the runtime path uses (backend/services/public_url.py) so the
+        # diagnostic can't disagree with what a real test call would do.
+        BASE_URL = await public_url.get_public_base_url(settings.public_base_url)
+    except public_url.PublicUrlUnavailable as exc:
+        _fail(
+            str(exc),
+            "start the quick tunnel with `docker compose --profile tunnel-quick up -d`, "
+            "or set PUBLIC_BASE_URL to a literal https:// URL in .env.",
+        )
+    if not BASE_URL:
         _fail(
             "PUBLIC_BASE_URL is empty",
-            "start the tunnel (docker compose --profile tunnel up -d), take the "
-            "https://*.trycloudflare.com URL from `docker compose logs tunnel`, put it in "
-            ".env, then `docker compose up -d api` (restart alone does NOT re-read .env).",
+            "start the tunnel (docker compose --profile tunnel-quick up -d) and set "
+            "PUBLIC_BASE_URL=auto in .env to have its URL discovered automatically, then "
+            "`docker compose up -d api` (restart alone does NOT re-read .env).",
         )
     if not settings.deepseek_api_key:
         _fail("DEEPSEEK_API_KEY is empty", "set it in .env and recreate the api container.")
-    print(f"{OK}   PUBLIC_BASE_URL = {settings.public_base_url}")
+    if public_url.is_auto(settings.public_base_url):
+        print(f"{OK}   PUBLIC_BASE_URL = auto -> {BASE_URL} (discovered from cloudflared)")
+    else:
+        print(f"{OK}   PUBLIC_BASE_URL = {BASE_URL}")
     print(f"{OK}   DEEPSEEK_API_KEY set ({len(settings.deepseek_api_key)} chars)")
     if not settings.retell_from_number:
         print(
@@ -78,19 +98,19 @@ def check_config() -> None:
 
 async def check_tunnel() -> None:
     print("\n2. Tunnel reachability")
-    url = f"{settings.public_base_url.rstrip('/')}/health"
+    url = f"{BASE_URL}/health"
     # Shared with test_call_service's preflight guard (backend/services/tunnel_check.py)
     # so this diagnostic and the runtime check can't silently drift apart. One request,
     # not two: a second independent GET here could flake differently than the one the
     # helper already made.
-    reason = await tunnel_check.check_public_url_reachable(settings.public_base_url, timeout=20.0)
+    reason = await tunnel_check.check_public_url_reachable(BASE_URL, timeout=20.0)
     if reason:
         _fail(
             reason,
             "the quick tunnel's hostname changes on every restart, and a long-running one "
-            "can die while the container still reports 'Up'. Check `docker compose logs "
-            "tunnel` for the CURRENT https://*.trycloudflare.com URL, update PUBLIC_BASE_URL, "
-            "and recreate the api container.",
+            "can die while the container still reports 'Up'. Set PUBLIC_BASE_URL=auto in "
+            ".env to have the current URL discovered automatically, or check `docker "
+            "compose logs tunnel-quick` for it and recreate the api container.",
         )
     print(f"{OK}   {url} -> 200 (reachable)")
 
@@ -160,7 +180,7 @@ async def check_websocket() -> None:
         )
         await db.commit()
 
-    ws_base = settings.public_base_url.replace("https://", "wss://").replace("http://", "ws://")
+    ws_base = BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_base.rstrip('/')}/llm-websocket/{external_id}"
     print(f"       connecting to {ws_url}")
 
@@ -261,7 +281,7 @@ async def check_websocket() -> None:
 
 async def main() -> None:
     print("Custom LLM (DeepSeek) path diagnostic\n" + "=" * 38)
-    check_config()
+    await check_config()
     await check_tunnel()
     await check_deepseek()
     await check_websocket()

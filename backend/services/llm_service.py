@@ -15,6 +15,7 @@ one per call/turn is not an option.
 
 import asyncio
 import json
+import random
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from functools import lru_cache
@@ -28,6 +29,26 @@ from backend.tools import get_tool_definitions, get_tool_handler
 settings = get_settings()
 
 MAX_TOKENS = 1024
+
+# How long a tool-call round may run before the caller hears a filler phrase instead of
+# silence (phase4.md Session 7). A Cal.com/HubSpot round-trip is the case this exists
+# for; anything resolving faster than this never triggers a filler, so quick answers
+# still feel immediate.
+TOOL_CALL_FILLER_DELAY_SECONDS = 0.3
+# Plain text, not audio: CONTEXT.md's "what NOT to build" rules out custom TTS, and
+# retell_ws.py's frames carry a `content` string that Retell's own voice synthesizes.
+# "Pre-recorded" here means pre-written and picked in-process — no LLM call, no
+# synthesis on our side, so a filler costs no latency of its own.
+_FILLER_PHRASES = (
+    "Let me check on that for you...",
+    "One moment...",
+    "Just a second while I look that up...",
+)
+
+
+def _pick_filler_phrase() -> str:
+    """Its own function so tests can patch it for a deterministic phrase."""
+    return random.choice(_FILLER_PHRASES)
 
 
 class LLMConfigError(Exception):
@@ -230,6 +251,27 @@ def _default_spawn_tracked(coro: Coroutine) -> "asyncio.Task":
     return asyncio.create_task(coro)
 
 
+def _start_tool_calls_shielded(
+    tool_calls: list[dict[str, Any]],
+    caller_context: dict[str, Any],
+    on_tool_event: Callable[[dict[str, Any]], None] | None,
+    spawn_tracked: Callable[[Coroutine], "asyncio.Task"],
+    check_duplicate: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> "asyncio.Future[list[dict]]":
+    """Starts _execute_tool_calls on a tracked, shielded task without awaiting it.
+
+    Split out from _run_tool_calls_shielded so stream_agent_response can *race* the
+    result against a timeout (the Session 7 filler) rather than only await it. The
+    shield has to wrap the same future the caller awaits, or a barge-in landing during
+    the filler wait would reach the real tool task — which is the exact thing ADR-009
+    exists to prevent.
+    """
+    task = spawn_tracked(
+        _execute_tool_calls(tool_calls, caller_context, on_tool_event, check_duplicate)
+    )
+    return asyncio.shield(task)
+
+
 async def _run_tool_calls_shielded(
     tool_calls: list[dict[str, Any]],
     caller_context: dict[str, Any],
@@ -250,10 +292,9 @@ async def _run_tool_calls_shielded(
 
     check_duplicate: see _execute_tool_calls — threaded through unchanged.
     """
-    task = spawn_tracked(
-        _execute_tool_calls(tool_calls, caller_context, on_tool_event, check_duplicate)
+    return await _start_tool_calls_shielded(
+        tool_calls, caller_context, on_tool_event, spawn_tracked, check_duplicate
     )
-    return await asyncio.shield(task)
 
 
 async def get_agent_response(
@@ -453,9 +494,21 @@ async def stream_agent_response(
                 ],
             }
         )
-        tool_results = await _run_tool_calls_shielded(
+        # Race the tool round against a short timeout so a slow Cal.com/HubSpot
+        # round-trip doesn't leave the caller in silence (phase4.md Session 7). The
+        # filler is yielded like any other delta, so it reaches Retell through the
+        # existing content-frame path with no protocol change. Awaiting `shielded`
+        # afterwards is correct either way — an already-resolved future returns
+        # immediately — and keeps the barge-in shield covering the real tool task
+        # during the wait.
+        shielded = _start_tool_calls_shielded(
             normalized, caller_context, on_tool_event, spawn_tracked, check_duplicate
         )
+        done, _pending = await asyncio.wait({shielded}, timeout=TOOL_CALL_FILLER_DELAY_SECONDS)
+        if not done:
+            any_content = True
+            yield _pick_filler_phrase()
+        tool_results = await shielded
         messages.extend(tool_results)
         stage = "tool_followup"
 

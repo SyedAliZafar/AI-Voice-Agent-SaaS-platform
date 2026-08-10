@@ -70,6 +70,12 @@ _LEDGER_ARG_KEYS: dict[str, tuple[str, ...]] = {
     # (outliers.md §5).
     "cancel_appointment": ("booking_uid",),
     "reschedule_appointment": ("booking_uid",),
+    # Same class of bug outliers.md §1 documented for book_appointment: this is a
+    # real (if lightweight) side-effecting booking capture, not a read, so a repeat
+    # request must be caught too. No start_time/attendee_email field exists on this
+    # tool's schema — phone + preferred_time is the closest analogous "who" + "when"
+    # identifying pair.
+    "book_discovery_call": ("phone", "preferred_time"),
 }
 _LEDGER_RESULT_ID_KEYS: dict[str, str] = {
     "book_appointment": "confirmation_id",

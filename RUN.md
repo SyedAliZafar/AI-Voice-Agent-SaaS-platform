@@ -9,7 +9,8 @@ in your own terminals). Pick one.
 |---|---|
 | Calls stuck at "In progress", 0s duration | Press **Sync status** on the Calls page (or `POST /api/calls/sync`) — see ["When calls are stuck"](#when-calls-are-stuck-showing-in-progress) |
 | Custom-LLM test call returns a 422 "not reachable" | The tunnel is down — this is the preflight guard working as intended, not a bug. It just saved you a billed call to dead air. Check `docker compose logs tunnel`, or run `scripts/check_custom_llm.py` for the full chain. |
-| Quick tunnel (`tunnel-quick`): `docker compose ps` shows `Up` but nothing works | Don't trust it — check `docker compose logs tunnel-quick` for the *current* `https://*.trycloudflare.com` URL, or `curl $PUBLIC_BASE_URL/health`. It sits in a silent reconnect loop while still reporting `Up`. Consider switching to the named tunnel (Option A below) so this stops happening. |
+| Quick tunnel (`tunnel-quick`): `docker compose ps` shows `Up` but nothing works | Don't trust it — check `docker compose logs tunnel-quick` for the *current* `https://*.trycloudflare.com` URL, or `curl $PUBLIC_BASE_URL/health`. It sits in a silent reconnect loop while still reporting `Up`. Set `PUBLIC_BASE_URL=auto` (below) so the current URL is discovered automatically, or switch to the named tunnel (Option A) so this stops happening. |
+| Quick tunnel restarted and `PUBLIC_BASE_URL` is stale again | Set `PUBLIC_BASE_URL=auto` in `.env` once. The hostname is then read live from cloudflared's `/quicktunnel` endpoint, and a test call that hits a stale URL re-resolves and retries by itself. No more copy-paste-from-logs. |
 | Named tunnel (`tunnel`): `docker compose ps` shows unhealthy | Trustworthy this time — its healthcheck calls cloudflared's own `/ready`. Check `docker compose logs tunnel` for why the connection isn't registering (bad `CF_TUNNEL_TOKEN` is the usual cause). |
 | Changed `PUBLIC_BASE_URL` in `.env` but nothing changed | `docker compose restart api` does **not** re-read `.env` — run `docker compose up -d api` to recreate the container. |
 | Custom-LLM (DeepSeek) call gives dead air, nothing in the logs | `uv run python scripts/check_custom_llm.py` — walks config → tunnel → LLM → websocket and prints which link is broken |
@@ -129,11 +130,17 @@ docker compose --profile tunnel-quick up
 
 Logs a `https://<random>.trycloudflare.com` URL that forwards to the API. No account
 needed, but two things bite:
-- The hostname changes on **every restart** — update `PUBLIC_BASE_URL` and recreate the
-  API container each time.
+- The hostname changes on **every restart**. **Fix: set `PUBLIC_BASE_URL=auto` in `.env`
+  once.** The backend then reads the live hostname from cloudflared's own metrics
+  endpoint (`/quicktunnel`, exposed by the `--metrics` flag on the `tunnel-quick`
+  service) at the moment it needs it, so a restart needs no `.env` edit and no container
+  recreate. A custom-LLM test call that finds a stale URL re-resolves and retries once
+  before failing, so even an in-flight restart is usually invisible. See
+  `backend/services/public_url.py`. Without `auto`, you must update `PUBLIC_BASE_URL` and
+  recreate the API container after every restart.
 - The tunnel can **silently die mid-session** while `docker compose ps` still reports it
   as `Up` — it sits in a reconnect loop instead of exiting. This is what caused custom-LLM
-  calls to go to dead air on 2026-08-04 (see `phase3.md`): the tunnel died ~45 minutes
+  calls to go to dead air on 2026-08-04 (see `phases/completed/phase3.md`): the tunnel died ~45 minutes
   after being restarted, and nothing surfaced that until a live call failed.
 
 If you hit that, don't trust `docker compose ps` — check `docker compose logs tunnel` for

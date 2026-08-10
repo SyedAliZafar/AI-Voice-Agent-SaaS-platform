@@ -1,12 +1,17 @@
 # CONTEXT.md — AI Voice Agent SaaS Platform
 
-> **Investigation logs:** [phase0.md](phase0.md), [phase2.md](phase2.md) and
-> [phase3.md](phase3.md) document real de-risking and bug-fixing work (auth rewrite,
-> telephony proof, latency spike, call-lifecycle fixes) done after this file was first
-> written. Where they contradict an ADR below, they supersede it — this file has been
-> updated to match, but if something still looks off, trust the phase docs and the code
-> over this one, and fix this file. **phase3.md is the current state of play**, including
+> **Investigation logs:** [phase0.md](phases/completed/phase0.md),
+> [phase2.md](phases/completed/phase2.md) and [phase3.md](phases/completed/phase3.md) document real
+> de-risking and bug-fixing work (auth rewrite, telephony proof, latency spike,
+> call-lifecycle fixes) done after this file was first written. Where they contradict an
+> ADR below, they supersede it — this file has been updated to match, but if something
+> still looks off, trust the phase docs and the code over this one, and fix this file.
+> **[phase3.md](phases/completed/phase3.md) is the current state of play**, including
 > what is verified vs. merely written.
+>
+> Phase docs live under [phases/](phases/): `completed/` for finished work,
+> `in-progress/` for work still open. A phase doc moves to `completed/` only once every
+> session in it is both done *and* real-call verified.
 
 ## Project overview
 
@@ -38,6 +43,17 @@ voiceagent/
 ├── docker-compose.yml            # Local dev: postgres, redis, minio, api, worker
 ├── .env.example                  # Required env vars template
 │
+├── phases/                       # Investigation/remediation logs (see note at top)
+│   ├── completed/                # Done AND real-call verified
+│   │   ├── phase0.md             # De-risking gates before the Custom LLM WS migration
+│   │   ├── phase2.md             # Outbound test call: from-number setup
+│   │   └── phase3.md             # Call lifecycle correctness + reaching DeepSeek
+│   └── in-progress/              # Still open — promote only when fully verified
+│       ├── phase4.md             # Remediation queue (Sessions 1-11)
+│       ├── outliers.md           # Real-call findings feeding phase4
+│       ├── session5.md           # Session 5 handoff (has an open "what's left" list)
+│       └── promptstotest.md      # Prompts pending a real-call verification pass
+│
 ├── backend/
 │   ├── main.py                   # FastAPI app factory
 │   ├── config.py                 # Pydantic Settings (env-based config)
@@ -67,13 +83,13 @@ voiceagent/
 │   │   ├── prospects.py          # Prospecting pipeline: discover/list/research/outreach status
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
 │   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
-│   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phase0.md)
+│   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phases/completed/phase0.md)
 │   │
 │   ├── services/                 # Business logic (no HTTP concerns)
 │   │   ├── __init__.py
 │   │   ├── agent_service.py      # Agent CRUD, prompt management
 │   │   ├── call_service.py       # Call lifecycle, state machine
-│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phase0.md)
+│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phases/completed/phase0.md)
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
@@ -92,8 +108,8 @@ voiceagent/
 │   │   ├── base.py               # BaseTool abstract class
 │   │   ├── book_appointment.py
 │   │   ├── check_availability.py # read-only "is this slot free?" (see ADR-009 note)
-│   │   ├── cancel_appointment.py     # (ADR-009 §4c, outliers.md §5)
-│   │   ├── reschedule_appointment.py # (ADR-009 §4c, outliers.md §5)
+│   │   ├── cancel_appointment.py     # (ADR-009 §4c, phases/in-progress/outliers.md §5)
+│   │   ├── reschedule_appointment.py # (ADR-009 §4c, phases/in-progress/outliers.md §5)
 │   │   ├── lookup_customer.py
 │   │   ├── create_lead.py
 │   │   ├── transfer_call.py
@@ -110,7 +126,7 @@ voiceagent/
 │   │   ├── rate_limit.py         # Redis-based rate limiting
 │   │   └── logging.py            # Structured JSON logging
 │   │   # NOTE: tenant.py used to live here — deleted, superseded by api/deps.py's
-│   │   # get_current_tenant dependency. See ADR-001 and phase0.md Task 2.
+│   │   # get_current_tenant dependency. See ADR-001 and phases/completed/phase0.md Task 2.
 │   │
 │   └── migrations/               # Alembic migrations
 │       ├── env.py
@@ -205,12 +221,12 @@ route takes it via `Depends(...)`, never from a client-supplied query param. An 
 `backend/middleware/tenant.py` did this via `BaseHTTPMiddleware` — it was written, never
 registered, and has since been deleted, because middleware can't raise per-route 401s,
 can't participate in dependency injection (so tests can't override it), and is skipped
-for WebSocket scopes, which matters for the Retell custom-LLM socket. See `phase0.md`
+for WebSocket scopes, which matters for the Retell custom-LLM socket. See `phases/completed/phase0.md`
 Task 2 for the full audit that drove this.
 
 `/webhooks/*` are the deliberate exception: Retell/Vapi can't send our JWT, so those
 routes stay unauthenticated by this mechanism. They still lack platform signature
-verification — a known open gap, see `backend/api/webhooks.py` and `phase0.md`.
+verification — a known open gap, see `backend/api/webhooks.py` and `phases/completed/phase0.md`.
 
 ### ADR-002: Voice platform adapter pattern
 `voice_platform.py` defines an abstract `VoicePlatformAdapter` with methods like
@@ -252,7 +268,7 @@ Transcript analysis, sentiment scoring, metric rollups, and CRM sync all happen 
 after the call ends. The webhook handler enqueues tasks and returns 200 immediately.
 This keeps webhook response time under 200ms (voice platforms timeout at 5-10s).
 
-**Retell's webhook contract** (learned the hard way — see phase3.md): exactly three
+**Retell's webhook contract** (learned the hard way — see phases/completed/phase3.md): exactly three
 events, `call_started` / `call_ended` / `call_analyzed`, and the call object is **nested**:
 `{"event": "call_ended", "call": {"call_id": ..., "duration_ms": ..., "transcript": ...}}`.
 There is no `transcript_update` webhook — that's a *websocket* message type from the
@@ -314,7 +330,7 @@ chat-completions protocol, so "which provider" reduces to `api_key` + `base_url`
   deepseek) — `llm_service.provider_for()`. Unresolvable, or resolvable but missing its
   API key, both raise `LLMConfigError` rather than a raw SDK error.
 - Exactly one `AsyncOpenAI` client per provider, cached (`get_client`, `@lru_cache`) — not
-  per call. phase0.md measured ~2.5s of dead air on a cold client (DNS + TLS); constructing
+  per call. phases/completed/phase0.md measured ~2.5s of dead air on a cold client (DNS + TLS); constructing
   one per turn in the WS handler would reintroduce that on every response.
 - `Agent.llm_model` (empty string = "use `settings.default_llm_model`") makes the choice
   per-agent, not global — set via the "Conversation engine" card's model `<select>`
@@ -327,7 +343,7 @@ chat-completions protocol, so "which provider" reduces to `api_key` + `base_url`
 
 ### ADR-009: Streaming custom-LLM responses with barge-in cancellation
 
-phase4.md Session 5. `backend/api/retell_ws.py`'s Custom LLM websocket handler used to
+phases/in-progress/phase4.md Session 5. `backend/api/retell_ws.py`'s Custom LLM websocket handler used to
 be fully blocking: one `llm_service.get_agent_response()` call per turn, then a single
 `content_complete: True` frame — dead air until the whole reply (plus any tool
 round-trips) was ready, and no way to react to a caller talking over the agent, since the
@@ -392,7 +408,7 @@ talked over the agent's own confirmation and the follow-up ("four PM?") read as 
 the ledger note, being pure prohibition with no alternative action, lost to what looked
 like a live request. Cal.com's own conflict check caught that specific repeat, but the
 model then booked a *different* slot instead — two real bookings for one appointment. Full
-writeup: `outliers.md` §1.
+writeup: `phases/in-progress/outliers.md` §1.
 
 Fix: `llm_service._execute_tool_calls` takes an optional `check_duplicate(tool,
 arguments) -> synthetic_result | None` callback, consulted *before* every side-effecting
@@ -405,7 +421,7 @@ carries an explicit instruction ("tell the caller it's already done"), not just 
 negative, because the same real call showed a bare prohibition isn't salient enough at the
 moment the model actually needs to act on it. This is the code-level backstop the prompt
 note was missing: it doesn't depend on the model choosing to comply. It's also the first
-slice of phase4.md Session 8 (server-enforced confirmation gating) — the
+slice of phases/in-progress/phase4.md Session 8 (server-enforced confirmation gating) — the
 `requires_confirmation`-before-first-attempt half of that session is still open.
 
 This still isn't a substitute for real idempotency keys in `integration_service` — the
@@ -416,7 +432,7 @@ if the process restarts between attempts. That remains open.
 cancel/reschedule.** A different real call hit a gap the above fix doesn't cover: the
 caller asked to reschedule a booking, the agent said "let me cancel the nine AM," but no
 cancel/reschedule tool existed at all — the model fabricated an *action taken*, not just
-a fact, leaving a silent real double-booking. Full writeup: `outliers.md` §5.
+a fact, leaving a silent real double-booking. Full writeup: `phases/in-progress/outliers.md` §5.
 
 Fix: two new tools, `cancel_appointment`/`reschedule_appointment`
 (`backend/tools/cancel_appointment.py`, `reschedule_appointment.py`), backed by new
@@ -452,7 +468,7 @@ caller it succeeded anyway. It happened to be true — Cal.com had processed the
 before the client gave up waiting — but only by luck; the same timeout on a genuinely
 failed request would have produced an identical false confirmation, despite the system
 prompt already saying not to claim success without tool confirmation. Full writeup:
-`outliers.md` §6.
+`phases/in-progress/outliers.md` §6.
 
 Fixed in code: `integration_service.IntegrationTimeoutError`, raised when
 `httpx.TimeoutException` interrupts the POST in `book_calendar_slot`/

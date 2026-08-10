@@ -291,6 +291,117 @@ class TestStreamAgentResponse:
         tool_msg = next(m for m in second_call_messages if m.get("role") == "tool")
         assert tool_msg["tool_call_id"] == "tu_1"
 
+    @staticmethod
+    def _tool_call_rounds():
+        """The two streams a one-tool-call turn needs: a round that finishes with
+        tool_calls, then the follow-up round that speaks the answer."""
+        first_round = _FakeStream(
+            [
+                _stream_chunk(
+                    tool_calls=[_tc_delta(0, id="tu_1", name="check_availability", arguments="{}")]
+                ),
+                _stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        second_round = _FakeStream(
+            [
+                _stream_chunk(content="Yes, that slot is free."),
+                _stream_chunk(finish_reason="stop"),
+            ]
+        )
+        return first_round, second_round
+
+    @pytest.mark.asyncio
+    async def test_slow_tool_call_yields_a_filler_before_the_answer(self, mock_client):
+        """phase4.md Session 7: a tool round slower than the threshold must put a spoken
+        filler on the wire so the caller isn't sitting in silence during a Cal.com/HubSpot
+        round-trip. The filler is yielded like any other delta — that's what carries it
+        through retell_ws.py's existing content-frame path."""
+        mock_client.chat.completions.create.side_effect = self._tool_call_rounds()
+
+        async def slow_handler(_input, _ctx):
+            await asyncio.sleep(0.05)
+            return {"available": True}
+
+        with (
+            patch.object(llm_service, "get_tool_handler", return_value=slow_handler),
+            patch.object(llm_service, "TOOL_CALL_FILLER_DELAY_SECONDS", 0.01),
+            patch.object(llm_service, "_pick_filler_phrase", return_value="One moment..."),
+        ):
+            chunks = await _collect(
+                llm_service.stream_agent_response(
+                    system_prompt="You are helpful.",
+                    conversation_history=[{"role": "user", "content": "is 4pm free?"}],
+                    caller_context={},
+                )
+            )
+
+        # Filler first, real answer after — order matters, it's what the caller hears.
+        assert chunks == ["One moment...", "Yes, that slot is free."]
+
+    @pytest.mark.asyncio
+    async def test_fast_tool_call_yields_no_filler(self, mock_client):
+        """A tool call that resolves inside the threshold must stay silent — a quick
+        answer should feel immediate, not be padded with an unnecessary phrase."""
+        mock_client.chat.completions.create.side_effect = self._tool_call_rounds()
+
+        handler = AsyncMock(return_value={"available": True})
+        with (
+            patch.object(llm_service, "get_tool_handler", return_value=handler),
+            patch.object(llm_service, "TOOL_CALL_FILLER_DELAY_SECONDS", 5.0),
+            patch.object(llm_service, "_pick_filler_phrase", return_value="One moment..."),
+        ):
+            chunks = await _collect(
+                llm_service.stream_agent_response(
+                    system_prompt="You are helpful.",
+                    conversation_history=[{"role": "user", "content": "is 4pm free?"}],
+                    caller_context={},
+                )
+            )
+
+        assert chunks == ["Yes, that slot is free."]
+
+    @pytest.mark.asyncio
+    async def test_filler_wait_still_shields_the_tool_call_from_barge_in(self, mock_client):
+        """ADR-009: the filler race must not weaken the barge-in shield. Cancelling the
+        generation while it's parked in the filler wait has to stop the speech but let
+        the in-flight tool call run to completion."""
+        mock_client.chat.completions.create.side_effect = self._tool_call_rounds()
+        completed = {"flag": False}
+        pending: set = set()
+
+        def spawn_tracked(coro):
+            task = asyncio.create_task(coro)
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+            return task
+
+        async def slow_handler(_input, _ctx):
+            await asyncio.sleep(0.05)
+            completed["flag"] = True
+            return {"available": True}
+
+        with (
+            patch.object(llm_service, "get_tool_handler", return_value=slow_handler),
+            patch.object(llm_service, "TOOL_CALL_FILLER_DELAY_SECONDS", 0.01),
+        ):
+            stream = llm_service.stream_agent_response(
+                system_prompt="You are helpful.",
+                conversation_history=[{"role": "user", "content": "is 4pm free?"}],
+                caller_context={},
+                spawn_tracked=spawn_tracked,
+            )
+            consumer = asyncio.create_task(_collect(stream))
+            await asyncio.sleep(0.02)  # let the tool dispatch and the filler wait elapse
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+
+            assert pending  # the shielded tool task outlived the cancelled generation
+            await asyncio.gather(*pending)
+
+        assert completed["flag"] is True
+
     @pytest.mark.asyncio
     async def test_empty_completion_yields_fallback(self, mock_client):
         mock_client.chat.completions.create.return_value = _FakeStream(

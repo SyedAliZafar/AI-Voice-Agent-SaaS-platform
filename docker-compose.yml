@@ -41,6 +41,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://voiceagent:voiceagent@postgres:5432/voiceagent
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
+      # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
+      # tunnel's metrics server. config.py's default targets localhost instead, for
+      # host-run tooling.
+      CLOUDFLARED_METRICS_URL: http://tunnel-quick:20241
     ports:
       - "8000:8000"
     depends_on:
@@ -114,7 +118,25 @@ services:
     # got: 416 kiB)" — Docker Desktop on Windows can't give QUIC the UDP buffers it wants,
     # and restrictive networks frequently drop or throttle UDP outright. HTTP/2 is slightly
     # slower in theory but actually stays connected, which matters rather more.
-    command: tunnel --no-autoupdate --protocol http2 --url http://api:8000
+    # --metrics exposes cloudflared's own HTTP server on :20241, which serves
+    # /quicktunnel — the assigned https://<random>.trycloudflare.com hostname. That's
+    # what lets PUBLIC_BASE_URL=auto discover the current URL instead of a human
+    # copy-pasting it out of the logs after every restart (see backend/services/
+    # public_url.py). The named `tunnel` service above already runs with --metrics for
+    # its healthcheck; this mirrors it.
+    command: >
+      tunnel --no-autoupdate --protocol http2 --metrics 0.0.0.0:20241
+      --url http://api:8000
+    # A quick tunnel that dies stays dead otherwise — that's how PUBLIC_BASE_URL went
+    # stale on 2026-08-08 (container Exited 255, nothing restarted it) and cost a test
+    # call on 2026-08-10. Restarting mints a NEW hostname, which is exactly why the
+    # auto-discovery above is the other half of this fix.
+    restart: unless-stopped
+    # Published so host-run tooling (scripts/check_custom_llm.py, which executes via
+    # `uv run` outside the compose network and therefore can't resolve the service
+    # name) can read /quicktunnel too. Containers reach it as tunnel-quick:20241.
+    ports:
+      - "20241:20241"
     depends_on:
       - api
 
@@ -127,6 +149,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://voiceagent:voiceagent@postgres:5432/voiceagent
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
+      # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
+      # tunnel's metrics server. config.py's default targets localhost instead, for
+      # host-run tooling.
+      CLOUDFLARED_METRICS_URL: http://tunnel-quick:20241
     depends_on:
       postgres:
         condition: service_healthy

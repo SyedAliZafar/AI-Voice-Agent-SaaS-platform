@@ -854,6 +854,34 @@ class TestFindDuplicateLedgerEntry:
         )
         assert entry is None
 
+    def test_book_discovery_call_matches_on_phone_and_preferred_time(self):
+        """Same class of bug outliers.md §1 documented and fixed for book_appointment —
+        book_discovery_call is a real (if lightweight) side-effecting booking capture,
+        not a read, so a repeat request for the same caller/slot must be caught too."""
+        completed = [
+            {
+                "tool": "book_discovery_call",
+                "args": {"phone": "+15551234567", "preferred_time": "tomorrow at 2pm"},
+                "result_id": "",
+            }
+        ]
+        entry = _find_duplicate_ledger_entry(
+            "book_discovery_call",
+            {"name": "Ali", "phone": "+15551234567", "preferred_time": "tomorrow at 2pm"},
+            completed,
+        )
+        assert entry is not None
+
+        # Different preferred_time — same caller, genuinely a different request.
+        assert (
+            _find_duplicate_ledger_entry(
+                "book_discovery_call",
+                {"name": "Ali", "phone": "+15551234567", "preferred_time": "Friday morning"},
+                completed,
+            )
+            is None
+        )
+
 
 class TestLedgerEntry:
     def test_book_appointment_captures_booking_uid_as_an_extra(self):
