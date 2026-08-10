@@ -1,0 +1,12 @@
+# This file's line endings are load-bearing, not cosmetic.
+#
+# scripts/seed_hvac_solar_outbound_agent.py reads the knowledge base verbatim into
+# Agent.system_prompt (no summarizing, no reformatting), and the check that the seeded
+# prompt is correct is a byte-for-byte comparison against this file — see phases/
+# in-progress/outliers.md and the seed script's own docstring. A checkout that rewrote
+# LF to CRLF would change every line of the stored prompt relative to the file, breaking
+# that comparison and silently altering what the live agent is actually prompted with.
+#
+# core.autocrlf=true is the Windows default and would do exactly that, so pin this file
+# to LF explicitly regardless of any per-machine or global setting.
+frontend/dashboardDesiging/hvac-solar-outbound-knowledge-v1.md text eol=lf
