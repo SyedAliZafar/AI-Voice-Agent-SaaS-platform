@@ -7,7 +7,7 @@ go through prospect_service.get_prospect() (tenant-scoped), never get_prospect_u
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_tenant
@@ -15,6 +15,7 @@ from backend.database import get_db
 from backend.schemas.agent import TestCallResponse
 from backend.schemas.prospect import (
     CompanyResearch,
+    CsvImportResult,
     DiscoverRequest,
     ProspectCallRequest,
     ProspectResponse,
@@ -42,6 +43,33 @@ async def discover(
         str(tenant_id), payload.query, payload.location, payload.radius_m, payload.limit
     )
     return {"status": "queued"}
+
+
+@router.post("/import-csv", response_model=CsvImportResult)
+async def import_csv(
+    file: UploadFile = File(...),
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-create prospects from an operator's list.
+
+    Columns: business_name, phone (required); city, source, niche (optional). Bad rows
+    are skipped and counted rather than failing the upload — see CsvImportResult.
+
+    Declared above /{prospect_id} so the literal path wins the route match.
+    """
+    raw = await file.read()
+    try:
+        # utf-8-sig: Excel's "Save as CSV UTF-8" writes a BOM, which would otherwise
+        # end up glued to the first header name and break the required-column check.
+        content = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="File must be UTF-8 encoded text") from exc
+
+    try:
+        return await prospect_service.import_from_csv(db, tenant_id, content)
+    except prospect_service.CsvImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("", response_model=list[ProspectResponse])

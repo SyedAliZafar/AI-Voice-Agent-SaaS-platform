@@ -61,6 +61,17 @@ class ProspectUpdate(BaseModel):
     # not_called | called | booked | flagged | no_answer | do_not_call
 
 
+class CsvImportResult(BaseModel):
+    """Outcome of one CSV upload. Deliberately a report, not an exception: a file with
+    some bad rows still imports the good ones, and the operator sees why the rest fell out.
+    """
+
+    imported: int = 0
+    skipped_duplicates: int = 0  # phone already on a prospect for this tenant, or repeated in-file
+    skipped_invalid: int = 0  # unusable phone or missing business_name
+    errors: list[str] = Field(default_factory=list)  # per-row reasons, truncated
+
+
 class ProspectCallRequest(BaseModel):
     agent_id: uuid.UUID
     to_number: str | None = None  # defaults to the prospect's stored phone if omitted

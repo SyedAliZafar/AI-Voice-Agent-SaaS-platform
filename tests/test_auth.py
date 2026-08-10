@@ -35,6 +35,7 @@ PROTECTED_ROUTES = [
     ("get", "/api/analytics/top-intents"),
     ("get", "/api/prospects"),
     ("post", "/api/prospects/discover"),
+    ("post", "/api/prospects/import-csv"),
     ("get", f"/api/prospects/{uuid.uuid4()}"),
     ("patch", f"/api/prospects/{uuid.uuid4()}"),
     ("post", f"/api/prospects/{uuid.uuid4()}/research"),

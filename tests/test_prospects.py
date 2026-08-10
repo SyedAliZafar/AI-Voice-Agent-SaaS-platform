@@ -19,6 +19,13 @@ async def _make_prospect(db_session, tenant_id, name="Acme HVAC", place_id="p_ap
     return prospect
 
 
+CSV_HEADER = "business_name,phone,city,source,niche\n"
+
+
+def _upload(content: str) -> dict:
+    return {"file": ("prospects.csv", content.encode("utf-8"), "text/csv")}
+
+
 @pytest.mark.asyncio
 async def test_new_prospect_defaults_to_not_called(db_session, tenant_id):
     prospect = await _make_prospect(db_session, tenant_id)
@@ -109,3 +116,145 @@ async def test_set_status_rejects_other_tenant(db_session, tenant_id, other_tena
     assert result is None
     unchanged = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert unchanged.status == "not_called"
+
+
+# --- CSV import ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("+491701234567", "+491701234567"),
+        ("+49 (170) 123-4567", "+491701234567"),
+        ("020 7946 0958", "02079460958"),
+        ("555-1234", "5551234"),  # 7 digits is the floor, so this squeaks through
+        ("555-123", None),  # one short
+        ("not a phone", None),
+        ("", None),
+        (None, None),
+        ("+4917012345678901234", None),  # past E.164's 15-digit ceiling
+    ],
+)
+def test_normalize_phone(raw, expected):
+    assert prospect_service.normalize_phone(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_import_csv_creates_prospects(client, db_session, tenant_id, auth_headers):
+    content = CSV_HEADER + (
+        "Acme HVAC,+491701234567,Berlin,cold-list,hvac\n"
+        "Sunbeam Solar,+491709876543,Munich,cold-list,solar\n"
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "imported": 2,
+        "skipped_duplicates": 0,
+        "skipped_invalid": 0,
+        "errors": [],
+    }
+
+    rows = await prospect_service.list_prospects(db_session, tenant_id)
+    by_name = {p.name: p for p in rows}
+    assert by_name["Acme HVAC"].phone == "+491701234567"
+    assert by_name["Acme HVAC"].address == "Berlin"  # city -> address
+    assert by_name["Acme HVAC"].category == "hvac"  # niche -> category
+    assert by_name["Acme HVAC"].source_query == "cold-list"  # source -> source_query
+    assert by_name["Acme HVAC"].status == "not_called"
+
+
+@pytest.mark.asyncio
+async def test_import_csv_skips_duplicate_phones(client, db_session, tenant_id, auth_headers):
+    """Duplicates within the file and against rows already stored both count as skips,
+    and formatting differences must not defeat the check.
+    """
+    first = CSV_HEADER + "Acme HVAC,+491701234567,Berlin,cold-list,hvac\n"
+    await client.post("/api/prospects/import-csv", files=_upload(first), headers=auth_headers)
+
+    second = CSV_HEADER + (
+        "Acme HVAC Again,+49 (170) 123-4567,Berlin,cold-list,hvac\n"  # already stored
+        "New Co,+491700000001,Berlin,cold-list,hvac\n"
+        "New Co Dupe,+49 170 000 0001,Berlin,cold-list,hvac\n"  # repeat within this file
+    )
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(second), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 1
+    assert body["skipped_duplicates"] == 2
+
+    rows = await prospect_service.list_prospects(db_session, tenant_id)
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_import_csv_reports_invalid_rows_without_failing(client, tenant_id, auth_headers):
+    content = CSV_HEADER + (
+        "Good Co,+491701234567,Berlin,cold-list,hvac\n"
+        "Bad Phone Co,banana,Berlin,cold-list,hvac\n"
+        ",+491700000009,Berlin,cold-list,hvac\n"  # no business_name
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 1
+    assert body["skipped_invalid"] == 2
+    assert any("banana" in e for e in body["errors"])
+    assert any("business_name" in e for e in body["errors"])
+
+
+@pytest.mark.asyncio
+async def test_import_csv_rejects_missing_required_columns(client, auth_headers):
+    resp = await client.post(
+        "/api/prospects/import-csv",
+        files=_upload("company,telephone\nAcme,+491701234567\n"),
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+    assert "business_name" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_import_csv_tolerates_excel_bom(client, auth_headers):
+    """Excel's "CSV UTF-8" export prepends a BOM, which would otherwise glue itself to
+    the first header name and fail the required-column check.
+    """
+    content = "﻿" + CSV_HEADER + "Acme HVAC,+491701234567,Berlin,cold-list,hvac\n"
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 1
+
+
+@pytest.mark.asyncio
+async def test_import_csv_is_tenant_scoped(
+    client, db_session, tenant_id, other_tenant_id, auth_headers, other_auth_headers
+):
+    """The same phone in two tenants is not a duplicate — dedupe must not leak across
+    the tenant boundary (ADR-001).
+    """
+    content = CSV_HEADER + "Acme HVAC,+491701234567,Berlin,cold-list,hvac\n"
+
+    await client.post("/api/prospects/import-csv", files=_upload(content), headers=auth_headers)
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=other_auth_headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 1
+    assert len(await prospect_service.list_prospects(db_session, tenant_id)) == 1
+    assert len(await prospect_service.list_prospects(db_session, other_tenant_id)) == 1

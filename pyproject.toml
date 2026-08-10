@@ -54,6 +54,7 @@ extend-immutable-calls = [
     "fastapi.Body",
     "fastapi.Header",
     "fastapi.Security",
+    "fastapi.File",
 ]
 
 [tool.pytest.ini_options]

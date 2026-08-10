@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshIcon, SearchIcon, TargetIcon } from "@/components/icons";
 import { Badge, Button, Card, EmptyState, Field, PageHeader, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
-import { Agent, OutreachStatus, Prospect, ResearchStatus } from "@/lib/types";
+import { Agent, CsvImportResult, OutreachStatus, Prospect, ResearchStatus } from "@/lib/types";
 
 const RESEARCH_META: Record<ResearchStatus, { label: string; tone: "neutral" | "info" | "success" | "danger" }> = {
   pending: { label: "Queued", tone: "neutral" },
@@ -36,7 +36,11 @@ export default function ProspectsPage() {
   const [callingId, setCallingId] = useState<string | null>(null);
   const [callFeedback, setCallFeedback] = useState<Record<string, string>>({});
 
+  const [importing, setImporting] = useState(false);
+  const [importSummary, setImportSummary] = useState("");
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
 
   const fetchProspects = useCallback(async () => {
     const res = await api.get<Prospect[]>("/prospects");
@@ -92,6 +96,28 @@ export default function ProspectsPage() {
       setTimeout(() => fetchProspects().catch(() => {}), 1500);
     } finally {
       setDiscovering(false);
+    }
+  }
+
+  async function importCsv(file: File) {
+    setImporting(true);
+    setImportSummary("");
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const res = await api.post<CsvImportResult>("/prospects/import-csv", form);
+      const { imported, skipped_duplicates, skipped_invalid, errors } = res.data;
+      setImportSummary(
+        `Imported ${imported} · ${skipped_duplicates} duplicate${skipped_duplicates === 1 ? "" : "s"} skipped · ` +
+          `${skipped_invalid} invalid skipped${errors.length ? ` — ${errors.join("; ")}` : ""}`,
+      );
+      fetchProspects().catch(() => {});
+    } catch (err) {
+      setImportSummary(getApiErrorMessage(err, "Import failed."));
+    } finally {
+      setImporting(false);
+      // Clear the input so re-picking the same file fires onChange again.
+      if (fileRef.current) fileRef.current.value = "";
     }
   }
 
@@ -171,6 +197,32 @@ export default function ProspectsPage() {
           Discovery and research run automatically in the background — this page updates as
           companies are found and their knowledge base is built.
         </p>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv,text/csv"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) importCsv(file);
+            }}
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => fileRef.current?.click()}
+            disabled={importing}
+          >
+            {importing ? "Importing…" : "Import CSV"}
+          </Button>
+          <span className="text-xs text-slate-400">
+            Columns: business_name, phone (required) · city, source, niche (optional)
+          </span>
+        </div>
+
+        {importSummary && <p className="mt-2 text-xs text-slate-600">{importSummary}</p>}
       </Card>
 
       {loading ? (

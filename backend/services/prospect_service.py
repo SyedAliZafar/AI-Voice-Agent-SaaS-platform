@@ -5,7 +5,10 @@ lands here via mark_research_*(); the operator lands here via list_prospects()
 and set_outreach_status().
 """
 
+import csv
+import io
 import math
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -14,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
 from backend.models.prospect import Prospect
-from backend.schemas.prospect import CompanyResearch
+from backend.schemas.prospect import CompanyResearch, CsvImportResult
 
 settings = get_settings()
 
@@ -88,6 +91,109 @@ async def upsert_from_places(
     await db.commit()
     for prospect in result:
         await db.refresh(prospect)
+    return result
+
+
+class CsvImportError(Exception):
+    """The file itself is unusable (wrong headers, too many rows) — as opposed to
+    individual rows being bad, which CsvImportResult reports without failing.
+    """
+
+
+CSV_REQUIRED_COLUMNS = ("business_name", "phone")
+CSV_OPTIONAL_COLUMNS = ("city", "source", "niche")
+CSV_MAX_ROWS = 5_000  # arbitrary sanity bound — an operator list, not a bulk data pipe
+CSV_MAX_REPORTED_ERRORS = 20  # keep the response readable; counts stay exact
+
+# Deliberately loose: strip formatting, then require an optional "+" and 7-15 digits
+# (E.164's own bound). This is a first-pass sanity check to keep obvious junk out of the
+# dialer, NOT real number validation — that needs a library with country metadata
+# (phonenumbers) and a decision about default region, neither of which exists here yet.
+_PHONE_STRIP_RE = re.compile(r"[\s\-().]")
+_PHONE_RE = re.compile(r"^\+?\d{7,15}$")
+
+
+def _cell(row: dict[str, str | None], name: str) -> str:
+    return (row.get(name) or "").strip()
+
+
+def normalize_phone(raw: str | None) -> str | None:
+    """Formatting-insensitive form used both to validate and to dedupe. None if unusable."""
+    if not raw:
+        return None
+    candidate = _PHONE_STRIP_RE.sub("", raw.strip())
+    return candidate if _PHONE_RE.match(candidate) else None
+
+
+async def import_from_csv(
+    db: AsyncSession, tenant_id: uuid.UUID, content: str, source_query: str = "csv-import"
+) -> CsvImportResult:
+    """Create prospects from an operator-supplied CSV.
+
+    Columns: business_name, phone (required); city, source, niche (optional). Rows with
+    an unusable phone or no business_name are skipped and counted, not fatal.
+
+    Dedupe is by normalized phone, within the tenant — both against rows already in the
+    DB and against earlier rows in the same file, so re-uploading a list is a no-op
+    rather than a duplicate set.
+    """
+    reader = csv.DictReader(io.StringIO(content))
+    headers = {(h or "").strip().lower() for h in (reader.fieldnames or [])}
+    missing = [c for c in CSV_REQUIRED_COLUMNS if c not in headers]
+    if missing:
+        raise CsvImportError(f"CSV is missing required column(s): {', '.join(missing)}")
+
+    # One pass to build the dedupe set: stored phones keep their original formatting
+    # (Places writes them verbatim), so they have to be normalized here to compare.
+    existing = await db.execute(
+        select(Prospect.phone).where(Prospect.tenant_id == tenant_id, Prospect.phone.isnot(None))
+    )
+    seen_phones = {p for p in (normalize_phone(row) for row in existing.scalars()) if p}
+
+    result = CsvImportResult()
+
+    def note(row_num: int, reason: str) -> None:
+        if len(result.errors) < CSV_MAX_REPORTED_ERRORS:
+            result.errors.append(f"row {row_num}: {reason}")
+
+    for row_num, row in enumerate(reader, start=2):  # row 1 is the header
+        if row_num - 1 > CSV_MAX_ROWS:
+            raise CsvImportError(f"CSV exceeds the {CSV_MAX_ROWS}-row limit")
+
+        name = _cell(row, "business_name")
+        phone = normalize_phone(_cell(row, "phone"))
+
+        if not name:
+            result.skipped_invalid += 1
+            note(row_num, "missing business_name")
+            continue
+        if not phone:
+            result.skipped_invalid += 1
+            note(row_num, f"unusable phone {_cell(row, 'phone')!r}")
+            continue
+        if phone in seen_phones:
+            result.skipped_duplicates += 1
+            continue
+
+        seen_phones.add(phone)
+        db.add(
+            Prospect(
+                tenant_id=tenant_id,
+                # Not from Places, but the column is NOT NULL and (tenant, place_id) is
+                # the identity key the rest of the pipeline upserts on — keying it to the
+                # phone keeps that key meaningful for CSV rows too.
+                google_place_id=f"csv:{phone}",
+                name=name,
+                phone=phone,
+                address=_cell(row, "city") or None,
+                category=_cell(row, "niche") or None,
+                source_query=_cell(row, "source") or source_query,
+                priority_score=compute_priority(None, 0, None, phone),
+            )
+        )
+        result.imported += 1
+
+    await db.commit()
     return result
 
 

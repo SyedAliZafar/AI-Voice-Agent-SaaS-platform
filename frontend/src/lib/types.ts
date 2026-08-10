@@ -97,6 +97,13 @@ export type ProspectStatus =
   | "no_answer"
   | "do_not_call";
 
+export interface CsvImportResult {
+  imported: number;
+  skipped_duplicates: number;
+  skipped_invalid: number;
+  errors: string[];
+}
+
 export interface Prospect {
   id: string;
   google_place_id: string;
