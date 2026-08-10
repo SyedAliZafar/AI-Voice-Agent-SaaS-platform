@@ -376,9 +376,7 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_place_test_call_custom_llm_fails_fast_when_tunnel_unreachable(
-    db_session, tenant_id
-):
+async def test_place_test_call_custom_llm_fails_fast_when_tunnel_unreachable(db_session, tenant_id):
     """A quick tunnel's hostname can stop resolving, or the tunnel can die while
     `docker compose ps` still reports it as Up (see RUN.md/CONTEXT.md ADR-007) — Retell
     would then dial a websocket it can't reach and the caller gets dead air. This must be
@@ -397,7 +395,9 @@ async def test_place_test_call_custom_llm_fails_fast_when_tunnel_unreachable(
         patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
         patch(
             "backend.services.tunnel_check.check_public_url_reachable",
-            new=AsyncMock(return_value="cannot connect to https://dead-tunnel.trycloudflare.com/health"),
+            new=AsyncMock(
+                return_value="cannot connect to https://dead-tunnel.trycloudflare.com/health"
+            ),
         ),
     ):
         mock_settings.retell_from_number = "+15551234567"

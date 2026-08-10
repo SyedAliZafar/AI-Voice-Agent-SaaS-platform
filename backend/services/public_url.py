@@ -90,9 +90,7 @@ async def _discover_quick_tunnel_url(timeout: float = DEFAULT_TIMEOUT) -> str:
     return f"https://{hostname}"
 
 
-async def get_public_base_url(
-    configured: str | None = None, *, force_refresh: bool = False
-) -> str:
+async def get_public_base_url(configured: str | None = None, *, force_refresh: bool = False) -> str:
     """The current public base URL, with no trailing slash.
 
     An explicit PUBLIC_BASE_URL is returned untouched. Under `auto`, the live quick
