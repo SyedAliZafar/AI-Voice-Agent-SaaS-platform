@@ -8,9 +8,12 @@ unit level, but put this in outliers.md" — 2026-08-05) to stop chasing a real-
 in favor of the existing unit tests. §1 and §3 are findings logged on the assistant's own
 initiative during that same testing — the user has not yet said whether/when to fix them.
 Don't describe §1 or §3 as "deferred by the user" — they're unresolved, full stop.
-§7 is a third category again: found on a real call and **explicitly directed by the user
-to be documented rather than fixed in that session** (2026-08-10) — deferred by decision,
-not by oversight, and not yet scheduled.
+§7 and §8 are a third category again: **explicitly directed by the user to be documented
+rather than fixed in that session** (2026-08-10) — deferred by decision, not by oversight,
+and not yet scheduled. Note §7 and §8 differ in provenance and that difference matters:
+§7 was *observed happening* on a real call, §8 is a *latent* defect found by code
+inspection while investigating that same call and has not been seen to fire in the wild.
+Don't promote §8 to "observed" without a real repro.
 
 ---
 
@@ -541,3 +544,110 @@ that has nothing behind it.
 a turn containing a failed side-effecting tool produces agent speech that makes no
 promise tied to that failure — checked against the `CallEvent` trail and the transcript
 together, not the transcript alone.
+
+---
+
+## 8. The 40-char ledger truncation can collide two genuinely different tool calls into a false duplicate [LATENT — NOT OBSERVED, NOT FIXED; needs review before any change, 2026-08-10]
+
+**Status:** not fixed, and **do not fix without review** — the shared blast radius is the
+whole point of this entry (see "Why this needs a decision, not a patch" below). Found by
+code inspection on 2026-08-10 while investigating an unrelated question about call
+`953ad0b7-7932-41c8-a77e-a0c2a5315c96` (why a `book_discovery_call` dispatched with
+partial arguments — that turned out to be benign, an interim-transcript artifact, not a
+race). **This defect has not been observed firing on a real call.** It is a latent
+inversion of §1's failure mode and is recorded before it bites, not after.
+
+**What's wrong.** `_ledger_args_key` (`backend/api/retell_ws.py`) truncates every
+identifying argument to `_LEDGER_MAX_ARG_LEN = 40` characters:
+
+```python
+return {k: str(arguments.get(k, ""))[:_LEDGER_MAX_ARG_LEN] for k in arg_keys}
+```
+
+That truncated dict is the *entire* identity of a tool call for duplicate-matching
+purposes — `_find_duplicate_ledger_entry` compares `entry["args"] == args` on exactly
+these truncated values, by deliberate design (both sides share the function so
+normalization can't drift). Consequence: **two tool calls whose identifying arguments
+differ only after character 40 are indistinguishable, and the second is silently treated
+as a repeat of the first.**
+
+**Why this is the §1 bug inverted, and worse in one respect.** §1 was "the model did
+something twice that should have happened once," caught by Cal.com's own conflict check.
+This is "the model asked for something genuinely new and we refused to do it, then told
+the caller it was already handled" — because a match feeds `_duplicate_tool_result`,
+whose `instruction` field explicitly tells the model to *"tell the caller it's already
+done, and confirm the details back to them."* So the caller hears their **old** request
+confirmed back at them, having just asked to change it. There is no external backstop
+for this the way Cal.com's conflict check backstopped §1 — the real handler is never
+reached, so no downstream system ever sees the second request to reject or accept it.
+
+**Exposure per tool, measured, not assumed.** `_LEDGER_ARG_KEYS` currently tracks six
+tools. Not all are equally exposed — the risk is entirely a function of whether an
+identifying argument is free text:
+
+| tool | identifying args | realistic length | exposed? |
+|---|---|---|---|
+| `send_sms` | `to_number`, `message` | `message` observed at **104 chars** on the call above | **Yes — highest.** `to_number` is constant per call, so `message` alone carries the distinction, and it is model-authored prose that essentially always exceeds 40. |
+| `book_discovery_call` | `phone`, `preferred_time` | `preferred_time` observed at **56 chars** | **Yes.** `phone` is constant per call; `preferred_time` is free text. |
+| `create_lead` | `email` | usually < 40 | Marginal — only a long address collides, and then only against another sharing a 40-char prefix. |
+| `book_appointment` | `start_time`, `attendee_email` | `start_time` 19 (ISO) | Low — `start_time` is short and fully discriminating. |
+| `cancel_appointment` | `booking_uid` | 22 (observed) | No — uids are well under the cap. |
+| `reschedule_appointment` | `booking_uid` | 22 (observed) | No — same. |
+
+Demonstrated collision for `book_discovery_call`, using the exact phrasing pattern the
+real call produced:
+
+```
+"Next week, Tuesday or Wednesday, between 12:00 and 15:00"  -> "Next week, Tuesday or Wednesday, between"
+"Next week, Tuesday or Wednesday, between 15:00 and 18:00"  -> "Next week, Tuesday or Wednesday, between"
+                                                                          identical -> false duplicate
+```
+
+A caller who says "actually, make that the afternoon instead" inside the same phrasing
+pattern gets their change silently dropped and the original time confirmed back to them.
+
+**Important mitigating fact — the two most-exposed tools cannot fire this today.** Ledger
+entries are only appended on `phase == "result"`:
+
+```python
+elif phase == "result":
+    ...
+    entry = _ledger_entry(tool, parsed_args, result)
+    if entry:
+        completed_tool_calls.append(entry)
+```
+
+Errors never reach the ledger. Both `send_sms` (no Twilio integration — phase4.md Session
+11) and `create_lead` (`crm_api_key` not configured — see §7) currently *always* error, so
+neither ever creates a ledger entry, so neither can currently produce a false duplicate.
+**This is a timing accident, not a safeguard**: the day Session 11 wires Twilio,
+`send_sms` becomes the single most exposed tool in the table above, with no code change to
+the ledger at all. `book_discovery_call` succeeds today and is exposed today.
+
+**Why this needs a decision, not a patch.** Every plausible fix has reach beyond the one
+tool that prompted it:
+
+- **Raise or remove `_LEDGER_MAX_ARG_LEN`** — simplest, but the cap exists for a real
+  reason: ADR-009 §4c sized the ledger note to a bounded ~400-token worst case, because
+  it is injected into `conversation_history` on *every single turn*. Uncapping a
+  104-char `send_sms` body across `_LEDGER_MAX_ENTRIES = 10` entries changes that budget
+  materially, on the latency-critical path.
+- **Exempt free-text args from truncation only for matching, keeping display truncated** —
+  splits `_ledger_args_key`'s currently-shared responsibility into two, which is exactly
+  the drift between storage and matching its docstring warns must never happen.
+- **Hash the full value and key on the hash** — fixes matching cleanly and stays bounded,
+  but makes the ledger note unreadable to the model, which currently reads real argument
+  values back out of it (§5's `booking_uid` flow depends on this).
+- **Change per-tool key sets** (e.g. add `name` to `book_discovery_call`) — narrowest, but
+  leaves `send_sms` unfixed and is the option most likely to be mistaken for a general fix.
+
+Recommendation if/when this is picked up: treat it as a change to the ledger's identity
+model across all six tools, with `send_sms` as the design target rather than
+`book_discovery_call`, and pair it with the pre-existing note in §1 that idempotency keys
+in `integration_service` remain the real fix for the whole category.
+
+**Verification once fixed** must cover the *negative* case specifically, since that's the
+one that would regress §1: confirm a genuine change-of-request within one call still
+dispatches (no false duplicate), **and** that an actual verbatim repeat still produces
+`skipped_duplicate`. Unit-level is a reasonable bar here given §2's and §6's precedent,
+but the false-duplicate direction has never been exercised at all.
