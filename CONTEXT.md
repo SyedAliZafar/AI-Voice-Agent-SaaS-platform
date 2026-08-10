@@ -80,7 +80,7 @@ voiceagent/
 │   │   ├── agents.py             # CRUD for agents + prompt config
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
-│   │   ├── prospects.py          # Prospecting pipeline: discover/list/research/outreach status
+│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
 │   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
 │   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phases/completed/phase0.md)
@@ -197,6 +197,7 @@ voiceagent/
     ├── test_webhooks.py
     ├── test_llm_service.py
     ├── test_sandbox_service.py
+    ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import
     ├── test_prospect_service.py
     ├── test_research_service.py
     ├── test_script_service.py
@@ -536,9 +537,17 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
 4. **Script generation** (`script_service.py`): turns a prospect + its research into a
    call script.
 5. **Operator surface**: `backend/api/prospects.py` exposes discover/list/research/
-   outreach-status; `frontend/src/app/prospects/page.tsx` is the UI. The operator's only
-   job in this pipeline is deciding who to call and when — discovery and research run
-   unattended.
+   outreach-status, plus `POST /import-csv` (bulk-create from an operator's own list —
+   business_name/phone required, city/source/niche optional, deduped by normalized phone
+   within the tenant) and `GET /stats` (per-status counts, aggregated in SQL so they
+   survive the 100-row page limit). `frontend/src/app/prospects/page.tsx` is the UI. The
+   operator's only job in this pipeline is deciding who to call and when — discovery and
+   research run unattended.
+
+   CSV-imported prospects land with `research_status="pending"` and nothing chained to
+   advance them, so they never reach `ready` — which is what the UI's "Call" button
+   gates on. Calling an imported prospect from the dashboard therefore doesn't work yet;
+   wiring import into `research_prospect` (or relaxing the gate) is an open follow-up.
 
 **Two overlapping outreach axes — a deliberate deferral, not an oversight.**
 `Prospect` now also carries `status` (`not_called | called | booked | flagged |
