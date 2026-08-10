@@ -5,7 +5,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshIcon, SearchIcon, TargetIcon } from "@/components/icons";
 import { Badge, Button, Card, EmptyState, Field, PageHeader, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
-import { Agent, CsvImportResult, OutreachStatus, Prospect, ResearchStatus } from "@/lib/types";
+import {
+  Agent,
+  CsvImportResult,
+  OutreachStatus,
+  Prospect,
+  ProspectStatus,
+  ResearchStatus,
+} from "@/lib/types";
 
 const RESEARCH_META: Record<ResearchStatus, { label: string; tone: "neutral" | "info" | "success" | "danger" }> = {
   pending: { label: "Queued", tone: "neutral" },
@@ -20,6 +27,26 @@ const OUTREACH_META: Record<OutreachStatus, { label: string; tone: "neutral" | "
   callback: { label: "Callback", tone: "warning" },
   do_not_call: { label: "Do not call", tone: "danger" },
 };
+
+// The campaign-outcome axis the operator sets by hand. Separate from OUTREACH_META
+// above and not synced with it — see backend/models/prospect.py.
+const STATUS_LABELS: Record<ProspectStatus, string> = {
+  not_called: "Not called",
+  called: "Called",
+  booked: "Booked",
+  flagged: "Flagged",
+  no_answer: "No answer",
+  do_not_call: "Do not call",
+};
+
+const STATUS_ORDER: ProspectStatus[] = [
+  "not_called",
+  "called",
+  "booked",
+  "flagged",
+  "no_answer",
+  "do_not_call",
+];
 
 export default function ProspectsPage() {
   const [prospects, setProspects] = useState<Prospect[]>([]);
@@ -129,6 +156,17 @@ export default function ProspectsPage() {
   async function setOutreach(id: string, outreach_status: OutreachStatus) {
     await api.patch(`/prospects/${id}`, { outreach_status });
     fetchProspects().catch(() => {});
+  }
+
+  async function setStatus(id: string, status: ProspectStatus) {
+    // Optimistic: the dropdown is the operator's own input, so reflect it immediately
+    // and let the refetch reconcile (or revert) it.
+    setProspects((prev) => prev.map((p) => (p.id === id ? { ...p, status } : p)));
+    try {
+      await api.patch(`/prospects/${id}`, { status });
+    } finally {
+      fetchProspects().catch(() => {});
+    }
   }
 
   function openCallPanel(prospect: Prospect) {
@@ -264,6 +302,19 @@ export default function ProspectsPage() {
                   <div className="flex items-center gap-2">
                     <Badge tone={research.tone}>{research.label}</Badge>
                     <Badge tone={outreach.tone}>{outreach.label}</Badge>
+
+                    <select
+                      aria-label={`Status for ${prospect.name}`}
+                      value={prospect.status}
+                      onChange={(e) => setStatus(prospect.id, e.target.value as ProspectStatus)}
+                      className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-700 focus:border-brand-300 focus:outline-none"
+                    >
+                      {STATUS_ORDER.map((s) => (
+                        <option key={s} value={s}>
+                          {STATUS_LABELS[s]}
+                        </option>
+                      ))}
+                    </select>
 
                     {prospect.research_status === "failed" && (
                       <Button
