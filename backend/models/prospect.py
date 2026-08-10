@@ -1,8 +1,17 @@
-"""Prospect model — companies discovered via Google Places, ranked for outreach.
+"""Prospect model — companies discovered via Google Places (or CSV import), ranked
+for outreach.
 
-Two independent status axes:
+Three independent status axes:
   research_status: pending -> running -> ready | failed  (has the KB been built?)
   outreach_status: not_reached -> reached | callback | do_not_call  (have we called them?)
+  status:          not_called | called | booked | flagged | no_answer | do_not_call
+                   (what was the *outcome* of working this prospect?)
+
+`status` and `outreach_status` overlap and are deliberately NOT auto-synced — see the
+"two overlapping outreach axes" note in CONTEXT.md ADR-006. `outreach_status` is the
+Places-pipeline axis that `record_call()` advances automatically; `status` is the
+operator-set campaign-outcome axis behind the /prospects dropdown and counts strip.
+Reconciling them into one field is an open design decision, not an oversight.
 """
 
 from datetime import datetime
@@ -36,6 +45,9 @@ class Prospect(Base, UUIDMixin, TimestampMixin, TenantMixin):
     # Outreach tracking
     outreach_status: Mapped[str] = mapped_column(String(20), default="not_reached")
     # not_reached | reached | callback | do_not_call
+    status: Mapped[str] = mapped_column(String(20), default="not_called", index=True)
+    # not_called | called | booked | flagged | no_answer | do_not_call
+    # Indexed because /prospects/stats aggregates on it on every page load.
     last_called_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     call_count: Mapped[int] = mapped_column(Integer, default=0)
 

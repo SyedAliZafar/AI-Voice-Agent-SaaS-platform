@@ -175,6 +175,21 @@ async def set_outreach_status(
     return prospect
 
 
+async def set_status(
+    db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID, status: str
+) -> Prospect | None:
+    """Set the operator-facing campaign-outcome axis. Deliberately independent of
+    set_outreach_status() — see the axes note in backend/models/prospect.py.
+    """
+    prospect = await get_prospect(db, prospect_id, tenant_id)
+    if not prospect:
+        return None
+    prospect.status = status
+    await db.commit()
+    await db.refresh(prospect)
+    return prospect
+
+
 async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
     prospect = await get_prospect(db, prospect_id, tenant_id)
     if not prospect:

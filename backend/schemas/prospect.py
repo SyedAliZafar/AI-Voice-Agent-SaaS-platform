@@ -45,6 +45,7 @@ class ProspectResponse(BaseModel):
     research_error: str | None
 
     outreach_status: str
+    status: str
     last_called_at: datetime | None
     call_count: int
 
@@ -56,6 +57,8 @@ class ProspectResponse(BaseModel):
 
 class ProspectUpdate(BaseModel):
     outreach_status: str | None = None  # not_reached | reached | callback | do_not_call
+    status: str | None = None
+    # not_called | called | booked | flagged | no_answer | do_not_call
 
 
 class ProspectCallRequest(BaseModel):

@@ -540,6 +540,22 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    job in this pipeline is deciding who to call and when — discovery and research run
    unattended.
 
+**Two overlapping outreach axes — a deliberate deferral, not an oversight.**
+`Prospect` now also carries `status` (`not_called | called | booked | flagged |
+no_answer | do_not_call`), the operator-set campaign-outcome axis behind the
+/prospects dropdown and counts strip. It overlaps `outreach_status` heavily
+(`not_called`≈`not_reached`, `called`≈`reached`, `do_not_call` identical) but is
+**not** auto-synced with it: `record_call()` still advances only `outreach_status`,
+and setting one via `PATCH /api/prospects/{id}` never moves the other.
+
+Adding a parallel column was chosen over widening `outreach_status`'s value set
+because the latter is load-bearing for step 3 above (`record_call`'s auto-transition),
+the list filter, and the frontend's `OUTREACH_META` — changing its domain is a
+breaking change to a documented axis, whereas a new column is purely additive.
+That makes it safe, not right: **collapsing these two into one field is an open
+design decision**, and until it's made, "have we called them" has two answers.
+Anything reading outreach state should know which axis it's reading and why.
+
 Tenant-scoping note: `prospect_service.get_prospect()` is tenant-filtered like everything
 else, but Celery tasks have no HTTP caller to scope to, so they use the explicitly-named
 `get_prospect_unscoped()` instead — the safe name stays the default, the unsafe one is

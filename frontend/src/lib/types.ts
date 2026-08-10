@@ -87,6 +87,16 @@ export interface CompanyResearch {
 export type ResearchStatus = "pending" | "running" | "ready" | "failed";
 export type OutreachStatus = "not_reached" | "reached" | "callback" | "do_not_call";
 
+// Campaign-outcome axis, set by the operator on /prospects. Overlaps OutreachStatus
+// on purpose and is not auto-synced with it — see backend/models/prospect.py.
+export type ProspectStatus =
+  | "not_called"
+  | "called"
+  | "booked"
+  | "flagged"
+  | "no_answer"
+  | "do_not_call";
+
 export interface Prospect {
   id: string;
   google_place_id: string;
@@ -104,6 +114,7 @@ export interface Prospect {
   research_error: string | null;
 
   outreach_status: OutreachStatus;
+  status: ProspectStatus;
   last_called_at: string | null;
   call_count: number;
 

@@ -26,6 +26,7 @@ from backend.workers.prospect_tasks import discover_prospects, research_prospect
 router = APIRouter()
 
 VALID_OUTREACH_STATUSES = {"not_reached", "reached", "callback", "do_not_call"}
+VALID_STATUSES = {"not_called", "called", "booked", "flagged", "no_answer", "do_not_call"}
 
 
 @router.post("/discover", status_code=202)
@@ -94,12 +95,17 @@ async def update_prospect(
         raise HTTPException(
             status_code=422, detail=f"Invalid outreach_status: {payload.outreach_status}"
         )
+    if payload.status and payload.status not in VALID_STATUSES:
+        raise HTTPException(status_code=422, detail=f"Invalid status: {payload.status}")
 
+    prospect = None
     if payload.outreach_status:
         prospect = await prospect_service.set_outreach_status(
             db, prospect_id, tenant_id, payload.outreach_status
         )
-    else:
+    if payload.status:
+        prospect = await prospect_service.set_status(db, prospect_id, tenant_id, payload.status)
+    if prospect is None and not (payload.outreach_status or payload.status):
         prospect = await prospect_service.get_prospect(db, prospect_id, tenant_id)
 
     if not prospect:
