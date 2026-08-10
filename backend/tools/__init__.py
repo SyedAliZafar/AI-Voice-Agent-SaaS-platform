@@ -11,6 +11,7 @@ from backend.tools.book_discovery_call import BookDiscoveryCallTool
 from backend.tools.cancel_appointment import CancelAppointmentTool
 from backend.tools.check_availability import CheckAvailabilityTool
 from backend.tools.create_lead import CreateLeadTool
+from backend.tools.flag_for_human_review import FlagForHumanReviewTool
 from backend.tools.lookup_customer import LookupCustomerTool
 from backend.tools.reschedule_appointment import RescheduleAppointmentTool
 from backend.tools.send_sms import SendSmsTool
@@ -26,6 +27,7 @@ _REGISTRY: dict[str, BaseTool] = {
         RescheduleAppointmentTool(),
         LookupCustomerTool(),
         CreateLeadTool(),
+        FlagForHumanReviewTool(),
         TransferCallTool(),
         SendSmsTool(),
     ]
