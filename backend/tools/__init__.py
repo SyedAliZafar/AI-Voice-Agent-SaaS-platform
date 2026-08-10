@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.tools.base import BaseTool
 from backend.tools.book_appointment import BookAppointmentTool
+from backend.tools.book_discovery_call import BookDiscoveryCallTool
 from backend.tools.cancel_appointment import CancelAppointmentTool
 from backend.tools.check_availability import CheckAvailabilityTool
 from backend.tools.create_lead import CreateLeadTool
@@ -20,6 +21,7 @@ _REGISTRY: dict[str, BaseTool] = {
     for tool in [
         CheckAvailabilityTool(),
         BookAppointmentTool(),
+        BookDiscoveryCallTool(),
         CancelAppointmentTool(),
         RescheduleAppointmentTool(),
         LookupCustomerTool(),
