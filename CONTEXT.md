@@ -94,6 +94,7 @@ voiceagent/
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
 │   │   ├── tunnel_check.py       # PUBLIC_BASE_URL reachability probe, shared by the custom-LLM preflight guard and scripts/check_custom_llm.py
+│   │   ├── public_url.py         # Resolves PUBLIC_BASE_URL; "auto" discovers the live quick-tunnel host from cloudflared (ADR-007)
 │   │   ├── llm_service.py        # Provider-agnostic LLM calls (DeepSeek/OpenAI, ADR-008), tool execution
 │   │   ├── sandbox_service.py    # Text-chat agent testing sandbox — no phone call, see "Agent testing sandbox" flow
 │   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
@@ -309,6 +310,34 @@ Signature verification (`X-Retell-Signature`, HMAC-SHA256 over the raw body with
 `RetellAdapter.verify_webhook_signature`. It must run against the **raw** request bytes,
 which is why `webhooks.py` reads the body itself rather than taking a parsed Pydantic
 model as a route parameter.
+
+**2026-08-10 update — the stale-URL half is now self-correcting.** The preflight above
+stops a wasted call but still leaves the operator doing the same manual recovery every
+time: read the new hostname out of `docker compose logs`, paste into `.env`, recreate the
+API container (because `docker compose restart` doesn't re-read `.env`). That ritual cost
+four billed test calls (2026-08-04, -08-05, -08-08, -08-10) — always the same root cause,
+a cloudflared *quick* tunnel minting a fresh `https://<random>.trycloudflare.com` on every
+start.
+
+`PUBLIC_BASE_URL` now accepts the sentinel **`auto`** (`backend/services/public_url.py`),
+which resolves the current hostname from cloudflared's own metrics server
+(`GET /quicktunnel` → `{"hostname": ...}`, verified empirically against
+`cloudflare/cloudflared:latest` before being coded against). A literal URL always wins, so
+the named tunnel, production, and every existing test that sets a concrete URL are
+untouched — that "explicit wins" property is deliberate and is what let this land without
+changing a single existing test. Callers pass their own configured value in
+(`get_public_base_url(settings.public_base_url)`) rather than the module reading settings
+itself, so `test_call_service`'s settings stay independently patchable.
+
+Two supporting changes: `tunnel-quick` gained `--metrics 0.0.0.0:20241` (mirroring the
+named `tunnel`, which already had it) plus `restart: unless-stopped` — its absence is why
+the 2026-08-08 container sat `Exited (255)` for 19 hours with nothing bringing it back.
+And because a stale cached URL can outlive a restart inside a long-lived API process, the
+custom-LLM preflight re-resolves once with `force_refresh=True` and retries before
+failing, so a tunnel restart is a non-event rather than a failed call.
+
+This is a workaround for the quick tunnel's design, not a replacement for the named one —
+Option A in RUN.md remains the recommendation, and makes all of the above moot.
 
 Reconciliation repairs a dead tunnel after the fact; it doesn't stop one from wasting a
 call in the first place. The custom-LLM path (below) additionally *preflights*
