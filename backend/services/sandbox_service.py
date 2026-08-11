@@ -64,4 +64,9 @@ async def chat(
         tools_enabled=tools_enabled,
     )
 
-    return {"reply": reply, "model": resolved_model, "tools_enabled": tools_enabled}
+    return {
+        "reply": reply,
+        "model": resolved_model,
+        "tools_enabled": tools_enabled,
+        "system_prompt": system_prompt,
+    }

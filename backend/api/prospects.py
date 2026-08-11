@@ -42,6 +42,20 @@ VALID_OUTREACH_STATUSES = {"not_reached", "reached", "callback", "do_not_call"}
 VALID_STATUSES = {"not_called", "called", "booked", "flagged", "no_answer", "do_not_call"}
 
 
+def _build_personalized_prompt(agent, prospect) -> str:
+    """The single place /call and /sandbox-chat assemble a prospect's personalized
+    script — both call only this, which is what makes the sandbox provably say what
+    the real call would say (see script_service.build_prospect_prompt's docstring).
+    """
+    research = CompanyResearch.model_validate(prospect.research or {})
+    return script_service.build_prospect_prompt(
+        agent.system_prompt,
+        prospect.name,
+        research,
+        prospect_notes=prospect.prospect_notes,
+    )
+
+
 @router.post("/discover", status_code=202)
 async def discover(
     payload: DiscoverRequest,
@@ -241,13 +255,7 @@ async def call_prospect(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    research = CompanyResearch.model_validate(prospect.research or {})
-    personalized_prompt = script_service.build_prospect_prompt(
-        agent.system_prompt,
-        prospect.name,
-        research,
-        prospect_notes=prospect.prospect_notes,
-    )
+    personalized_prompt = _build_personalized_prompt(agent, prospect)
 
     try:
         result = await test_call_service.place_test_call(
@@ -297,13 +305,7 @@ async def prospect_sandbox_chat(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    research = CompanyResearch.model_validate(prospect.research or {})
-    personalized_prompt = script_service.build_prospect_prompt(
-        agent.system_prompt,
-        prospect.name,
-        research,
-        prospect_notes=prospect.prospect_notes,
-    )
+    personalized_prompt = _build_personalized_prompt(agent, prospect)
 
     try:
         result = await sandbox_service.chat(

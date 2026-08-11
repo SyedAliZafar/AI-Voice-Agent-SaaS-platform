@@ -44,7 +44,7 @@ def build_prospect_prompt(
 
     This function is the single place personalization is assembled, which is what makes
     the sandbox test and the real call provably say the same thing — both endpoints in
-    api/prospects.py go through _place_personalized_call(), which calls only this.
+    api/prospects.py go through _build_personalized_prompt(), which calls only this.
     """
     hooks = "\n".join(f"  - {h}" for h in research.hooks) or "  - (no specific hook found)"
     pain_points = "\n".join(f"  - {p}" for p in research.pain_points) or "  - (none identified)"

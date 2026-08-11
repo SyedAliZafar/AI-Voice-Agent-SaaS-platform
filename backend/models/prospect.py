@@ -36,10 +36,11 @@ class Prospect(Base, UUIDMixin, TimestampMixin, TenantMixin):
     # strings order components differently across countries (a "second-to-last comma
     # segment" heuristic breaks even within the UK: "Bristol, Clevedon BS21 6RR" has
     # Clevedon as the town and Bristol as the postal county). CSV imports populate city
-    # directly from their own city column; country is left null for CSV rows, since
-    # nothing in that import path currently supplies one. No index yet — same as
-    # `category`, which has the same shape and isn't indexed either; add one if/when
-    # grouping/filtering queries actually need it.
+    # directly from their own city/country columns (operator-typed and unvalidated,
+    # unlike the Places path's canonical addressComponents value — near-duplicate
+    # spellings like "UK" vs "United Kingdom" will group separately in the UI). No
+    # index yet — same as `category`, which has the same shape and isn't indexed
+    # either; add one if/when grouping/filtering queries actually need it.
     city: Mapped[str | None] = mapped_column(String(255), nullable=True)
     country: Mapped[str | None] = mapped_column(String(255), nullable=True)
     category: Mapped[str | None] = mapped_column(String(255), nullable=True)

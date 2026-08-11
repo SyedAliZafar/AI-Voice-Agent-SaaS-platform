@@ -101,6 +101,11 @@ class SandboxChatResponse(BaseModel):
     reply: str
     model: str
     tools_enabled: bool
+    # The exact system prompt this turn ran against — lets a sandbox UI show the
+    # operator what was actually sent, rather than the client reconstructing an
+    # approximation of it client-side. Always populated (agent.system_prompt when no
+    # override was given).
+    system_prompt: str
 
 
 class TestCallRequest(BaseModel):

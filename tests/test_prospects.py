@@ -868,6 +868,25 @@ async def test_sandbox_chat_returns_a_reply(
 
 
 @pytest.mark.asyncio
+async def test_sandbox_chat_response_includes_the_prompt_actually_sent(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    """The response should carry the exact prompt the LLM ran against, so a sandbox
+    UI can show it verbatim instead of reconstructing an approximation client-side.
+    """
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.json()["system_prompt"] == chat_calls[0]["system_prompt"]
+
+
+@pytest.mark.asyncio
 async def test_sandbox_chat_never_dials_a_phone(
     client, db_session, tenant_id, auth_headers, chat_calls, placed_calls
 ):

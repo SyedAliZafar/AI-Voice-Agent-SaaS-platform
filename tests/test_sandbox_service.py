@@ -33,6 +33,44 @@ async def test_chat_returns_reply_from_llm_service(db_session, tenant_id):
 
 
 @pytest.mark.asyncio
+async def test_chat_returns_the_system_prompt_it_ran_against(db_session, tenant_id):
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="Ali", platform="retell", system_prompt="You are Ali."),
+    )
+    mock_response = AsyncMock(return_value="Hello, how can I help?")
+
+    with patch("backend.services.llm_service.get_agent_response", mock_response):
+        result = await sandbox_service.chat(
+            db_session, agent.id, tenant_id, [{"role": "user", "content": "Hi"}]
+        )
+
+    assert result["system_prompt"] == "You are Ali."
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_the_override_prompt_when_given(db_session, tenant_id):
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="Ali", platform="retell", system_prompt="You are Ali."),
+    )
+    mock_response = AsyncMock(return_value="Hello, how can I help?")
+
+    with patch("backend.services.llm_service.get_agent_response", mock_response):
+        result = await sandbox_service.chat(
+            db_session,
+            agent.id,
+            tenant_id,
+            [{"role": "user", "content": "Hi"}],
+            system_prompt_override="You are personalized-Ali.",
+        )
+
+    assert result["system_prompt"] == "You are personalized-Ali."
+
+
+@pytest.mark.asyncio
 async def test_unknown_agent_raises_sandbox_error(db_session, tenant_id):
     with pytest.raises(sandbox_service.SandboxError):
         await sandbox_service.chat(db_session, uuid.uuid4(), tenant_id, [])

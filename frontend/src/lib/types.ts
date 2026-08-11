@@ -50,6 +50,9 @@ export interface SandboxChatResponse {
   reply: string;
   model: string;
   tools_enabled: boolean;
+  // The exact system prompt this turn ran against (agent's saved prompt, or the
+  // personalized override for a prospect sandbox) — lets the UI show it verbatim.
+  system_prompt: string;
 }
 
 export interface Call {
