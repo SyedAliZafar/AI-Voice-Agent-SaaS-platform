@@ -1,18 +1,21 @@
 # FRONTEND.md — UI structure and conventions
 
-> **This is a target-state document.** Nothing described under "Target structure" has been
-> refactored yet — the current tree is flat and is accurately reflected in CONTEXT.md's
-> structure tree. This file is the reference for that refactor when it happens, and the
-> convention for anything written in the meantime. Where it says "today", that's current
-> reality; where it says "target", that's the destination.
+> **This started as a target-state document; the structural move described below has
+> since happened** — `components/ui/`, `components/layout/`, and
+> `components/features/{agents,calls,prospects}/` all exist and match CONTEXT.md's
+> structure tree. It stays the reference for the *conventions* (where a new component
+> goes, tokens, fetching-in-hooks) rather than a still-pending migration. Where it
+> says "today", that's current reality; where it says "target", read it as "the
+> convention going forward" rather than "not built yet."
 
 Stack: Next.js 14 (App Router) + React 18 + Tailwind + TypeScript, in `frontend/`.
 
 ## Target structure
 
-Today `components/` is flat — 14 files, mixing generic primitives (`ui.tsx`, `form.tsx`),
+`components/` used to be flat — 14 files, mixing generic primitives (`ui.tsx`, `form.tsx`),
 app chrome (`AppShell`, `Sidebar`, `Topbar`), and domain features (`AgentBuilder`,
-`LiveCallPanel`) at the same level. That's fine at 14 files and painful at 40. Target:
+`LiveCallPanel`) at the same level. That's fine at 14 files and painful at 40, so it's
+been split into:
 
 ```
 frontend/src/
@@ -30,7 +33,7 @@ frontend/src/
 │   └── features/             # domain components, grouped by resource
 │       ├── agents/           #   AgentCard, AgentBuilder, Stepper, PromptEditor
 │       ├── calls/            #   CallTable, TranscriptViewer, LiveCallPanel
-│       └── prospects/
+│       └── prospects/        #   Search/filter/group tree/detail panel + sandbox chat
 ├── hooks/                    # all data fetching lives here
 └── lib/                      # api client, types, formatting, constants
 ```
@@ -39,11 +42,11 @@ The rule that decides where a component goes: **does it know what an Agent or a 
 is?** If no, it's `ui/`. If it's chrome around every page, it's `layout/`. Otherwise it's
 `features/<resource>/`.
 
-`ui.tsx` and `form.tsx` are the only files that bundle multiple components today. Splitting
-them is the main mechanical work; an `index.ts` barrel keeps existing import paths short.
+`ui.tsx` and `form.tsx` were the only files that bundled multiple components; both have
+been split, with `components/ui/index.ts` re-exporting so import paths stayed short.
 
-Also: `cx()` (the className joiner) is defined *and not exported* in `ui.tsx`, so no other
-component can use it. It belongs in `lib/` and should be exported.
+Also: `cx()` (the className joiner) used to be defined *and not exported* in `ui.tsx`, so no other
+component could use it. It's now `lib/cx.ts`, exported.
 
 ## Design tokens — one source, not three
 

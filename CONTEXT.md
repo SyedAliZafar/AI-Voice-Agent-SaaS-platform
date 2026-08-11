@@ -163,30 +163,35 @@ voiceagent/
 │   │   │   │   └── page.tsx      # Integrations, phone numbers, billing
 │   │   │   └── api/strategist/
 │   │   │       └── route.ts      # Next.js route proxying an LLM call for the agent-builder wizard — see FRONTEND.md
-│   │   ├── components/           # Currently flat — see FRONTEND.md for the target components/ui + components/features split
-│   │   │   ├── ui.tsx             # De-facto primitives: Button, Card, Badge, PageHeader, EmptyState, Skeleton
-│   │   │   ├── form.tsx
-│   │   │   ├── AppShell.tsx
-│   │   │   ├── Sidebar.tsx
-│   │   │   ├── Topbar.tsx
-│   │   │   ├── CallTable.tsx
-│   │   │   ├── MetricCard.tsx
-│   │   │   ├── AgentCard.tsx
-│   │   │   ├── AgentBuilder.tsx
-│   │   │   ├── Stepper.tsx
-│   │   │   ├── TranscriptViewer.tsx
-│   │   │   ├── PromptEditor.tsx  # Monaco-based prompt editing
-│   │   │   ├── LiveCallPanel.tsx # Real-time call audio + transcript
+│   │   ├── components/           # components/ui + components/features split — see FRONTEND.md
+│   │   │   ├── ui/                # Generic primitives, one per file, zero domain knowledge
+│   │   │   │   ├── Button.tsx, Card.tsx, Badge.tsx, PageHeader.tsx, EmptyState.tsx, Skeleton.tsx, ...
+│   │   │   │   └── index.ts      # re-export barrel, so imports stay `@/components/ui`
+│   │   │   ├── layout/            # App chrome: AppShell, Sidebar, Topbar
+│   │   │   ├── features/
+│   │   │   │   ├── agents/       # AgentCard, AgentBuilder, Stepper, PromptEditor
+│   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
+│   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
+│   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
+│   │   │   │                     #   ProspectDetailPanel, CsvImportButton, SandboxChat,
+│   │   │   │                     #   SandboxContextPanel, prospectStatus.ts (status meta/labels)
 │   │   │   └── icons.tsx
-│   │   ├── hooks/
+│   │   ├── hooks/                 # all data fetching lives here (FRONTEND.md)
 │   │   │   ├── useWebSocket.ts
-│   │   │   └── useCallMetrics.ts
+│   │   │   ├── useCallMetrics.ts
+│   │   │   ├── useAgents.ts
+│   │   │   ├── useLlmModels.ts
+│   │   │   ├── useProspects.ts    # list + stats + research-status polling
+│   │   │   ├── useCityAutocomplete.ts
+│   │   │   └── useProspectSandbox.ts
 │   │   └── lib/
 │   │       ├── api.ts            # Axios wrapper + auth-token interceptor
 │   │       ├── types.ts          # Shared TS interfaces, hand-mirrored from backend/schemas/*.py — no codegen, see FRONTEND.md
 │   │       ├── format.ts
 │   │       ├── builder.ts
-│   │       └── constants.ts
+│   │       ├── constants.ts
+│   │       ├── cx.ts             # className joiner, exported (was trapped, unexported, in the old ui.tsx)
+│   │       └── prospectGrouping.ts  # pure country -> category -> city -> companies grouping
 │   └── tailwind.config.ts
 │
 └── tests/
@@ -545,12 +550,19 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    outreach-status, plus `POST /import-csv` (bulk-create from an operator's own list —
    business_name/phone required, city/country/source/niche optional, deduped by
    normalized phone within the tenant) and `GET /stats` (per-status counts, aggregated
-   in SQL so they survive the 100-row page limit). `frontend/src/app/prospects/page.tsx`
-   is the UI, grouped Country -> Category (client-side, over whatever `/prospects`
-   returned) with `?country=&category=` URL params persisting the filter across a
-   refresh — the first page in this repo to use `useSearchParams`/`useRouter` for filter
-   state, so it's the pattern to copy for the next one. The operator's only job in this
-   pipeline is deciding who to call and when — discovery and research run unattended.
+   in SQL so they survive the page limit). `frontend/src/app/prospects/page.tsx` is the
+   UI — thin/presentational per FRONTEND.md, with fetching in `hooks/useProspects.ts`
+   and the domain UI in `components/features/prospects/`. Results group Country ->
+   Category -> City (client-side, over whatever `/prospects` returned, capped at 500
+   rows to keep group counts accurate — see `useProspects.ts`'s comment) via
+   `lib/prospectGrouping.ts`, with `?q=&where=&country=&category=&city=` URL params
+   persisting the search terms and filters across a refresh — the first page in this
+   repo to use `useSearchParams`/`useRouter` for filter state, so it's the pattern to
+   copy for the next one. City-autocomplete for the "Where" field
+   (`hooks/useCityAutocomplete.ts` + `components/features/prospects/CityAutocomplete.tsx`)
+   proxies `GET /prospects/city-autocomplete` — see below. The operator's only job in
+   this pipeline is deciding who to call and when — discovery and research run
+   unattended.
 
    `Prospect.prospect_notes` (nullable text) is the operator's hand-written context,
    injected as an `[OPERATOR NOTES]` block *after* the researched `[COMPANY BRIEF]` and
@@ -570,15 +582,21 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    (an id-exact Place Details lookup per row, never a re-run of the text search, which
    could match a different business).
 
-   `POST /{id}/sandbox-chat` is a text-only sandbox for one prospect: it builds the
-   exact same prompt `/call` would (via `script_service.build_prospect_prompt`) and runs
-   it through `sandbox_service.chat()` — the same stateless text-chat mechanism
-   `/api/agents/{id}/sandbox-chat` uses — so what the operator reads while testing is
-   provably what the real call would say, without telephony or touching outreach
-   counters. `frontend/src/app/prospects/[id]/sandbox/page.tsx` is the UI; unlike the
-   agent-level sandbox, the prompt isn't editable there (it's built from the prospect's
-   research/notes, and that's the point) and every agent is selectable regardless of
-   platform, since nothing here dials a phone.
+   `POST /{id}/sandbox-chat` is a text-only sandbox for one prospect: both it and
+   `/call` build the personalized prompt through the single
+   `api/prospects._build_personalized_prompt()` helper (which itself calls only
+   `script_service.build_prospect_prompt`), and `sandbox_service.chat()` — the same
+   stateless text-chat mechanism `/api/agents/{id}/sandbox-chat` uses — returns that
+   exact `system_prompt` back in the response, so what the operator reads while
+   testing is provably what the real call would say, without telephony or touching
+   outreach counters. `frontend/src/app/prospects/[id]/sandbox/page.tsx` is the UI
+   (fetching lives in `hooks/useProspectSandbox.ts`; chat transcript and the
+   agent/model/"what's injected" panel are `components/features/prospects/SandboxChat.tsx`
+   and `SandboxContextPanel.tsx`, the latter showing the literal last-turn
+   `system_prompt` in a collapsible `<details>`); unlike the agent-level sandbox, the
+   prompt isn't editable there (it's built from the prospect's research/notes, and
+   that's the point) and every agent is selectable regardless of platform, since
+   nothing here dials a phone.
 
    `GET /city-autocomplete` proxies Google's Places Autocomplete (New) — type-ahead for
    the discovery "Where" field, debounced client-side with a per-session token for
