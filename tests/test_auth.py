@@ -37,10 +37,12 @@ PROTECTED_ROUTES = [
     ("post", "/api/prospects/discover"),
     ("post", "/api/prospects/import-csv"),
     ("get", "/api/prospects/stats"),
+    ("get", "/api/prospects/city-autocomplete"),
     ("get", f"/api/prospects/{uuid.uuid4()}"),
     ("patch", f"/api/prospects/{uuid.uuid4()}"),
     ("post", f"/api/prospects/{uuid.uuid4()}/research"),
     ("post", f"/api/prospects/{uuid.uuid4()}/call"),
+    ("post", f"/api/prospects/{uuid.uuid4()}/sandbox-chat"),
 ]
 
 
@@ -124,9 +126,7 @@ async def test_agent_list_only_returns_own_tenants_agents(
 
 
 @pytest.mark.asyncio
-async def test_cannot_read_another_tenants_agent(
-    client, db_session, tenant_id, other_auth_headers
-):
+async def test_cannot_read_another_tenants_agent(client, db_session, tenant_id, other_auth_headers):
     agent = await agent_service.create_agent(
         db_session, tenant_id, AgentCreate(name="Mine", platform="retell")
     )

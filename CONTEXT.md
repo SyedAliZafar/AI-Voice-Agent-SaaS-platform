@@ -80,7 +80,7 @@ voiceagent/
 │   │   ├── agents.py             # CRUD for agents + prompt config
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
-│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status
+│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
 │   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
 │   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phases/completed/phase0.md)
@@ -99,7 +99,7 @@ voiceagent/
 │   │   ├── sandbox_service.py    # Text-chat agent testing sandbox — no phone call, see "Agent testing sandbox" flow
 │   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
 │   │   ├── analytics_service.py  # Metrics computation, sentiment aggregation
-│   │   ├── places_service.py     # Google Places search — prospecting Agent 1, discovery (ADR-006)
+│   │   ├── places_service.py     # Google Places search, city/country extraction, autocomplete — prospecting Agent 1, discovery (ADR-006)
 │   │   ├── research_service.py   # Company research — prospecting Agent 2, knowledge base (ADR-006)
 │   │   ├── script_service.py     # Call-script generation for prospects
 │   │   └── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking (ADR-006)
@@ -155,7 +155,10 @@ voiceagent/
 │   │   │   │   └── live/
 │   │   │   │       └── page.tsx  # WebSocket live call monitor
 │   │   │   ├── prospects/
-│   │   │   │   └── page.tsx      # Prospecting pipeline UI (ADR-006)
+│   │   │   │   ├── page.tsx      # Prospecting pipeline UI (ADR-006) — grouped, URL-param filtered
+│   │   │   │   └── [id]/
+│   │   │   │       └── sandbox/
+│   │   │   │           └── page.tsx  # Text-chat sandbox for one prospect's script — no phone call
 │   │   │   ├── settings/
 │   │   │   │   └── page.tsx      # Integrations, phone numbers, billing
 │   │   │   └── api/strategist/
@@ -197,8 +200,10 @@ voiceagent/
     ├── test_webhooks.py
     ├── test_llm_service.py
     ├── test_sandbox_service.py
-    ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import
+    ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import, sandbox-chat, city-autocomplete
     ├── test_prospect_service.py
+    ├── test_prospect_tasks.py    # discover_prospects task: arguments reach places_service, source_location/city/country persist
+    ├── test_places_service.py    # addressComponents extraction, autocomplete normalization
     ├── test_research_service.py
     ├── test_script_service.py
     └── test_tools/
@@ -538,11 +543,50 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    call script.
 5. **Operator surface**: `backend/api/prospects.py` exposes discover/list/research/
    outreach-status, plus `POST /import-csv` (bulk-create from an operator's own list —
-   business_name/phone required, city/source/niche optional, deduped by normalized phone
-   within the tenant) and `GET /stats` (per-status counts, aggregated in SQL so they
-   survive the 100-row page limit). `frontend/src/app/prospects/page.tsx` is the UI. The
-   operator's only job in this pipeline is deciding who to call and when — discovery and
-   research run unattended.
+   business_name/phone required, city/country/source/niche optional, deduped by
+   normalized phone within the tenant) and `GET /stats` (per-status counts, aggregated
+   in SQL so they survive the 100-row page limit). `frontend/src/app/prospects/page.tsx`
+   is the UI, grouped Country -> Category (client-side, over whatever `/prospects`
+   returned) with `?country=&category=` URL params persisting the filter across a
+   refresh — the first page in this repo to use `useSearchParams`/`useRouter` for filter
+   state, so it's the pattern to copy for the next one. The operator's only job in this
+   pipeline is deciding who to call and when — discovery and research run unattended.
+
+   `Prospect.prospect_notes` (nullable text) is the operator's hand-written context,
+   injected as an `[OPERATOR NOTES]` block *after* the researched `[COMPANY BRIEF]` and
+   described to the model as outranking it — a human who just spoke to the company knows
+   things the scraper doesn't. Unlike `research`, it survives a research re-run. Edited
+   inline on /prospects via `PATCH /{id}` (which keys off `model_fields_set`, so an
+   explicit null clears the notes rather than reading as "not supplied").
+
+   `Prospect.city`/`.country` are structured fields sourced from Google Places'
+   `addressComponents` (`places_service._extract_city_country`), not parsed out of the
+   formatted `address` string — component order varies by country, and a UK address
+   commonly tags its town `postal_town` with no `locality` at all, which the extractor
+   falls back to. `Prospect.source_location` similarly captures the *where* half of the
+   discovery search that found a row (`source_query` already captured the *what*) —
+   previously silently dropped after being sent to Google. Both are populated going
+   forward automatically; existing rows need `scripts/backfill_prospect_city_country.py`
+   (an id-exact Place Details lookup per row, never a re-run of the text search, which
+   could match a different business).
+
+   `POST /{id}/sandbox-chat` is a text-only sandbox for one prospect: it builds the
+   exact same prompt `/call` would (via `script_service.build_prospect_prompt`) and runs
+   it through `sandbox_service.chat()` — the same stateless text-chat mechanism
+   `/api/agents/{id}/sandbox-chat` uses — so what the operator reads while testing is
+   provably what the real call would say, without telephony or touching outreach
+   counters. `frontend/src/app/prospects/[id]/sandbox/page.tsx` is the UI; unlike the
+   agent-level sandbox, the prompt isn't editable there (it's built from the prospect's
+   research/notes, and that's the point) and every agent is selectable regardless of
+   platform, since nothing here dials a phone.
+
+   `GET /city-autocomplete` proxies Google's Places Autocomplete (New) — type-ahead for
+   the discovery "Where" field, debounced client-side with a per-session token for
+   Google's session-based Autocomplete billing SKU (distinct from Text Search's). The
+   API key never reaches the browser (ADR-002 discipline); a short-input guard rejects
+   anything under 2 characters before it ever reaches Google, in case the frontend's own
+   debounce is bypassed. Global for now, not narrowed by country — see `region_code`'s
+   unused-but-plumbed-through param if that's ever needed.
 
    CSV-imported prospects land with `research_status="pending"` and nothing chained to
    advance them, so they never reach `ready` — which is what the UI's "Call" button

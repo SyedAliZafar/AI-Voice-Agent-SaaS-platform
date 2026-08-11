@@ -31,16 +31,39 @@ class Prospect(Base, UUIDMixin, TimestampMixin, TenantMixin):
     website: Mapped[str | None] = mapped_column(String(500), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # city/country are structured fields sourced from Google Places' addressComponents
+    # (places_service._normalize), NOT parsed out of `address` — formatted-address
+    # strings order components differently across countries (a "second-to-last comma
+    # segment" heuristic breaks even within the UK: "Bristol, Clevedon BS21 6RR" has
+    # Clevedon as the town and Bristol as the postal county). CSV imports populate city
+    # directly from their own city column; country is left null for CSV rows, since
+    # nothing in that import path currently supplies one. No index yet — same as
+    # `category`, which has the same shape and isn't indexed either; add one if/when
+    # grouping/filtering queries actually need it.
+    city: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(255), nullable=True)
     category: Mapped[str | None] = mapped_column(String(255), nullable=True)
     rating: Mapped[float | None] = mapped_column(Float, nullable=True)
     review_count: Mapped[int] = mapped_column(Integer, default=0)
     source_query: Mapped[str] = mapped_column(String(255), default="")
+    # The `location` half of the discovery search that found this row ("Bristol, UK").
+    # Sibling to source_query rather than folded into it: they answer different
+    # questions (*what* was searched vs. *where*), and joining them into one string
+    # would make either one unfilterable on its own. Set once at creation and never
+    # updated, exactly like source_query. Null for CSV imports and for rows discovered
+    # before this column existed.
+    source_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Research (Agent 2 — the knowledge base)
     research_status: Mapped[str] = mapped_column(String(20), default="pending")
     # pending | running | ready | failed
     research: Mapped[dict] = mapped_column(JSON, default=dict)  # CompanyResearch shape
     research_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Operator-written context, injected alongside `research` into the call prompt
+    # (script_service.build_prospect_prompt). Distinct from `research`: that is machine-
+    # generated and clobbered wholesale on every re-run, this survives one.
+    prospect_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Outreach tracking
     outreach_status: Mapped[str] = mapped_column(String(20), default="not_reached")

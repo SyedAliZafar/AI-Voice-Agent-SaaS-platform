@@ -36,11 +36,19 @@ def compute_priority(
 
 
 async def upsert_from_places(
-    db: AsyncSession, tenant_id: uuid.UUID, places: list[dict], source_query: str
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    places: list[dict],
+    source_query: str,
+    source_location: str | None = None,
 ) -> list[Prospect]:
     """Insert new prospects, update identity fields (+ re-score) on ones we've already
     seen, keyed by (tenant_id, google_place_id). Never touches research/outreach state
     on an existing row — discovery shouldn't clobber work Agent 2 or the operator did.
+
+    `source_location` records the *where* of the search that found each row, and like
+    `source_query` is written only on insert: re-running a different search that happens
+    to return an already-known place shouldn't rewrite which search originally found it.
     """
     result = []
     for place in places:
@@ -66,6 +74,8 @@ async def upsert_from_places(
             prospect.website = place.get("website") or prospect.website
             prospect.phone = place.get("phone") or prospect.phone
             prospect.address = place.get("address") or prospect.address
+            prospect.city = place.get("city") or prospect.city
+            prospect.country = place.get("country") or prospect.country
             prospect.category = place.get("category") or prospect.category
             prospect.rating = place.get("rating")
             prospect.review_count = place.get("review_count", 0)
@@ -78,10 +88,13 @@ async def upsert_from_places(
                 website=place.get("website"),
                 phone=place.get("phone"),
                 address=place.get("address"),
+                city=place.get("city"),
+                country=place.get("country"),
                 category=place.get("category"),
                 rating=place.get("rating"),
                 review_count=place.get("review_count", 0),
                 source_query=source_query,
+                source_location=source_location,
                 priority_score=priority,
             )
             db.add(prospect)
@@ -101,7 +114,7 @@ class CsvImportError(Exception):
 
 
 CSV_REQUIRED_COLUMNS = ("business_name", "phone")
-CSV_OPTIONAL_COLUMNS = ("city", "source", "niche", "website", "address")
+CSV_OPTIONAL_COLUMNS = ("city", "country", "source", "niche", "website", "address")
 CSV_MAX_ROWS = 5_000  # arbitrary sanity bound — an operator list, not a bulk data pipe
 CSV_MAX_REPORTED_ERRORS = 20  # keep the response readable; counts stay exact
 
@@ -150,15 +163,17 @@ async def import_from_csv(
 ) -> CsvImportResult:
     """Create prospects from an operator-supplied CSV.
 
-    Columns: business_name, phone (required); city, source, niche, website, address
-    (optional). Rows with an unusable phone or no business_name are skipped and counted,
-    not fatal. A missing website is NOT an invalid row — it just means that prospect gets
-    degraded (name/address-only) research, which the result's with_website/without_website
-    split reports up front.
+    Columns: business_name, phone (required); city, country, source, niche, website,
+    address (optional). Rows with an unusable phone or no business_name are skipped and
+    counted, not fatal. A missing website is NOT an invalid row — it just means that
+    prospect gets degraded (name/address-only) research, which the result's
+    with_website/without_website split reports up front.
 
-    address falls back to city when the richer `address` column is absent, so files
-    written against the older header keep working; a full street address is preferred
-    because research_service passes it to the LLM as a disambiguating signal.
+    city and country are stored as their own columns (they drive the operator UI's
+    grouping), and address additionally falls back to city when the richer `address`
+    column is absent, so files written against the older header keep working; a full
+    street address is preferred because research_service passes it to the LLM as a
+    disambiguating signal.
 
     Dedupe is by normalized phone, within the tenant — both against rows already in the
     DB and against earlier rows in the same file, so re-uploading a list is a no-op
@@ -204,7 +219,12 @@ async def import_from_csv(
             continue
 
         website = normalize_website(_cell(row, "website"))
-        address = _cell(row, "address") or _cell(row, "city") or None
+        city = _cell(row, "city") or None
+        # `city` now has its own column, but address still falls back to it: address is
+        # what research_service passes to the scrape/LLM step as a disambiguating
+        # signal, so dropping the fallback would silently degrade research for any file
+        # that only carries a city. The two holding the same value is a fair price.
+        address = _cell(row, "address") or city
 
         seen_phones.add(phone)
         prospect = Prospect(
@@ -217,6 +237,12 @@ async def import_from_csv(
             phone=phone,
             website=website,
             address=address,
+            city=city,
+            # Operator-typed and unvalidated, unlike the Places path's country, which
+            # comes from Google's canonical addressComponents. Near-duplicate spellings
+            # ("UK" vs "United Kingdom") will group separately in the UI — worth knowing
+            # before blaming the grouping code.
+            country=_cell(row, "country") or None,
             category=_cell(row, "niche") or None,
             source_query=_cell(row, "source") or source_query,
             # website is a scoring signal (see compute_priority), so a CSV row that
@@ -349,6 +375,21 @@ async def set_status(
     if not prospect:
         return None
     prospect.status = status
+    await db.commit()
+    await db.refresh(prospect)
+    return prospect
+
+
+async def set_notes(
+    db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.UUID, notes: str | None
+) -> Prospect | None:
+    """Set (or clear, with None/blank) the operator's hand-written context. Blank
+    normalizes to None so "no notes" has one representation rather than two.
+    """
+    prospect = await get_prospect(db, prospect_id, tenant_id)
+    if not prospect:
+        return None
+    prospect.prospect_notes = (notes or "").strip() or None
     await db.commit()
     await db.refresh(prospect)
     return prospect

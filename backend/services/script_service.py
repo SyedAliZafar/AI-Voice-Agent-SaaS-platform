@@ -29,12 +29,22 @@ def build_prospect_prompt(
     research: CompanyResearch,
     extra_never_say: list[str] | None = None,
     extra_never_promise: list[str] | None = None,
+    prospect_notes: str | None = None,
 ) -> str:
     """Inject a [COMPANY BRIEF] + [RULES] block into an existing campaign script.
     Idempotent-ish: always appends a fresh block, so re-running research and
     re-personalizing simply produces a new combined prompt (the caller decides
     whether to base off the original campaign prompt or a prior personalized one —
     test_call_service always starts from Agent.system_prompt, the source of truth).
+
+    `prospect_notes` is the operator's own hand-written context. It lands in its own
+    [OPERATOR NOTES] section *after* the researched brief and is described to the model
+    as outranking it, because a human who just got off the phone with this company knows
+    things the scraper cannot.
+
+    This function is the single place personalization is assembled, which is what makes
+    the sandbox test and the real call provably say the same thing — both endpoints in
+    api/prospects.py go through _place_personalized_call(), which calls only this.
     """
     hooks = "\n".join(f"  - {h}" for h in research.hooks) or "  - (no specific hook found)"
     pain_points = "\n".join(f"  - {p}" for p in research.pain_points) or "  - (none identified)"
@@ -44,6 +54,18 @@ def build_prospect_prompt(
 
     never_say = GLOBAL_NEVER_SAY + (extra_never_say or [])
     never_promise = GLOBAL_NEVER_PROMISE + (extra_never_promise or []) + research.do_not_mention
+
+    notes = (prospect_notes or "").strip()
+    notes_block = (
+        f"""
+
+[OPERATOR NOTES — {company_name}]
+The operator added this by hand. Where it conflicts with the company brief above,
+trust these notes — they are more recent and come from a human who knows this account.
+{notes}"""
+        if notes
+        else ""
+    )
 
     brief = f"""
 
@@ -66,4 +88,4 @@ Never promise: {", ".join(never_promise)}.
 If the prospect raises something not covered here, fall back to the base script's
 guardrails rather than guessing at facts about {company_name}."""
 
-    return campaign_system_prompt.rstrip() + brief
+    return campaign_system_prompt.rstrip() + brief + notes_block

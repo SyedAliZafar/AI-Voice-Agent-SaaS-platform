@@ -25,6 +25,15 @@ export interface LlmModelsResponse {
   default: string;
 }
 
+export interface CityAutocompleteResult {
+  place_id: string;
+  label: string;
+}
+
+export interface CityAutocompleteResponse {
+  suggestions: CityAutocompleteResult[];
+}
+
 export interface SandboxMessage {
   role: "user" | "assistant";
   content: string;
@@ -125,14 +134,23 @@ export interface Prospect {
   website: string | null;
   phone: string | null;
   address: string | null;
+  // Structured fields from Google Places' addressComponents, not parsed out of
+  // `address`. Null for rows discovered/imported before this existed.
+  city: string | null;
+  country: string | null;
   category: string | null;
   rating: number | null;
   review_count: number;
   source_query: string;
+  // The "where" of the discovery search that found this row. Null for CSV imports and
+  // for rows discovered before this was captured.
+  source_location: string | null;
 
   research_status: ResearchStatus;
   research: CompanyResearch;
   research_error: string | null;
+  // Operator-written context, injected into the call prompt alongside `research`.
+  prospect_notes: string | null;
 
   outreach_status: OutreachStatus;
   status: ProspectStatus;

@@ -53,7 +53,7 @@ async def _discover(
 
     async with AsyncSessionLocal() as db:
         prospects = await prospect_service.upsert_from_places(
-            db, uuid.UUID(tenant_id), places, source_query=query
+            db, uuid.UUID(tenant_id), places, source_query=query, source_location=location
         )
         # Only kick off research for rows that don't have it yet — re-running a
         # discovery query shouldn't re-research prospects we already know.

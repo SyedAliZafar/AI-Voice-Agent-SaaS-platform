@@ -198,6 +198,75 @@ async def test_stats_path_is_not_swallowed_by_the_uuid_route(client, auth_header
     assert resp.status_code == 200
 
 
+# --- city autocomplete -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_city_autocomplete_path_is_not_swallowed_by_the_uuid_route(client, auth_headers):
+    """Same route-ordering trap as /stats and /import-csv — declared above
+    /{prospect_id} so this doesn't 422 as an invalid UUID.
+    """
+    resp = await client.get(
+        "/api/prospects/city-autocomplete",
+        params={"input": "Br", "session_token": "s1"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_city_autocomplete_returns_suggestions(client, auth_headers, monkeypatch):
+    from backend.api import prospects as prospects_api
+
+    async def fake_autocomplete(input_text, session_token, region_code=None):
+        assert input_text == "Bri"
+        assert session_token == "session-1"
+        assert region_code is None
+        return [{"place_id": "place_bristol", "label": "Bristol, United Kingdom"}]
+
+    monkeypatch.setattr(prospects_api.places_service, "autocomplete_cities", fake_autocomplete)
+
+    resp = await client.get(
+        "/api/prospects/city-autocomplete",
+        params={"input": "Bri", "session_token": "session-1"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "suggestions": [{"place_id": "place_bristol", "label": "Bristol, United Kingdom"}]
+    }
+
+
+@pytest.mark.asyncio
+async def test_city_autocomplete_rejects_short_input_without_calling_google(
+    client, auth_headers, monkeypatch
+):
+    """Defense in depth beyond the frontend's debounce — a single keystroke must not
+    bill a Google request, whether the guard is bypassed by a bug or a direct hit.
+    """
+    from backend.api import prospects as prospects_api
+
+    called = False
+
+    async def fake_autocomplete(*args, **kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(prospects_api.places_service, "autocomplete_cities", fake_autocomplete)
+
+    resp = await client.get(
+        "/api/prospects/city-autocomplete",
+        params={"input": "B", "session_token": "s1"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"suggestions": []}
+    assert called is False
+
+
 # --- CSV import ------------------------------------------------------------------
 
 
@@ -243,7 +312,8 @@ async def test_import_csv_creates_prospects(client, db_session, tenant_id, auth_
     rows = await prospect_service.list_prospects(db_session, tenant_id)
     by_name = {p.name: p for p in rows}
     assert by_name["Acme HVAC"].phone == "+491701234567"
-    assert by_name["Acme HVAC"].address == "Berlin"  # city -> address
+    assert by_name["Acme HVAC"].city == "Berlin"  # city -> its own column
+    assert by_name["Acme HVAC"].address == "Berlin"  # ...and still the address fallback
     assert by_name["Acme HVAC"].category == "hvac"  # niche -> category
     assert by_name["Acme HVAC"].source_query == "cold-list"  # source -> source_query
     assert by_name["Acme HVAC"].status == "not_called"
@@ -366,6 +436,46 @@ async def test_import_csv_stores_website_and_address(client, db_session, tenant_
     assert rows["Sunbeam Solar"].website == "https://sunbeam.example"  # scheme added
     assert rows["Sunbeam Solar"].address == "Munich"  # falls back to city
 
+    # city keeps its own value either way — a richer address must not cost us the city.
+    assert rows["Acme HVAC"].city == "Berlin"
+    assert rows["Sunbeam Solar"].city == "Munich"
+
+
+@pytest.mark.asyncio
+async def test_import_csv_stores_country(client, db_session, tenant_id, auth_headers):
+    """Without this, every CSV row groups under "Unknown country" forever. Unlike the
+    Places path this value is operator-typed and unvalidated — stored verbatim.
+    """
+    content = "business_name,phone,city,country\n" + (
+        "Acme HVAC,+491701234567,Berlin,Germany\nBristol Solar,+441172510125,Bristol,\n"
+    )
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    rows = {p.name: p for p in await prospect_service.list_prospects(db_session, tenant_id)}
+    assert rows["Acme HVAC"].country == "Germany"
+    assert rows["Bristol Solar"].country is None  # blank stays null, not ""
+
+
+@pytest.mark.asyncio
+async def test_import_csv_without_a_country_column_still_works(
+    client, db_session, tenant_id, auth_headers
+):
+    """country is optional — files written against the older header must keep importing."""
+    content = CSV_HEADER + "Acme HVAC,+491701234567,Berlin,cold-list,hvac\n"
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    [prospect] = await prospect_service.list_prospects(db_session, tenant_id)
+    assert prospect.country is None
+    assert prospect.city == "Berlin"
+
 
 @pytest.mark.asyncio
 async def test_import_csv_reports_website_coverage(client, auth_headers):
@@ -465,3 +575,448 @@ async def test_imported_prospect_reaches_research_ready_via_the_pipeline(
     assert refreshed.research_status == "ready"
     assert refreshed.research_error is None
     assert refreshed.research["summary"] == "Family-run HVAC installer"
+
+
+# --- prospect_notes --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_prospect_has_no_notes(db_session, tenant_id):
+    prospect = await _make_prospect(db_session, tenant_id)
+    assert prospect.prospect_notes is None
+
+
+@pytest.mark.asyncio
+async def test_patch_sets_and_returns_notes(client, db_session, tenant_id, auth_headers):
+    prospect = await _make_prospect(db_session, tenant_id)
+
+    resp = await client.patch(
+        f"/api/prospects/{prospect.id}",
+        json={"prospect_notes": "Owner is Maria, only answers before 9am."},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["prospect_notes"] == "Owner is Maria, only answers before 9am."
+
+
+@pytest.mark.asyncio
+async def test_patch_can_clear_notes(client, db_session, tenant_id, auth_headers):
+    """An explicit null means "clear", which must not read as "field not supplied"."""
+    prospect = await _make_prospect(db_session, tenant_id)
+    await client.patch(
+        f"/api/prospects/{prospect.id}", json={"prospect_notes": "temp"}, headers=auth_headers
+    )
+
+    resp = await client.patch(
+        f"/api/prospects/{prospect.id}", json={"prospect_notes": None}, headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["prospect_notes"] is None
+
+
+@pytest.mark.asyncio
+async def test_blank_notes_normalize_to_null(client, db_session, tenant_id, auth_headers):
+    """One representation of "no notes", so build_prospect_prompt's blank check is the
+    only place emptiness has to be reasoned about.
+    """
+    prospect = await _make_prospect(db_session, tenant_id)
+
+    resp = await client.patch(
+        f"/api/prospects/{prospect.id}", json={"prospect_notes": "   \n "}, headers=auth_headers
+    )
+
+    assert resp.json()["prospect_notes"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_notes_leaves_the_status_axes_alone(
+    client, db_session, tenant_id, auth_headers
+):
+    prospect = await _make_prospect(db_session, tenant_id)
+    await prospect_service.set_status(db_session, prospect.id, tenant_id, "booked")
+
+    resp = await client.patch(
+        f"/api/prospects/{prospect.id}", json={"prospect_notes": "note"}, headers=auth_headers
+    )
+
+    body = resp.json()
+    assert body["prospect_notes"] == "note"
+    assert body["status"] == "booked"
+    assert body["outreach_status"] == "not_reached"
+
+
+@pytest.mark.asyncio
+async def test_patch_notes_is_tenant_scoped(client, db_session, other_auth_headers):
+    prospect = await _make_prospect(db_session, uuid.uuid4())
+
+    resp = await client.patch(
+        f"/api/prospects/{prospect.id}", json={"prospect_notes": "leak"}, headers=other_auth_headers
+    )
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_set_notes_rejects_other_tenant(db_session, tenant_id, other_tenant_id):
+    prospect = await _make_prospect(db_session, tenant_id)
+
+    result = await prospect_service.set_notes(db_session, prospect.id, other_tenant_id, "leak")
+
+    assert result is None
+    unchanged = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert unchanged.prospect_notes is None
+
+
+# --- personalized outbound call ---------------------------------------------------
+
+
+@pytest.fixture
+def placed_calls(monkeypatch) -> list[dict]:
+    """Capture what would have been dialed instead of spending a real, billed call.
+
+    Patched at backend.api.prospects.test_call_service so the router's own reference is
+    the one replaced — everything up to the Retell boundary stays the production path,
+    including prompt assembly, which is what these tests are actually about.
+    """
+    from backend.api import prospects as prospects_api
+
+    calls: list[dict] = []
+
+    async def fake_place_test_call(db, agent_id, tenant_id, to_number, system_prompt_override=None):
+        calls.append(
+            {
+                "agent_id": agent_id,
+                "to_number": to_number,
+                "prompt": system_prompt_override,
+            }
+        )
+        return {
+            "call_id": f"mock_call_{len(calls)}",
+            "from_number": "+10000000000",
+            "status": "dialing",
+        }
+
+    monkeypatch.setattr(prospects_api.test_call_service, "place_test_call", fake_place_test_call)
+    return calls
+
+
+async def _researched_prospect(db_session, tenant_id, notes=None):
+    prospect = await _make_prospect(db_session, tenant_id, "Acme HVAC", "p_call")
+    prospect.phone = "+491701111111"
+    await prospect_service.mark_research_ready(
+        db_session,
+        prospect.id,
+        CompanyResearch(summary="Family-run HVAC installer", hooks=["New Berlin depot"]),
+    )
+    if notes is not None:
+        await prospect_service.set_notes(db_session, prospect.id, tenant_id, notes)
+    return await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+
+
+async def _agent(db_session, tenant_id):
+    from backend.schemas.agent import AgentCreate
+    from backend.services import agent_service
+
+    return await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", system_prompt="[ROLE] You are Alex.", platform="retell"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_dials_the_prospects_own_number_by_default(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert placed_calls[0]["to_number"] == prospect.phone
+
+
+@pytest.mark.asyncio
+async def test_call_advances_outreach_counters(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert refreshed.call_count == 1
+    assert refreshed.outreach_status == "reached"
+
+
+@pytest.mark.asyncio
+async def test_call_injects_research_and_notes(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    """What the agent is told to say must carry the base script, the researched brief,
+    and the operator's own notes — all three, assembled by build_prospect_prompt.
+    """
+    prospect = await _researched_prospect(
+        db_session, tenant_id, notes="Owner is Maria, only answers before 9am."
+    )
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    prompt = placed_calls[0]["prompt"]
+    assert "[ROLE] You are Alex." in prompt  # base script preserved
+    assert "Family-run HVAC installer" in prompt  # research
+    assert "New Berlin depot" in prompt  # research
+    assert "Owner is Maria" in prompt  # operator notes
+
+
+@pytest.mark.asyncio
+async def test_call_requires_ready_research(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    prospect = await _make_prospect(db_session, tenant_id)  # research_status stays "pending"
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+    assert placed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_call_is_tenant_scoped(
+    client, db_session, tenant_id, other_auth_headers, placed_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=other_auth_headers,
+    )
+
+    assert resp.status_code == 404
+    assert placed_calls == []
+
+
+# --- prospect sandbox chat ---------------------------------------------------------
+
+
+@pytest.fixture
+def chat_calls(monkeypatch) -> list[dict]:
+    """Capture what would have been sent to the LLM, instead of spending a real,
+    billed completion. Patched at llm_service.get_agent_response — the one function
+    sandbox_service.chat() (and therefore the sandbox-chat route) ultimately calls.
+    """
+    from backend.services import llm_service
+
+    calls: list[dict] = []
+
+    async def fake_get_agent_response(
+        system_prompt, messages, caller_context, *, model=None, tools_enabled=True, **kwargs
+    ):
+        calls.append(
+            {
+                "system_prompt": system_prompt,
+                "messages": messages,
+                "model": model,
+                "tools_enabled": tools_enabled,
+            }
+        )
+        return "Hi, thanks for calling!"
+
+    monkeypatch.setattr(llm_service, "get_agent_response", fake_get_agent_response)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_returns_a_reply(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "Hi, thanks for calling!"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_never_dials_a_phone(
+    client, db_session, tenant_id, auth_headers, chat_calls, placed_calls
+):
+    """The entire point of this endpoint — text only, no telephony."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert placed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_does_not_advance_outreach_counters(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    """Nobody at the company was reached — a text test must not move campaign state."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert refreshed.call_count == 0
+    assert refreshed.outreach_status == "not_reached"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_disables_tools(client, db_session, tenant_id, auth_headers, chat_calls):
+    """book_appointment/create_lead must never fire against this specific real
+    prospect's calendar/CRM just because the operator was testing a pitch.
+    """
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert chat_calls[0]["tools_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_and_real_call_inject_identical_personalization(
+    client, db_session, tenant_id, auth_headers, chat_calls, placed_calls
+):
+    """The guarantee the whole feature rests on: what you read in the sandbox chat is
+    what the real call will say. Both paths call script_service.build_prospect_prompt
+    with the same arguments, so this fails the moment one of them drifts.
+    """
+    prospect = await _researched_prospect(
+        db_session, tenant_id, notes="Owner is Maria, only answers before 9am."
+    )
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    chat_prompt = chat_calls[0]["system_prompt"]
+    call_prompt = placed_calls[0]["prompt"]
+    assert chat_prompt == call_prompt
+    assert "[ROLE] You are Alex." in chat_prompt
+    assert "Family-run HVAC installer" in chat_prompt
+    assert "Owner is Maria" in chat_prompt
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_passes_through_the_chosen_model(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={
+            "agent_id": str(agent.id),
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-4o-mini",
+        },
+        headers=auth_headers,
+    )
+
+    assert chat_calls[0]["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_requires_ready_research(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    prospect = await _make_prospect(db_session, tenant_id)  # research_status stays "pending"
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+    assert chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_404s_for_unknown_agent(
+    client, db_session, tenant_id, auth_headers, chat_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(uuid.uuid4()), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 404
+    assert chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_chat_is_tenant_scoped(
+    client, db_session, tenant_id, other_auth_headers, chat_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/sandbox-chat",
+        json={"agent_id": str(agent.id), "messages": [{"role": "user", "content": "Hello"}]},
+        headers=other_auth_headers,
+    )
+
+    assert resp.status_code == 404
+    assert chat_calls == []

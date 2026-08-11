@@ -3,7 +3,9 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from backend.schemas.agent import SandboxMessage, _validate_llm_model
 
 
 class CompanyResearch(BaseModel):
@@ -35,14 +37,21 @@ class ProspectResponse(BaseModel):
     website: str | None
     phone: str | None
     address: str | None
+    # Structured fields sourced from Google Places' addressComponents, not parsed out of
+    # `address` — see backend/models/prospect.py. Null for rows discovered/imported
+    # before this existed, and for CSV rows (country has no CSV column yet).
+    city: str | None
+    country: str | None
     category: str | None
     rating: float | None
     review_count: int
     source_query: str
+    source_location: str | None
 
     research_status: str
     research: CompanyResearch
     research_error: str | None
+    prospect_notes: str | None
 
     outreach_status: str
     status: str
@@ -59,6 +68,10 @@ class ProspectUpdate(BaseModel):
     outreach_status: str | None = None  # not_reached | reached | callback | do_not_call
     status: str | None = None
     # not_called | called | booked | flagged | no_answer | do_not_call
+
+    # None is a real value here (clear the notes), so the router keys off
+    # model_fields_set rather than truthiness to tell "clear" from "not supplied".
+    prospect_notes: str | None = None
 
 
 class CsvImportResult(BaseModel):
@@ -98,6 +111,37 @@ class ProspectStats(BaseModel):
     do_not_call: int = 0
 
 
+class CityAutocompleteResult(BaseModel):
+    place_id: str
+    label: str  # e.g. "Bristol, United Kingdom" — shown verbatim in the suggestion list
+
+
+class CityAutocompleteResponse(BaseModel):
+    suggestions: list[CityAutocompleteResult]
+
+
 class ProspectCallRequest(BaseModel):
     agent_id: uuid.UUID
     to_number: str | None = None  # defaults to the prospect's stored phone if omitted
+
+
+class ProspectSandboxChatRequest(BaseModel):
+    """Text-chat sandbox for one prospect's personalized script. Reuses SandboxMessage
+    from schemas.agent rather than redefining it — same shape, one type.
+
+    tools_enabled is deliberately NOT exposed here (unlike the agent-level sandbox,
+    which lets the operator opt in): book_appointment/create_lead firing real HTTP
+    calls against a *specific real prospect's* calendar/CRM while the operator is only
+    testing a pitch is a worse accident than the generic agent sandbox risks.
+    """
+
+    agent_id: uuid.UUID
+    messages: list[SandboxMessage] = Field(min_length=1, max_length=50)
+    model: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: str | None) -> str | None:
+        if value:
+            return _validate_llm_model(value)
+        return value

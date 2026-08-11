@@ -52,6 +52,37 @@ async def test_upsert_from_places_dedupes_by_place_id(db_session, tenant_id):
 
 
 @pytest.mark.asyncio
+async def test_upsert_persists_city_and_country(db_session, tenant_id):
+    """places_service extracts these from Google's typed addressComponents; if the
+    upsert drops them, every discovered prospect lands ungrouped.
+    """
+    place = {
+        "google_place_id": "place_geo",
+        "name": "Acme Solar",
+        "address": "13 Harbury Rd, Bristol BS9 4PN, UK",
+        "city": "Bristol",
+        "country": "United Kingdom",
+    }
+
+    [created] = await prospect_service.upsert_from_places(db_session, tenant_id, [place], "solar")
+    assert created.city == "Bristol"
+    assert created.country == "United Kingdom"
+
+    # A later run that resolves a different city (Google refined it) must update, and a
+    # run that reports nothing must not wipe what we already knew.
+    [moved] = await prospect_service.upsert_from_places(
+        db_session, tenant_id, [{**place, "city": "Clevedon"}], "solar"
+    )
+    assert moved.city == "Clevedon"
+
+    [unchanged] = await prospect_service.upsert_from_places(
+        db_session, tenant_id, [{**place, "city": None, "country": None}], "solar"
+    )
+    assert unchanged.city == "Clevedon"
+    assert unchanged.country == "United Kingdom"
+
+
+@pytest.mark.asyncio
 async def test_upsert_does_not_clobber_research_or_outreach_state(db_session, tenant_id):
     place = {"google_place_id": "place_2", "name": "Beta Clinic", "rating": 4.0, "review_count": 10}
     [prospect] = await prospect_service.upsert_from_places(

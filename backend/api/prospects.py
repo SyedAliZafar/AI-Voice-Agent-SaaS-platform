@@ -12,17 +12,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_tenant
 from backend.database import get_db
-from backend.schemas.agent import TestCallResponse
+from backend.schemas.agent import SandboxChatResponse, TestCallResponse
 from backend.schemas.prospect import (
+    CityAutocompleteResponse,
+    CityAutocompleteResult,
     CompanyResearch,
     CsvImportResult,
     DiscoverRequest,
     ProspectCallRequest,
     ProspectResponse,
+    ProspectSandboxChatRequest,
     ProspectStats,
     ProspectUpdate,
 )
-from backend.services import agent_service, prospect_service, script_service, test_call_service
+from backend.services import (
+    agent_service,
+    llm_service,
+    places_service,
+    prospect_service,
+    sandbox_service,
+    script_service,
+    test_call_service,
+)
 from backend.workers.prospect_tasks import discover_prospects, research_prospect
 
 router = APIRouter()
@@ -54,8 +65,8 @@ async def import_csv(
 ):
     """Bulk-create prospects from an operator's list, then research each imported row.
 
-    Columns: business_name, phone (required); city, source, niche, website, address
-    (optional). Bad rows are skipped and counted rather than failing the upload — see
+    Columns: business_name, phone (required); city, country, source, niche, website,
+    address (optional). Bad rows are skipped and counted rather than failing the upload — see
     CsvImportResult, whose with_website/without_website split says how many of the
     imported rows will get degraded (name-only) research.
 
@@ -83,6 +94,31 @@ async def import_csv(
     for prospect_id in result.imported_ids:
         research_prospect.delay(str(prospect_id))
     return result
+
+
+@router.get("/city-autocomplete", response_model=CityAutocompleteResponse)
+async def city_autocomplete(
+    input: str,
+    session_token: str,
+    region_code: str | None = None,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """Type-ahead suggestions for the discovery "Where" field. Declared above
+    /{prospect_id} so the literal path wins the route match (same reasoning as
+    /stats and /import-csv above).
+
+    tenant_id is required even though this route reads nothing tenant-scoped: without
+    auth, this would be a free, unauthenticated relay onto a billed Google SKU.
+
+    A short input is rejected before ever reaching Google — defense in depth beyond
+    the frontend's own debounce, since a client bug or a direct hit on this endpoint
+    shouldn't be able to bill a request per keystroke.
+    """
+    if len(input.strip()) < 2:
+        return CityAutocompleteResponse(suggestions=[])
+
+    suggestions = await places_service.autocomplete_cities(input, session_token, region_code)
+    return CityAutocompleteResponse(suggestions=[CityAutocompleteResult(**s) for s in suggestions])
 
 
 @router.get("", response_model=list[ProspectResponse])
@@ -154,13 +190,21 @@ async def update_prospect(
         raise HTTPException(status_code=422, detail=f"Invalid status: {payload.status}")
 
     prospect = None
+    if "prospect_notes" in payload.model_fields_set:
+        # Keyed on model_fields_set, not truthiness: an explicit null/"" means "clear
+        # these notes", which is indistinguishable from "not supplied" otherwise.
+        prospect = await prospect_service.set_notes(
+            db, prospect_id, tenant_id, payload.prospect_notes
+        )
     if payload.outreach_status:
         prospect = await prospect_service.set_outreach_status(
             db, prospect_id, tenant_id, payload.outreach_status
         )
     if payload.status:
         prospect = await prospect_service.set_status(db, prospect_id, tenant_id, payload.status)
-    if prospect is None and not (payload.outreach_status or payload.status):
+    if prospect is None and not (
+        payload.outreach_status or payload.status or "prospect_notes" in payload.model_fields_set
+    ):
         prospect = await prospect_service.get_prospect(db, prospect_id, tenant_id)
 
     if not prospect:
@@ -175,9 +219,10 @@ async def call_prospect(
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
-    """Personalizes the given agent's campaign script with this prospect's research
-    ([COMPANY BRIEF] injection — script_service.build_prospect_prompt) and places the
-    call via the same Retell provisioning path as a plain test call.
+    """Personalizes the given agent's campaign script with this prospect's research and
+    operator notes ([COMPANY BRIEF] + [OPERATOR NOTES] injection —
+    script_service.build_prospect_prompt) and places the call via the same Retell
+    provisioning path as a plain test call.
     """
     prospect = await prospect_service.get_prospect(db, prospect_id, tenant_id)
     if not prospect:
@@ -198,7 +243,10 @@ async def call_prospect(
 
     research = CompanyResearch.model_validate(prospect.research or {})
     personalized_prompt = script_service.build_prospect_prompt(
-        agent.system_prompt, prospect.name, research
+        agent.system_prompt,
+        prospect.name,
+        research,
+        prospect_notes=prospect.prospect_notes,
     )
 
     try:
@@ -213,4 +261,63 @@ async def call_prospect(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     await prospect_service.record_call(db, prospect_id, tenant_id)
+    return result
+
+
+@router.post("/{prospect_id}/sandbox-chat", response_model=SandboxChatResponse)
+async def prospect_sandbox_chat(
+    prospect_id: uuid.UUID,
+    payload: ProspectSandboxChatRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Hear how this agent would talk to this specific prospect, over text — no phone
+    call, no telephony spend.
+
+    Builds the exact same prompt /call would (agent's base script + this prospect's
+    researched [COMPANY BRIEF] + [OPERATOR NOTES] via script_service.build_prospect_prompt)
+    and runs it through sandbox_service.chat() — the same stateless text-chat mechanism
+    /api/agents/{id}/sandbox-chat uses. What the operator sees here is provably what the
+    real call would say, because both paths build the prompt through the one function.
+
+    Lives here rather than in api/agents.py because it needs prospect_id to resolve
+    research/prospect_notes via the tenant-scoped prospect_service.get_prospect() —
+    exactly the same reasoning /call already follows.
+    """
+    prospect = await prospect_service.get_prospect(db, prospect_id, tenant_id)
+    if not prospect:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+    if prospect.research_status != "ready":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Prospect research is '{prospect.research_status}', not ready yet",
+        )
+
+    agent = await agent_service.get_agent(db, payload.agent_id, tenant_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    research = CompanyResearch.model_validate(prospect.research or {})
+    personalized_prompt = script_service.build_prospect_prompt(
+        agent.system_prompt,
+        prospect.name,
+        research,
+        prospect_notes=prospect.prospect_notes,
+    )
+
+    try:
+        result = await sandbox_service.chat(
+            db,
+            payload.agent_id,
+            tenant_id,
+            [m.model_dump() for m in payload.messages],
+            system_prompt_override=personalized_prompt,
+            model=payload.model,
+            tools_enabled=False,
+        )
+    except sandbox_service.SandboxError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except llm_service.LLMConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     return result
