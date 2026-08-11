@@ -3,6 +3,24 @@
 Two ways to run this locally: full Docker Compose stack, or manual (backend/frontend
 in your own terminals). Pick one.
 
+## The database is shared — read this first
+
+Everyone on the team points at **one Neon Postgres**, so a call placed or a prospect
+searched on your machine is immediately visible on your teammate's. Nothing about the
+data lives in git.
+
+- Get the connection string from a teammate (it is not committed) and put it in your
+  own `.env` as `DATABASE_URL`. Two edits to what Neon's dashboard shows you, both
+  required: `postgresql+asyncpg://` instead of `postgresql://`, and `?ssl=require`
+  instead of `?sslmode=require` (asyncpg rejects the latter).
+- **A fresh clone does not need to run migrations** — the schema is already applied on
+  the shared instance. Only run them when you add a new migration.
+- `docker compose` no longer starts a local Postgres. It is behind a `local-db` profile
+  precisely so it can't silently shadow the shared one and give you a private, diverging
+  copy. If you deliberately want throwaway local data, see `.env.example`.
+- Since you share a database, you also share its state: a destructive migration or a
+  bulk delete hits your teammate too. Say so before you run one.
+
 ## Troubleshooting quick reference
 
 | Symptom | What to do |
@@ -20,12 +38,13 @@ in your own terminals). Pick one.
 ## Option A — Docker Compose (everything, including the worker)
 
 ```bash
-cp .env.example .env   # fill in real API keys
+cp .env.example .env   # fill in real API keys + the shared DATABASE_URL
 docker compose up --build
 ```
 
-Starts postgres, redis, minio, the API (`:8000`), and the Celery worker together.
-Then in a separate terminal for the frontend:
+Starts redis, minio, the API (`:8000`), and the Celery worker together — the database is
+the shared Neon instance from your `.env`, not a container. Then in a separate terminal
+for the frontend:
 
 ```bash
 cd frontend
@@ -40,15 +59,23 @@ You'll need an auth token before either is useful — see "Getting an auth token
 ## Option B — Manual (run pieces yourself)
 
 ```bash
-# infra only
-docker compose up -d postgres redis minio
+# infra only (no postgres — the DB is the shared Neon instance in .env)
+docker compose up -d redis minio
 
-# deps + migrations
+# deps
 uv sync --extra dev
-cd backend/migrations && uv run alembic upgrade head && cd ../..
 
 # API
 uv run uvicorn backend.main:app --reload
+```
+
+No migration step: the shared database already has the schema. When you *do* add a
+migration, run it from the repo root — `alembic.ini` sets `script_location` relative to
+the current directory, and `config.py` reads `.env` relative to it too, so running from
+inside `backend/migrations` finds neither:
+
+```bash
+uv run alembic -c backend/migrations/alembic.ini upgrade head
 ```
 
 Then, in a separate terminal, start the Celery worker:

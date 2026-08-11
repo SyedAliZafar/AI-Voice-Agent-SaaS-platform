@@ -16,8 +16,11 @@ uv run pytest                    # run tests
 uv run ruff check .              # lint
 uv run ruff format .             # format
 uv run mypy backend              # type check
-uv run alembic upgrade head      # apply migrations
-uv run alembic revision --autogenerate -m "..."  # new migration
+uv run alembic -c backend/migrations/alembic.ini upgrade head      # apply migrations
+uv run alembic -c backend/migrations/alembic.ini revision --autogenerate -m "..."  # new migration
+# Run both from the repo root: alembic.ini resolves script_location, and config.py finds
+# .env, relative to the CWD. They also hit the SHARED Neon database — a migration you
+# apply lands on your teammates immediately. See RUN.md.
 uv run celery -A backend.workers.celery_app worker --loglevel=info  # run worker
 ```
 

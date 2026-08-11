@@ -1,6 +1,13 @@
 services:
+  # Local Postgres is now OPT-IN (`--profile local-db`). The shared Neon instance in .env
+  # is the default so both devs read and write the same calls/prospects/leads — a local
+  # container DB would silently give each machine its own private, diverging copy.
+  # Only start this if you deliberately want throwaway local data:
+  #   docker compose --profile local-db up -d postgres
+  # and point DATABASE_URL at localhost:5433 (see .env for that string).
   postgres:
     image: postgres:16-alpine
+    profiles: ["local-db"]
     environment:
       POSTGRES_USER: voiceagent
       POSTGRES_PASSWORD: voiceagent
@@ -38,7 +45,10 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://voiceagent:voiceagent@postgres:5432/voiceagent
+      # DATABASE_URL is deliberately NOT set here. A value in this block overrides
+      # env_file, so hardcoding the local container DB (as this once did) silently
+      # ignored the shared Neon URL in .env and gave each dev a private database.
+      # Redis/MinIO stay per-machine, so those still get compose-network overrides.
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
@@ -48,8 +58,6 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_started
     volumes:
@@ -146,7 +154,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://voiceagent:voiceagent@postgres:5432/voiceagent
+      # See the api service above for why DATABASE_URL must not be set here.
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
@@ -154,8 +162,6 @@ services:
       # host-run tooling.
       CLOUDFLARED_METRICS_URL: http://tunnel-quick:20241
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_started
     volumes:
