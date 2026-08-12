@@ -56,3 +56,10 @@ docker-compose up        # postgres, redis, minio, api, worker
   (see ADR-005).
 - Run `uv run ruff check .` and `uv run pytest` before considering backend work done.
 - Never commit `.env` — only `.env.example` with placeholder values.
+
+## Docs
+- After a batch of structural work (new file/module, a flow changes, a change-recipe
+  row goes stale, an ADR-worthy decision), sync CONTEXT.md/FRONTEND.md in a dedicated
+  `docs: sync ...` commit before moving to the next unrelated task — see `16ccfb9` for
+  the pattern. Don't update docs for bug fixes or internal refactors that don't change
+  file roles or flow.
