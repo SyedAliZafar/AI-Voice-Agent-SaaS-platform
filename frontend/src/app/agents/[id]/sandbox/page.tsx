@@ -4,8 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { PromptEditor } from "@/components/features/agents/PromptEditor";
-import { ArrowLeftIcon, RefreshIcon, SparkleIcon } from "@/components/icons";
+import { ArrowLeftIcon, MicIcon, RefreshIcon, SparkleIcon } from "@/components/icons";
 import { Button, Card, Skeleton } from "@/components/ui";
+import { useSpeechToText } from "@/hooks/useSpeechToText";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { Agent, LlmModel, SandboxChatResponse, SandboxMessage } from "@/lib/types";
 
@@ -22,6 +23,7 @@ export default function AgentSandboxPage({ params }: { params: { id: string } })
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const { isListening, isSupported, start, stop } = useSpeechToText(setInput);
 
   useEffect(() => {
     api.get<Agent>(`/agents/${params.id}`).then((res) => {
@@ -133,6 +135,12 @@ export default function AgentSandboxPage({ params }: { params: { id: string } })
             {sending && <p className="text-xs text-slate-400">Thinking…</p>}
           </div>
           {error && <p className="border-t border-slate-100 px-5 py-2 text-xs text-red-600">{error}</p>}
+          {isListening && (
+            <p className="flex items-center gap-1.5 border-t border-slate-100 px-5 py-1.5 text-xs text-red-600">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
+              Listening…
+            </p>
+          )}
           <div className="flex items-center gap-2 border-t border-slate-100 p-3">
             <input
               value={input}
@@ -145,6 +153,15 @@ export default function AgentSandboxPage({ params }: { params: { id: string } })
               }}
               placeholder="Type what the caller would say…"
               className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-brand-300 focus:outline-none"
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<MicIcon width={14} height={14} className={isListening ? "animate-pulse" : undefined} />}
+              onClick={() => (isListening ? stop() : start())}
+              disabled={!isSupported || sending}
+              title={isSupported ? "Speak your message" : "Speech input isn't supported in this browser"}
+              className={isListening ? "bg-red-50 text-red-600 hover:bg-red-100" : undefined}
             />
             <Button size="sm" onClick={sendMessage} disabled={sending || !input.trim()}>
               {sending ? "Sending…" : "Send"}

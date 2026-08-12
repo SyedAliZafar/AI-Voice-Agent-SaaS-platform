@@ -175,6 +175,15 @@ export function RefreshIcon(props: IconProps) {
   );
 }
 
+export function MicIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M5 10a7 7 0 0 0 14 0M12 19v3" />
+    </Base>
+  );
+}
+
 /** Brand mark — rounded square with a stylized sound wave. */
 export function BrandMark(props: IconProps) {
   return (
