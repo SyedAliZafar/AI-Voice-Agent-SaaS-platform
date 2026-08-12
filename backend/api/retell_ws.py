@@ -228,15 +228,40 @@ def _ledger_note(entries: list[dict[str, Any]]) -> str:
     return "Already completed on this call — do NOT repeat these:\n" + "\n".join(lines)
 
 
+_DATA_CAPTURE_BLOCK = (
+    "[DATA_CAPTURE]\n"
+    "When you capture a spoken name or email address:\n"
+    "- Never repeat a guessed spelling back as a statement of fact. After the caller says "
+    "an uncommon or ambiguous-sounding name, ask them to spell it, then read it back "
+    "letter-by-letter using the NATO phonetic alphabet (e.g. 'S as in Sierra, H as in "
+    "Hotel, A as in Alpha...') and wait for explicit yes/no confirmation before moving on "
+    "or calling any tool with it.\n"
+    "- If the caller corrects you, do not guess again — ask them to spell just the part "
+    "you got wrong, or the whole word if that's easier for them, then re-confirm the same "
+    "way.\n"
+    "- When you say an email address out loud, always speak it as words, never symbols: "
+    "say 'at' for '@' and 'dot' for '.' (e.g. 'syed dot ali at gmail dot com'). Never say "
+    "'at the rate' or any other rendering of '@'.\n"
+    "- Only pass a name or email to a tool call once the caller has confirmed it back to "
+    "you as correct."
+)
+
+
 def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zone: str) -> str:
-    """Appends CONTEXT.md's documented "[CONTEXT] Current time / Caller number" block to
-    the agent's own prompt.
+    """Appends CONTEXT.md's documented "[CONTEXT] Current time / Caller number" block,
+    plus a [DATA_CAPTURE] block, to the agent's own prompt.
 
     The model otherwise has no idea what day it is, and it shows: on a real test call on
     2026-08-05 the LLM invented "2024-08-06" and "2025-08-06" as start_time values for
     book_appointment, so every booking landed in the past. The prompt architecture in
     CONTEXT.md always specified this block — it just was never implemented on the
     custom-LLM path.
+
+    [DATA_CAPTURE] exists for the same reason: a real call on 2026-08-12 showed the model
+    guessing at a caller's name spelling repeatedly instead of confirming letter-by-letter,
+    and reading "@" back in a way Retell's TTS rendered as "at the rate" instead of "at" —
+    both silently wrong without an explicit instruction, since nothing in an agent's own
+    persona prompt is expected to cover call-mechanics like this.
 
     Rebuilt per turn rather than once per connection so a long call can't drift across
     midnight, and stated in the agent's own calendar timezone so "tomorrow at 2pm" means
@@ -250,7 +275,8 @@ def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zon
         f"Today's date in ISO format is {now.date().isoformat()}. When the caller says a "
         f"relative day like 'tomorrow' or 'next Tuesday', resolve it against that date and "
         f"always pass a full ISO 8601 start_time in the CURRENT year.\n"
-        f"Caller's phone number: {caller_number or 'unknown'}."
+        f"Caller's phone number: {caller_number or 'unknown'}.\n\n"
+        f"{_DATA_CAPTURE_BLOCK}"
     )
 
 
