@@ -4,10 +4,10 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { AgentCard } from "@/components/features/agents/AgentCard";
-import { AgentFilters } from "@/components/features/agents/AgentFilters";
-import { AgentsIcon, PlusIcon } from "@/components/icons";
+import { AgentCategoryTiles } from "@/components/features/agents/AgentCategoryTiles";
+import { ArrowLeftIcon, AgentsIcon, PlusIcon } from "@/components/icons";
 import { Button, EmptyState, PageHeader, Skeleton } from "@/components/ui";
-import { agentOptions, parseAgentName } from "@/lib/agentGrouping";
+import { parseAgentName, sortLabels } from "@/lib/agentGrouping";
 import { api } from "@/lib/api";
 import { Agent } from "@/lib/types";
 
@@ -31,24 +31,13 @@ function AgentsPageInner() {
   const searchParams = useSearchParams();
 
   const industryFilter = searchParams.get("industry") || "";
-  const serviceFilter = searchParams.get("service") || "";
-  const styleFilter = searchParams.get("style") || "";
 
-  // Reflects filters into the URL (shareable, survives refresh) rather than into
-  // component state — same pattern as ProspectsPage's setParam.
-  function setParam(key: string, value: string) {
+  // Reflects the selected category into the URL (shareable, survives refresh) —
+  // same pattern as ProspectsPage's setParam.
+  function selectIndustry(value: string) {
     const params = new URLSearchParams(searchParams.toString());
-    if (value) params.set(key, value);
-    else params.delete(key);
-    const query = params.toString();
-    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
-  }
-
-  function clearFilters() {
-    const params = new URLSearchParams(searchParams.toString());
-    params.delete("industry");
-    params.delete("service");
-    params.delete("style");
+    if (value) params.set("industry", value);
+    else params.delete("industry");
     const query = params.toString();
     router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
   }
@@ -61,19 +50,21 @@ function AgentsPageInner() {
       .finally(() => setLoading(false));
   }, []);
 
-  const industryOptions = useMemo(() => agentOptions(agents, "industry"), [agents]);
-  const serviceOptions = useMemo(() => agentOptions(agents, "service"), [agents]);
-  const styleOptions = useMemo(() => agentOptions(agents, "style"), [agents]);
+  const categories = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const agent of agents) {
+      const { industry } = parseAgentName(agent.name);
+      counts.set(industry, (counts.get(industry) || 0) + 1);
+    }
+    return sortLabels([...counts.keys()]).map((industry) => ({
+      industry,
+      count: counts.get(industry)!,
+    }));
+  }, [agents]);
 
-  const filteredAgents = agents.filter((agent) => {
-    const parsed = parseAgentName(agent.name);
-    if (industryFilter && parsed.industry !== industryFilter) return false;
-    if (serviceFilter && parsed.service !== serviceFilter) return false;
-    if (styleFilter && parsed.style !== styleFilter) return false;
-    return true;
-  });
-
-  const hasFilter = industryFilter || serviceFilter || styleFilter;
+  const filteredAgents = agents.filter(
+    (agent) => parseAgentName(agent.name).industry === industryFilter,
+  );
 
   return (
     <div className="animate-fade-in">
@@ -108,32 +99,30 @@ function AgentsPageInner() {
             </Button>
           }
         />
+      ) : !industryFilter ? (
+        <AgentCategoryTiles categories={categories} onSelect={selectIndustry} />
       ) : (
         <>
-          <AgentFilters
-            industry={industryFilter}
-            service={serviceFilter}
-            style={styleFilter}
-            industryOptions={industryOptions}
-            serviceOptions={serviceOptions}
-            styleOptions={styleOptions}
-            onIndustryChange={(v) => setParam("industry", v)}
-            onServiceChange={(v) => setParam("service", v)}
-            onStyleChange={(v) => setParam("style", v)}
-            onClear={clearFilters}
-          />
+          <div className="mb-4 flex items-center gap-3">
+            <button
+              onClick={() => selectIndustry("")}
+              className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800"
+            >
+              <ArrowLeftIcon width={16} height={16} /> All categories
+            </button>
+            <span className="text-sm text-slate-300">/</span>
+            <span className="text-sm font-medium text-slate-700">{industryFilter}</span>
+          </div>
 
           {filteredAgents.length === 0 ? (
             <EmptyState
               icon={<AgentsIcon />}
-              title="No agents match these filters"
-              description="Try a different industry, service, or style, or clear the filters above."
+              title="No agents in this category"
+              description="Pick a different category, or create one here."
               action={
-                hasFilter ? (
-                  <Button variant="secondary" onClick={clearFilters}>
-                    Clear filters
-                  </Button>
-                ) : undefined
+                <Button variant="secondary" onClick={() => selectIndustry("")}>
+                  All categories
+                </Button>
               }
             />
           ) : (

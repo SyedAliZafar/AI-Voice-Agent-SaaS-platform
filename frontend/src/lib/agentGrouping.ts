@@ -1,4 +1,3 @@
-import { Agent } from "@/lib/types";
 import { sortLabels, UNSPECIFIED } from "@/lib/prospectGrouping";
 
 export { sortLabels, UNSPECIFIED };
@@ -35,8 +34,4 @@ export function parseAgentName(name: string): ParsedAgentName {
 
   const service = parts[1].replace(VERSION_SUFFIX, "").trim() || UNSPECIFIED;
   return { industry, service, style: UNSPECIFIED };
-}
-
-export function agentOptions(agents: Agent[], key: keyof ParsedAgentName): string[] {
-  return sortLabels([...new Set(agents.map((a) => parseAgentName(a.name)[key]))]);
 }
