@@ -18,6 +18,7 @@ interface TestCallResult {
 
 export default function AgentDetailPage({ params }: { params: { id: string } }) {
   const [agent, setAgent] = useState<Agent | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [regenerating, setRegenerating] = useState(false);
   const [toNumber, setToNumber] = useState("");
   const [calling, setCalling] = useState(false);
@@ -30,7 +31,10 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   const router = useRouter();
 
   useEffect(() => {
-    api.get<Agent>(`/agents/${params.id}`).then((res) => setAgent(res.data)).catch(() => {});
+    api
+      .get<Agent>(`/agents/${params.id}`)
+      .then((res) => setAgent(res.data))
+      .catch((err) => setLoadError(getApiErrorMessage(err, "Couldn't load this agent.")));
     api
       .get<{ models: LlmModel[]; default: string }>("/agents/models")
       .then((res) => {
@@ -39,6 +43,25 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
       })
       .catch(() => setModels([]));
   }, [params.id]);
+
+  if (loadError) {
+    return (
+      <div className="animate-fade-in">
+        <button
+          onClick={() => router.push("/agents")}
+          className="mb-4 inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800"
+        >
+          <ArrowLeftIcon width={16} height={16} /> Back to agents
+        </button>
+        <Card className="p-6 text-center">
+          <p className="text-sm font-medium text-slate-900">{loadError}</p>
+          <p className="mt-1 text-sm text-slate-500">
+            This agent may not exist, or your session may need refreshing.
+          </p>
+        </Card>
+      </div>
+    );
+  }
 
   if (!agent) {
     return (
