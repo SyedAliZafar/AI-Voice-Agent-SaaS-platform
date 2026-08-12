@@ -63,6 +63,7 @@ export interface Call {
   duration_sec: number;
   sentiment_score: number | null;
   started_at: string;
+  cost_usd: number;
 }
 
 export interface TranscriptTurn {

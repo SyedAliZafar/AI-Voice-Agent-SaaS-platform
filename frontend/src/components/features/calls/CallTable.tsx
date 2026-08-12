@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 
-import { CALL_STATUS_META, formatDuration, sentimentMeta } from "@/lib/format";
+import { CALL_STATUS_META, formatCost, formatDuration, sentimentMeta } from "@/lib/format";
 import { Call } from "@/lib/types";
 
 export function CallTable({ calls }: { calls: Call[] }) {
@@ -22,7 +22,8 @@ export function CallTable({ calls }: { calls: Call[] }) {
             <th className="py-2.5 pr-2 font-medium">Caller</th>
             <th className="py-2.5 px-2 font-medium">Status</th>
             <th className="py-2.5 px-2 font-medium">Sentiment</th>
-            <th className="py-2.5 pl-2 text-right font-medium">Duration</th>
+            <th className="py-2.5 px-2 text-right font-medium">Duration</th>
+            <th className="py-2.5 pl-2 text-right font-medium">Cost</th>
           </tr>
         </thead>
         <tbody>
@@ -52,8 +53,11 @@ export function CallTable({ calls }: { calls: Call[] }) {
                     {sentiment.label}
                   </span>
                 </td>
-                <td className="py-3 pl-2 text-right tabular-nums text-slate-600">
+                <td className="py-3 px-2 text-right tabular-nums text-slate-600">
                   {formatDuration(call.duration_sec)}
+                </td>
+                <td className="py-3 pl-2 text-right tabular-nums text-slate-600">
+                  {formatCost(call.cost_usd)}
                 </td>
               </tr>
             );

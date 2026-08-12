@@ -6,6 +6,13 @@ export function formatDuration(totalSec: number): string {
   return `${m}m ${s}s`;
 }
 
+/** Quick per-minute estimate (see backend Settings.call_cost_per_minute), not an
+ * itemized bill — shown with more precision below $0.01 so short calls don't all
+ * round down to "$0.00". */
+export function formatCost(usd: number): string {
+  return `$${usd.toFixed(usd < 0.01 && usd > 0 ? 4 : 2)}`;
+}
+
 type StatusMeta = {
   label: string;
   badge: string; // tailwind classes for the pill

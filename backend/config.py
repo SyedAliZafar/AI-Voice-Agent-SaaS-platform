@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     # Celery (dev-only: run tasks inline instead of dispatching to a worker)
     celery_task_always_eager: bool = False
 
+    # Billing — flat per-minute estimate for what a call costs to run (voice platform +
+    # telephony + LLM combined), not itemized. Used by schemas.call.CallResponse.cost_usd.
+    call_cost_per_minute: float = 0.20
+
 
 @lru_cache
 def get_settings() -> Settings:

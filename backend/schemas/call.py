@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
+
+from backend.config import get_settings
 
 # The full set of Call.status values, all written by call_service. Declared as a Literal
 # rather than a bare `str` so the API contract matches what the frontend already assumes
@@ -22,6 +24,15 @@ class CallResponse(BaseModel):
     started_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def cost_usd(self) -> float:
+        """Flat estimate at settings.call_cost_per_minute — not itemized against the
+        voice platform's/LLM provider's actual bills, just duration * rate. Still 0 for
+        an in_progress call since duration_sec isn't final yet; the frontend re-fetches
+        once the call resolves, same as every other field here."""
+        return round((self.duration_sec / 60) * get_settings().call_cost_per_minute, 4)
 
 
 class CallSyncResponse(BaseModel):

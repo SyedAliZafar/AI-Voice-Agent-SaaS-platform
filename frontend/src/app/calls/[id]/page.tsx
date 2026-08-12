@@ -7,7 +7,7 @@ import { TranscriptViewer } from "@/components/features/calls/TranscriptViewer";
 import { ArrowLeftIcon } from "@/components/icons";
 import { Card, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
-import { CALL_STATUS_META, formatDuration, sentimentMeta } from "@/lib/format";
+import { CALL_STATUS_META, formatCost, formatDuration, sentimentMeta } from "@/lib/format";
 import { Call, Transcript } from "@/lib/types";
 
 export default function CallDetailPage({ params }: { params: { id: string } }) {
@@ -65,6 +65,7 @@ export default function CallDetailPage({ params }: { params: { id: string } }) {
       </span>
     ) },
     { label: "Duration", node: <span className="font-medium text-slate-900">{formatDuration(call.duration_sec)}</span> },
+    { label: "Cost", node: <span className="font-medium text-slate-900">{formatCost(call.cost_usd)}</span> },
     { label: "Sentiment", node: (
       <span className="inline-flex items-center gap-2 text-sm text-slate-700">
         <span className={`h-2 w-2 rounded-full ${sentiment.color}`} />
