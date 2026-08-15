@@ -256,6 +256,7 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
 
         result = await test_call_service.place_test_call(
             db_session, agent.id, tenant_id, "+491701234567"
@@ -271,6 +272,9 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         llm_websocket_url="wss://abc123.trycloudflare.com/llm-websocket",
         voice_id="11labs-Adrian",
         webhook_url="https://abc123.trycloudflare.com/webhooks/retell",
+        # ADR-010: the opening pause has to be Retell's parameter — our websocket opens
+        # during call setup, so we can't tell ringing from pickup on our side.
+        begin_message_delay_ms=1500,
     )
     mock_adapter.create_llm.assert_not_awaited()
     mock_adapter.create_outbound_call.assert_awaited_once_with(
@@ -284,6 +288,7 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         "agent_id": "custom_agent_1",
         "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
         "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
+        "begin_message_delay_ms": 1500,
     }
 
 
@@ -359,6 +364,7 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://new-tunnel.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
 
         await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
@@ -367,12 +373,62 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         llm_websocket_url="wss://new-tunnel.trycloudflare.com/llm-websocket",
         voice_id="11labs-Adrian",
         webhook_url="https://new-tunnel.trycloudflare.com/webhooks/retell",
+        begin_message_delay_ms=1500,
     )
     mock_adapter.create_outbound_call.assert_awaited_once_with(
         from_number="+15551234567",
         to_number="+491701234567",
         agent_external_id="fresh_agent",
     )
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_reprovisions_when_greeting_delay_changes(
+    db_session, tenant_id
+):
+    """begin_message_delay_ms is fixed on the Retell agent at creation, so a cached
+    agent provisioned before the setting existed (or with a different value) has to be
+    recreated — otherwise tuning the opening pause would silently do nothing."""
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {
+        "retell_custom": {
+            "agent_id": "agent_without_delay",
+            "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+            "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_with_delay"
+    mock_adapter.create_outbound_call.return_value = "call_delay"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 2000
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once()
+    assert (
+        mock_adapter.create_agent_with_custom_llm.await_args.kwargs["begin_message_delay_ms"]
+        == 2000
+    )
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.voice_config["retell_custom"]["agent_id"] == "agent_with_delay"
 
 
 @pytest.mark.asyncio
@@ -455,6 +511,7 @@ async def test_place_test_call_custom_llm_auto_self_heals_after_tunnel_restart(
         mock_settings.retell_from_number = "+15551234567"
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "auto"
+        mock_settings.greeting_delay_ms = 1500
 
         result = await test_call_service.place_test_call(
             db_session, agent.id, tenant_id, "+491701234567"

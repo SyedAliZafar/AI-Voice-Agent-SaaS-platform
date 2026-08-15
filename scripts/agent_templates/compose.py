@@ -46,10 +46,11 @@ def compose(style_key: str, service_key: str, industry_key: str) -> str:
 
 ---
 
+{shared.CALL_OPENING_SEQUENCE}
 {style['call_shape']}
 
-## Qualifying flow (only after the interest check has been cleared, for Short Quick — \
-ask early, in this order, for Long Detail)
+## Qualifying flow (never before Beat 3 — for Short Quick, only once the interest check \
+has been cleared)
 
 {industry['qualifying_flow']}
 

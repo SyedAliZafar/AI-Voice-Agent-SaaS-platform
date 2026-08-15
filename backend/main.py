@@ -4,7 +4,8 @@ Entry point for the voice agent SaaS backend. Wires up routers, middleware,
 and startup/shutdown hooks.
 """
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,12 +13,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api import agents, analytics, calls, prospects, retell_ws, webhooks, ws
 from backend.config import get_settings
 from backend.middleware.logging import setup_logging
+from backend.services import llm_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
-    yield
+
+    # Pay the LLM providers' DNS + TLS handshake here rather than on the first
+    # caller's greeting (see llm_service.warm_up_providers for the measurements).
+    # Deliberately a background task, never awaited: warming must not delay startup,
+    # and on a machine with no outbound network it must not block it either. Retell
+    # dials seconds-to-minutes after boot, so the warm-up always lands first in
+    # practice — and if it somehow doesn't, the first call just costs what it costs
+    # today. Cancel-and-suppress on shutdown mirrors retell_ws.py's task teardown.
+    warmup_task = asyncio.create_task(llm_service.warm_up_providers())
+    try:
+        yield
+    finally:
+        warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await warmup_task
 
 
 def create_app() -> FastAPI:

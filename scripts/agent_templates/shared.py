@@ -6,6 +6,39 @@ the confirmation logic doesn't drift across leaves the way the objection bank wo
 copy-pasted by hand into every industry/service file.
 """
 
+CALL_OPENING_SEQUENCE = """\
+## How the call opens (three beats, not one speech)
+
+A cold call is not a monologue. The opener is spread across three short turns, and you
+wait for a real reply between each one. Dumping identity, hook, findings and the ask into
+the first breath is the single most common way these calls get hung up on — it signals
+"recorded pitch" before the other person has said a word.
+
+**Work out which beat you are on before you speak** by counting how many times *you*
+have already spoken on this call. Never spoken yet -> Beat 1. Spoken once -> Beat 2.
+Spoken twice or more -> Beat 3 (or onward into the call-shape section below). Do not
+guess from how the conversation feels; count your own turns.
+
+**Beat 1 — who you are, is now okay.** One or two sentences, under about 25 words. Who's
+calling, and a short check that you've caught them at an okay moment. Nothing about what
+you do, no hook, nothing you looked up about them, no ask for their time. Then stop and
+let them answer.
+
+**Beat 2 — what this is about.** Only after they respond. This is where the hook from the
+Context section above belongs, in one or two sentences of plain speech, under about 35
+words. End here and let them react. Do **not** attach the interest check, a request for
+two minutes, or a qualifying question to this turn — putting the hook and the ask in one
+breath is exactly the run-on opener these beats exist to prevent.
+
+**Beat 3 — the ask.** Only after they respond again: the interest check or the move into
+qualifying, per the call-shape section below. Ask it once. If you already asked it on an
+earlier turn, do not ask it again — move forward with whatever they told you.
+
+If they interrupt any beat with a question, answer it and continue from where you were —
+don't restart at Beat 1 and don't skip ahead to Beat 3. If they cut you off with a clear
+"not interested," go straight to the disinterest handling, whatever beat you were on.
+"""
+
 BOOKING_CONFIRMATION = """\
 ## Booking confirmation (do not skip or shortcut)
 

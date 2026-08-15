@@ -15,6 +15,7 @@ one per call/turn is not an option.
 
 import asyncio
 import json
+import logging
 import random
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -26,9 +27,15 @@ from openai import AsyncOpenAI, BadRequestError
 from backend.config import get_settings
 from backend.tools import get_tool_definitions, get_tool_handler
 
+logger = logging.getLogger(__name__)
+
 settings = get_settings()
 
 MAX_TOKENS = 1024
+
+# Ceiling on a single provider's warm-up request (see warm_up_providers). Generous:
+# the point is to bound a hung connection, not to race a slow-but-working one.
+WARMUP_TIMEOUT_SECONDS = 10.0
 
 # How long a tool-call round may run before the caller hears a filler phrase instead of
 # silence (phase4.md Session 7). A Cal.com/HubSpot round-trip is the case this exists
@@ -124,6 +131,52 @@ def provider_configured_status() -> dict[str, bool]:
         provider: bool(getattr(settings, key_attr))
         for provider, (_, key_attr) in _PROVIDERS.items()
     }
+
+
+async def warm_up_providers() -> dict[str, bool]:
+    """Open a connection to every configured provider so the FIRST real call doesn't
+    pay DNS + TLS on the caller's time. Called from main.py's lifespan.
+
+    Measured 2026-08-15, first streamed completion's time-to-first-token:
+
+        provider   cold     after this warm-up
+        openai     2.76s    0.63s
+        deepseek   0.98s    0.62s
+
+    That ~2.1s OpenAI penalty is not hypothetical — it is what a real call spent as
+    dead air on its greeting, long enough that the callee said "Hello?" over it and
+    Retell cancelled the half-spoken turn (ADR-009 barge-in) and restarted it. The
+    module docstring above already noted phase0.md measuring the same ~2.5s cold cost;
+    this is the fix for it rather than another note about it.
+
+    models.list() rather than a one-token completion: it costs no tokens, and it opens
+    the very connection get_client() will hand to the first real turn — the @lru_cache
+    on _client_for_provider is what carries the warmth across.
+
+    Warms only providers with a key configured, so this stays correct as an
+    OpenAI-or-DeepSeek deployment rather than assuming both.
+
+    Never raises. A provider unreachable at boot must not stop the app from starting,
+    and the cost of failing here is only that the first call pays what it pays today.
+    Returns provider -> whether it warmed, for logging and for tests.
+    """
+    results: dict[str, bool] = {}
+    for provider, configured in provider_configured_status().items():
+        if not configured:
+            continue
+        try:
+            client = _client_for_provider(provider)
+            await asyncio.wait_for(client.models.list(), timeout=WARMUP_TIMEOUT_SECONDS)
+            results[provider] = True
+        except Exception:
+            # Includes TimeoutError and LLMConfigError. Warn, don't propagate.
+            logger.warning(
+                "llm warm-up failed; first call to this provider will be slower",
+                extra={"provider": provider},
+                exc_info=True,
+            )
+            results[provider] = False
+    return results
 
 
 def _to_openai_tools() -> list[dict]:

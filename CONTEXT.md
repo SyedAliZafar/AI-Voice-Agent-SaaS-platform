@@ -372,6 +372,19 @@ chat-completions protocol, so "which provider" reduces to `api_key` + `base_url`
 - Exactly one `AsyncOpenAI` client per provider, cached (`get_client`, `@lru_cache`) — not
   per call. phases/completed/phase0.md measured ~2.5s of dead air on a cold client (DNS + TLS); constructing
   one per turn in the WS handler would reintroduce that on every response.
+- **Caching alone never covered the *first* call, though** — the cache has to be populated
+  by someone, and whoever does it pays the handshake. On 2026-08-14 that someone was a
+  real caller: the one agent configured for `gpt-4o-mini` (19 of 20 use the DeepSeek
+  default) opened the process's first-ever OpenAI connection, spent **2.6s** reaching its
+  first token, and the callee said "Hello?" into the silence — which Retell read as a
+  barge-in, cancelling and restarting the half-spoken greeting (ADR-009). Re-measured
+  head-to-head: cold 2.76s (openai) / 0.98s (deepseek), warm 0.5–1.1s both; idle gaps
+  between turns cost nothing, so it is strictly a first-request cost, not connection
+  churn. `llm_service.warm_up_providers()` now opens each *configured* provider's
+  connection from `main.py`'s lifespan, which drops that first call to 0.63s / 0.62s. It
+  uses `models.list()` (no tokens) rather than a throwaway completion, runs as a
+  background task so it can never delay or — offline — block startup, and swallows its
+  own failures: the worst case of a failed warm-up is the latency we already had.
 - `Agent.llm_model` (empty string = "use `settings.default_llm_model`") makes the choice
   per-agent, not global — set via the "Conversation engine" card's model `<select>`
   (`GET /api/agents/models` reports the catalog plus which providers are `configured`).
@@ -524,6 +537,69 @@ prompt_tokens, completion_tokens}` shape the Session 4 baseline established — 
 change to `CallEvent(event_type="llm_timing")` — plus two additive keys: `ttfb_ms` (time to
 the first content delta, the metric streaming exists to move) and `streamed: True` (so
 before/after rows are distinguishable in the same table).
+
+### ADR-010: The agent speaks first, via a begin message on `call_details`
+
+Found on a real test call: the agent stayed silent after connecting and only spoke once
+the person who'd been dialed said something first. Backwards for outbound cold calls —
+the agent placed the call, so it owes the opener, and every prompt in
+`scripts/agent_templates/` is written around delivering one.
+
+Cause: Retell only sends `response_required` *after* the other party speaks, and
+`retell_ws.py`'s receive loop explicitly did nothing with the one-time `call_details`
+frame that arrives at connect. Nothing was broken in the prompts; there was simply no
+code path that could produce a first utterance.
+
+Fix: `call_details` now starts a normal generation turn with `response_id: 0` (what
+Retell's protocol reserves for the begin message), through the same `_generate` used by
+every other turn — so streaming, barge-in cancellation, fallback text, transcript
+persistence and `llm_events` all apply to the opener too, with no parallel code path.
+
+**The opener waits, and it arrives in three beats.** Both came out of listening to real
+calls. The agent spoke the instant the call connected, talking over the "Hello?" of
+whoever picked up.
+
+The pause is `settings.greeting_delay_ms` (default 1500), sent to Retell as
+`begin_message_delay_ms` when the agent is provisioned — **not** a sleep in
+`retell_ws.py`. That was the first attempt and it was the wrong layer: Retell opens the
+LLM websocket during call *setup*, so a timer started on `call_details` runs out while
+the phone is still ringing. It passed its unit test, held the audio exactly as designed,
+and changed nothing on a real call, because it was measuring from an event that isn't
+pickup. Retell is the only side that knows when the call was answered. The value is part
+of the `voice_config["retell_custom"]` cache key alongside `ws_url`/`webhook_url`, since
+it's fixed on the Retell agent at creation — without that, changing it would silently
+never reach an already-provisioned agent.
+
+If they speak while the opener is still generating, the receive loop cancels it and their
+turn is answered normally — `current_response_id` is a sentinel object for that window
+precisely so an incoming `response_id: 0` reads as a barge-in rather than as Retell
+resending the same turn.
+
+The opener also used to deliver identity, hook, findings and the ask in one breath, which
+is what a recorded pitch sounds like. It's now three turns with a real reply between each
+(`shared.CALL_OPENING_SEQUENCE`, applied to every leaf): who's calling → what this is
+about → the ask. Because each turn is stateless, the block tells the model to determine
+its beat by *counting its own prior turns in the transcript* rather than inferring from
+feel — without that it collapsed beats 2 and 3 together and then re-asked the interest
+check. `compose.py`'s qualifying-flow heading had to change with it: it previously read
+"ask early ... for Long Detail", which directly contradicted the beats and made Long
+Detail jump into qualifying at Beat 2.
+
+Two more things are deliberate:
+- **The opener is LLM-generated from the agent's own prompt, not static config text.**
+  Each service line has its own hook (`agent_templates/services.py` — AI Automation's
+  "you're talking to the proof" can't be reused by SEO/Web Dev), so a hardcoded
+  `begin_message` on the Retell agent would either be generic or need duplicating per
+  leaf. `_BEGIN_MESSAGE_INSTRUCTION` is a synthetic system turn — present only in that
+  one LLM call, never persisted — telling the model to deliver its opener rather than
+  answer a caller turn that doesn't exist.
+- **Tools are disabled for this turn** (`tools_enabled=not greeting`): nothing can
+  legitimately need a booking or a lookup before the other party has said a word.
+
+`_call_already_in_progress` guards the reconnect case: the config frame sets
+`auto_reconnect: True`, so Retell can replay `call_details` mid-call, and re-greeting
+there would talk over a conversation in progress and restart the pitch. A call object
+carrying a transcript is a reconnect, not a fresh start.
 
 ### ADR-006: Prospecting pipeline (Prospector + Researcher agents)
 Before a call can happen, something has to decide *who* to call. The prospecting
@@ -728,6 +804,18 @@ for how to move through these efficiently.
 5. DeepSeek responds with text OR a tool call → we execute tool → return result to DeepSeek
 6. Final text response sent back to voice platform → TTS → caller hears it
 7. Loop continues until hangup or escalation trigger
+
+### Outbound call (custom-LLM websocket)
+1. `test_call_service` provisions/reuses a Retell agent pointing at
+   `/llm-websocket/{call_id}` and dials the target
+2. Retell opens the websocket → `retell_ws.py` resolves the `Call`/`Agent` by
+   `external_id`, sends the `config` frame
+3. Retell sends `call_details` → **the agent speaks first**: a begin message on
+   `response_id: 0`, generated from the agent's own prompt (ADR-010). Skipped when the
+   frame describes a reconnect rather than a fresh call
+4. Each caller utterance → `response_required` → streamed turn, server-side tools, ledger
+   checks (ADR-009/ADR-003); `reminder_required` covers caller silence
+5. Every completed turn is persisted/broadcast via `_persist_and_publish_turn`
 
 ### Post-call processing (Celery)
 1. Call ends → Retell POSTs `call_ended` to the per-agent `webhook_url`

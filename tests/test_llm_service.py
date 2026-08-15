@@ -820,3 +820,81 @@ class TestConcurrentToolDispatch:
             )
 
         assert [r["tool_call_id"] for r in results] == ["tc1", "tc2"]
+
+
+class TestWarmUpProviders:
+    """Startup warm-up (main.py lifespan): opens each configured provider's connection
+    so the first real call doesn't pay DNS + TLS as dead air on the caller's greeting."""
+
+    @staticmethod
+    def _client(side_effect=None):
+        client = MagicMock()
+        client.models.list = AsyncMock(side_effect=side_effect)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_warms_only_configured_providers(self):
+        client = self._client()
+        with (
+            patch.object(
+                llm_service,
+                "provider_configured_status",
+                return_value={"deepseek": True, "openai": False},
+            ),
+            patch.object(llm_service, "_client_for_provider", return_value=client),
+        ):
+            result = await llm_service.warm_up_providers()
+
+        # openai has no key here, so touching it would raise LLMConfigError for nothing.
+        assert result == {"deepseek": True}
+        client.models.list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_provider_does_not_raise(self):
+        """A provider that's down at boot must not stop the app from starting — the
+        only consequence is that the first call to it pays what it pays today."""
+        client = self._client(side_effect=RuntimeError("connection refused"))
+        with (
+            patch.object(llm_service, "provider_configured_status", return_value={"openai": True}),
+            patch.object(llm_service, "_client_for_provider", return_value=client),
+        ):
+            result = await llm_service.warm_up_providers()
+
+        assert result == {"openai": False}
+
+    @pytest.mark.asyncio
+    async def test_one_provider_failing_does_not_stop_the_others(self):
+        clients = {
+            "deepseek": self._client(side_effect=RuntimeError("down")),
+            "openai": self._client(),
+        }
+        with (
+            patch.object(
+                llm_service,
+                "provider_configured_status",
+                return_value={"deepseek": True, "openai": True},
+            ),
+            patch.object(llm_service, "_client_for_provider", side_effect=lambda p: clients[p]),
+        ):
+            result = await llm_service.warm_up_providers()
+
+        assert result == {"deepseek": False, "openai": True}
+        clients["openai"].models.list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_provider_is_bounded_by_timeout(self):
+        """Bounds a hung connection rather than racing a slow-but-working one."""
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        client = MagicMock()
+        client.models.list = MagicMock(side_effect=lambda: never_returns())
+        with (
+            patch.object(llm_service, "provider_configured_status", return_value={"openai": True}),
+            patch.object(llm_service, "_client_for_provider", return_value=client),
+            patch.object(llm_service, "WARMUP_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = await llm_service.warm_up_providers()
+
+        assert result == {"openai": False}

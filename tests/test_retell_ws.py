@@ -43,6 +43,7 @@ from backend.api.retell_ws import (
     _find_duplicate_ledger_entry,
     _ledger_entry,
     _ledger_note,
+    _system_prompt_with_context,
     _to_conversation_history,
 )
 from backend.main import app
@@ -139,6 +140,20 @@ def test_to_conversation_history_maps_retell_roles():
     ]
 
 
+def test_system_prompt_with_context_forbids_speaking_placeholders():
+    """Found while verifying ADR-010's opener against a real model: it read the literal
+    "[Name]" out of the prompt's own script text, which TTS would speak as "bracket
+    Name". The outbound templates are full of such fill-ins ([insert service] in the
+    disinterest branch), so the prohibition is stated on every turn, not just the first."""
+    prompt = _system_prompt_with_context("You are Ali.", "+15551234567", "UTC")
+
+    assert "[SPEECH]" in prompt
+    assert "[Name]" in prompt and "placeholder" in prompt
+    # The other half of the same failure: with no name given, the model either invented
+    # a human one or spoke the placeholder — both wrong, so it's told what to say instead.
+    assert "do not have a personal first name" in prompt
+
+
 def test_llm_websocket_closes_unknown_call(tmp_path):
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'unknown.db'}"
     _seed_db(db_url, uuid.uuid4(), uuid.uuid4(), "some-other-call-id")
@@ -204,6 +219,138 @@ def test_llm_websocket_ping_pong_and_streamed_response(tmp_path):
     assert call_args.args[1] == [{"role": "user", "content": "Hi"}]
     assert call_args.args[2]["agent_id"] == str(agent_id)
     assert call_args.args[2]["tenant_id"] == str(tenant_id)
+
+
+def test_llm_websocket_speaks_first_on_call_details(tmp_path):
+    """ADR-010: Retell only sends response_required after the *other* party speaks, so
+    the opener has to be generated off the one-time call_details frame — otherwise an
+    outbound cold call sits silent until the person who was dialed says something."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'greeting.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_greeting_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id, system_prompt="You are Ali.")
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    mock_stream = MagicMock(side_effect=_stream_returning("Hey, this is Krucx calling."))
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", mock_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                config_msg = ws.receive_json()
+                assert config_msg["response_type"] == "config"
+
+                ws.send_json({"interaction_type": "call_details", "call": {"call_id": "x"}})
+                frames = _recv_until_complete(ws)
+
+    # Retell's protocol reserves response_id 0 for the begin message.
+    assert [f["response_id"] for f in frames] == [0, 0]
+    assert frames[0]["content"] == "Hey, this is Krucx calling."
+    assert frames[-1]["content_complete"] is True
+
+    mock_stream.assert_called_once()
+    call_args = mock_stream.call_args
+    assert call_args.args[0].startswith("You are Ali.")
+    # Nothing was said yet, so the only history is the synthetic nudge telling the model
+    # to deliver its opener rather than answer a caller turn that doesn't exist.
+    history = call_args.args[1]
+    assert [m["role"] for m in history] == ["system"]
+    assert "speak first" in history[0]["content"]
+    # No tool can legitimately fire before the other party has said a word.
+    assert call_args.kwargs["tools_enabled"] is False
+
+
+def test_llm_websocket_does_not_greet_again_on_reconnect(tmp_path):
+    """config sets auto_reconnect=True, so Retell can replay call_details mid-call. A
+    call object that already carries a transcript is a reconnect, not a fresh start —
+    re-greeting there would talk over a conversation in progress."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'reconnect.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_reconnect_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id)
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    mock_stream = MagicMock(side_effect=_stream_returning("Should not be spoken"))
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", mock_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "call_details",
+                        "call": {
+                            "call_id": "x",
+                            "transcript": "Agent: Hey there\nUser: yeah go ahead",
+                        },
+                    }
+                )
+                # No greeting frames — the socket is still live and answering, which a
+                # ping_pong round-trip proves without waiting on a response that will
+                # never arrive.
+                ws.send_json({"interaction_type": "ping_pong", "timestamp": 9})
+                assert ws.receive_json() == {"response_type": "ping_pong", "timestamp": 9}
+
+    mock_stream.assert_not_called()
+
+
+def test_llm_websocket_caller_speaking_first_cancels_the_greeting(tmp_path):
+    """If they answer with "Hello?" while the opener is still generating, the opener must
+    be dropped rather than spoken over the top of their turn. current_response_id is a
+    sentinel for the greeting precisely so an incoming response_id of 0 reads as a
+    barge-in and not as Retell resending the same turn."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'greet_cancel.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_greet_cancel_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id)
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    greeting_started = threading.Event()
+
+    async def _stream(*args, **kwargs):
+        history = args[1]
+        if any("speak first" in m.get("content", "") for m in history):
+            # The opener: park here so the caller's turn is guaranteed to arrive while
+            # it is still in flight, which is the race this test exists for.
+            greeting_started.set()
+            await asyncio.sleep(30)
+            yield "opener that must never be spoken"
+        else:
+            yield "Hi, you've reached Krucx."
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", MagicMock(side_effect=_stream)),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json({"interaction_type": "call_details", "call": {"call_id": "x"}})
+                assert greeting_started.wait(timeout=5), "greeting never started"
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 0,
+                        "transcript": [{"role": "user", "content": "Hello?"}],
+                    }
+                )
+                frames = _recv_until_complete(ws)
+
+    assert [f["content"] for f in frames if f["content"]] == ["Hi, you've reached Krucx."]
 
 
 def test_llm_websocket_kill_switch_off_uses_blocking_path(tmp_path):

@@ -68,12 +68,17 @@ class RetellAdapter(VoicePlatformAdapter):
         llm_websocket_url: str,
         voice_id: str,
         webhook_url: str | None = None,
+        begin_message_delay_ms: int | None = None,
     ) -> str:
         """Provision an agent backed by OUR Custom LLM WebSocket (ADR-003) — Retell dials
         `llm_websocket_url` (appending the call's own call_id itself, per Retell's
         protocol: docs.retellai.com/api-references/llm-websocket) and relays transcript
         turns to backend/api/retell_ws.py, which answers using DeepSeek + server-side
         tools. Contrast with create_agent_with_llm, which uses Retell's own hosted LLM.
+
+        begin_message_delay_ms holds the agent's opener after the call is answered
+        (ADR-010). It has to be Retell's parameter rather than a sleep on our side: the
+        websocket opens during call setup, so we can't tell ringing apart from pickup.
         """
         body: dict[str, Any] = {
             "agent_name": name,
@@ -85,6 +90,8 @@ class RetellAdapter(VoicePlatformAdapter):
         }
         if webhook_url:
             body["webhook_url"] = webhook_url
+        if begin_message_delay_ms:
+            body["begin_message_delay_ms"] = begin_message_delay_ms
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(f"{BASE_URL}/create-agent", headers=self.headers, json=body)

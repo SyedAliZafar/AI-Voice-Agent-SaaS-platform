@@ -28,6 +28,11 @@ still completes and gets recorded, never abandoned mid-flight with an unknown ou
 settings.llm_streaming_enabled is the kill switch — False restores the original
 single-frame blocking behavior via llm_service.get_agent_response, unchanged since
 before this file went streaming.
+
+Who speaks first (ADR-010): Retell only sends response_required once the *other* party
+has spoken, so the agent's opener is generated here off the one-time call_details frame
+instead, as a begin message on response_id 0. See _BEGIN_MESSAGE_INSTRUCTION and
+_call_already_in_progress.
 """
 
 import asyncio
@@ -246,6 +251,24 @@ _DATA_CAPTURE_BLOCK = (
     "you as correct."
 )
 
+_SPEECH_BLOCK = (
+    "[SPEECH]\n"
+    "Everything you produce is spoken aloud by a text-to-speech engine, so it must be "
+    "sayable as-is:\n"
+    "- Never speak a placeholder. Prompt scripts contain fill-ins like [Name], "
+    "[Your Name] or [insert service]; substitute the real value, or if you don't have "
+    "one, rephrase the sentence without it. Saying the brackets out loud instantly "
+    "exposes this as a script being read.\n"
+    "- You do not have a personal first name unless your instructions give you one. "
+    "Introduce yourself by who you're calling for (e.g. 'this is the assistant for "
+    "Krucx') rather than inventing a human name that won't match anything the caller "
+    "may later be told.\n"
+    "- Never read stage directions, section headings, or notes-to-self aloud. If your "
+    "instructions describe an action rather than words to say, perform it silently.\n"
+    "- Output only the words to be spoken: no quotation marks wrapping your whole reply, "
+    "no markdown, no asterisks, no bullet points, no emoji."
+)
+
 
 def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zone: str) -> str:
     """Appends CONTEXT.md's documented "[CONTEXT] Current time / Caller number" block,
@@ -263,6 +286,13 @@ def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zon
     both silently wrong without an explicit instruction, since nothing in an agent's own
     persona prompt is expected to cover call-mechanics like this.
 
+    [SPEECH] is the same category, found while verifying ADR-010's opener: the model read
+    the literal placeholder "[Name]" out of the prompt's own script text and would have
+    spoken "bracket Name" to a live prospect. The outbound templates in
+    scripts/agent_templates/ are full of such fill-ins ([insert service] in the
+    disinterest branch), and stage directions next to quoted script lines had already
+    leaked once, so this is stated per-turn rather than only on the opening turn.
+
     Rebuilt per turn rather than once per connection so a long call can't drift across
     midnight, and stated in the agent's own calendar timezone so "tomorrow at 2pm" means
     what the caller means.
@@ -276,8 +306,39 @@ def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zon
         f"relative day like 'tomorrow' or 'next Tuesday', resolve it against that date and "
         f"always pass a full ISO 8601 start_time in the CURRENT year.\n"
         f"Caller's phone number: {caller_number or 'unknown'}.\n\n"
-        f"{_DATA_CAPTURE_BLOCK}"
+        f"{_DATA_CAPTURE_BLOCK}\n\n"
+        f"{_SPEECH_BLOCK}"
     )
+
+
+_GREETING_SENTINEL = object()
+
+_BEGIN_MESSAGE_INSTRUCTION = (
+    "The call has just connected and the other party has not said anything yet. You are "
+    "the one who placed this call, so you speak first — but this is only the FIRST of "
+    "several short beats, not the whole pitch.\n"
+    "Say two things and nothing else: who is calling, and a short check that now is an "
+    "okay time. One or two sentences, under about 25 words total.\n"
+    "Do NOT yet: explain what you do, deliver your hook, mention anything you looked up "
+    "about them, list what you found, ask a qualifying question, or ask for two minutes "
+    "of their time. Every one of those belongs to a later turn, after they have replied. "
+    "Someone who just picked up the phone has no idea who you are yet — say who you are "
+    "and let them answer."
+)
+
+
+def _call_already_in_progress(data: dict[str, Any]) -> bool:
+    """Whether this call_details frame describes a call that has already been talking.
+
+    The config frame sets auto_reconnect=True, so Retell can re-open this socket
+    mid-call and replay call_details — speaking the opener again at that point would
+    talk over a conversation already in progress and restart the pitch from the top.
+    A call that hasn't started has no transcript yet, which is what distinguishes the
+    real start from a reconnect. Both spellings are checked because Retell carries the
+    plain-text transcript and the structured one under separate keys.
+    """
+    call = data.get("call") or {}
+    return bool(call.get("transcript") or call.get("transcript_object"))
 
 
 def _to_conversation_history(transcript: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -480,10 +541,24 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
             return None
         return _duplicate_tool_result(tool, entry)
 
-    async def _generate(data: dict[str, Any]) -> None:
+    async def _generate(data: dict[str, Any], *, greeting: bool = False) -> None:
+        """Generate and speak one turn. `greeting` is the call-opening turn (ADR-010):
+        no caller utterance to answer, just the agent's own opener, and tools are
+        disabled for it — nothing can legitimately need booking or a lookup before the
+        other party has said a single word.
+
+        Nothing here waits before speaking: the pause that lets the person say "Hello?"
+        first is Retell's begin_message_delay_ms, set at provisioning time. This socket
+        opens during call *setup*, so a timer started here expires while the phone is
+        still ringing — it looked like it worked and did nothing on a real call.
+        """
         response_id = data.get("response_id")
         transcript_so_far = data.get("transcript", [])
         conversation_history = _to_conversation_history(transcript_so_far)
+        if greeting:
+            conversation_history.append(
+                {"role": "system", "content": _BEGIN_MESSAGE_INSTRUCTION}
+            )
         if completed_tool_calls:
             conversation_history.insert(
                 0, {"role": "system", "content": _ledger_note(completed_tool_calls)}
@@ -509,6 +584,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                     conversation_history,
                     caller_context,
                     model=llm_model,
+                    tools_enabled=not greeting,
                     llm_events=llm_events,
                     on_tool_event=sink,
                     spawn_tracked=_spawn_tracked,
@@ -530,6 +606,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                     conversation_history,
                     caller_context,
                     model=llm_model,
+                    tools_enabled=not greeting,
                     llm_events=llm_events,
                     on_tool_event=sink,
                     spawn_tracked=_spawn_tracked,
@@ -619,6 +696,23 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
 
             if interaction_type == "ping_pong":
                 await _send({"response_type": "ping_pong", "timestamp": data.get("timestamp")})
+            elif interaction_type == "call_details":
+                # ADR-010: speak first. Retell only sends response_required *after* the
+                # other party talks, so without this the agent sat silent until the
+                # person it called said something — backwards for outbound cold calls,
+                # where the agent is the one who dialed and owes the opener. Retell's
+                # protocol reserves response_id 0 for exactly this begin message.
+                if _call_already_in_progress(data):
+                    continue
+                # A sentinel, not 0: current_response_id is only ever compared against
+                # incoming ids to tell "Retell resent this turn" from "genuine barge-in",
+                # and an incoming 0 here is the latter — the person answered and spoke
+                # during the opening pause. A sentinel can't collide, so their speech
+                # always cancels the opener instead of being mistaken for a resend.
+                current_response_id = _GREETING_SENTINEL
+                current_task = asyncio.create_task(
+                    _generate({"response_id": 0, "transcript": []}, greeting=True)
+                )
             elif interaction_type in ("response_required", "reminder_required"):
                 response_id = data.get("response_id")
                 if current_task is not None and not current_task.done():
@@ -634,7 +728,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                         await current_task
                 current_response_id = response_id
                 current_task = asyncio.create_task(_generate(data))
-            # call_details / update_only: no response required, nothing to do.
+            # update_only: no response required, nothing to do.
     except WebSocketDisconnect:
         pass
     finally:

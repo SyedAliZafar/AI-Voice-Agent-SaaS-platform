@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # restores the pre-streaming single-frame blocking behavior via
     # llm_service.get_agent_response — see CONTEXT.md's ADR-009.
     llm_streaming_enabled: bool = True
+    # How long Retell holds the agent's opener after the person actually answers
+    # (ADR-010), giving them room to say "Hello?" first instead of being talked over.
+    # Sent as Retell's own begin_message_delay_ms at agent-provisioning time rather than
+    # slept for in retell_ws.py: our websocket opens during call *setup*, so any timer
+    # we start there has already expired by the time the phone is picked up. Retell is
+    # the only side that knows when the call was answered. Max 5000 per Retell's API.
+    greeting_delay_ms: int = 1500
 
     # Voice platforms
     retell_api_key: str = ""

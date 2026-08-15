@@ -234,10 +234,16 @@ async def _provision_custom_llm_agent(
     cached: dict = dict((agent.voice_config or {}).get("retell_custom") or {})
     webhook_url = await _webhook_url()
 
+    # In the cache key for the same reason webhook_url is: it's fixed on the Retell agent
+    # at creation, so a changed value has to force a re-provision or the setting would
+    # silently never reach a previously-provisioned agent.
+    begin_message_delay_ms = settings.greeting_delay_ms
+
     if (
         cached.get("agent_id")
         and cached.get("ws_url") == ws_url
         and cached.get("webhook_url") == webhook_url
+        and cached.get("begin_message_delay_ms") == begin_message_delay_ms
     ):
         return cached["agent_id"]
 
@@ -247,6 +253,7 @@ async def _provision_custom_llm_agent(
         llm_websocket_url=ws_url,
         voice_id=voice_id,
         webhook_url=webhook_url,
+        begin_message_delay_ms=begin_message_delay_ms,
     )
 
     agent.voice_config = {
@@ -255,6 +262,7 @@ async def _provision_custom_llm_agent(
             "agent_id": agent_external_id,
             "ws_url": ws_url,
             "webhook_url": webhook_url,
+            "begin_message_delay_ms": begin_message_delay_ms,
         },
     }
     await db.commit()
