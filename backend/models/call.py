@@ -26,6 +26,13 @@ class Call(Base, UUIDMixin, TimestampMixin, TenantMixin):
     external_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    # Set only for calls placed by the lead retry scheduler (ADR-011) — lets
+    # call_service's terminal-state writer (apply_retell_call_state) hand off to
+    # lead_service.evaluate_call_outcome without every other call path knowing leads
+    # exist. Null for ordinary test calls and prospect calls.
+    lead_id: Mapped[UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("leads.id"), nullable=True, index=True
+    )
 
     events: Mapped[list["CallEvent"]] = relationship(back_populates="call")
     transcript: Mapped["Transcript"] = relationship(back_populates="call", uselist=False)

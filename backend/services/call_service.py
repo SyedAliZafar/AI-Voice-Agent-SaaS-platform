@@ -128,6 +128,7 @@ async def create_outbound_call_record(
     agent_id: uuid.UUID,
     external_id: str,
     caller_number: str,
+    lead_id: uuid.UUID | None = None,
 ) -> Call:
     """Called by test_call_service right after the voice platform confirms an
     outbound call was placed — see module docstring for why creation happens here
@@ -140,6 +141,7 @@ async def create_outbound_call_record(
         status="in_progress",
         started_at=datetime.now(UTC),
         external_id=external_id,
+        lead_id=lead_id,
     )
     db.add(call)
     await db.commit()
@@ -379,6 +381,22 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     return changed
 
 
+async def _maybe_advance_lead(db: AsyncSession, call: Call) -> None:
+    """If this call was placed by the lead retry scheduler (ADR-011) and has just
+    reached a terminal status, hand off to lead_service to record the outcome and
+    either close out the lead or schedule its next attempt.
+
+    Imported locally, not at module level: lead_service doesn't import call_service
+    today, but keeping the dependency one-directional and lazy avoids ever having to
+    care about import order between the two.
+    """
+    if not call.lead_id or call.status not in ("resolved", "escalated", "failed"):
+        return
+    from backend.services import lead_service
+
+    await lead_service.evaluate_call_outcome(db, call)
+
+
 async def handle_call_ended(
     db: AsyncSession, external_call_id: str, payload: dict[str, Any] | None = None
 ) -> None:
@@ -397,6 +415,7 @@ async def handle_call_ended(
 
     await apply_retell_call_state(db, call, data)
     await db.commit()
+    await _maybe_advance_lead(db, call)
 
 
 async def handle_call_analyzed(
@@ -415,6 +434,7 @@ async def handle_call_analyzed(
 
     await apply_retell_call_state(db, call, payload)
     await db.commit()
+    await _maybe_advance_lead(db, call)
 
 
 async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
@@ -440,6 +460,7 @@ async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
     changed = await apply_retell_call_state(db, call, payload)
     if changed:
         await db.commit()
+        await _maybe_advance_lead(db, call)
     return changed
 
 

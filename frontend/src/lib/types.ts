@@ -131,6 +131,58 @@ export interface CsvImportResult {
   without_website: number;
 }
 
+export type LeadRetryState =
+  | "paused"
+  | "scheduled"
+  | "in_flight"
+  | "succeeded"
+  | "exhausted"
+  | "do_not_call";
+
+export type LeadStatus = "new" | "contacted" | "booked" | "not_interested" | "unreachable";
+
+export interface Lead {
+  id: string;
+  contact_name: string | null;
+  business_name: string | null;
+  phone: string;
+  email: string | null;
+  city: string | null;
+  country: string | null;
+  timezone: string | null;
+
+  source: string;
+  bark_request_id: string | null;
+  service_requested: string | null;
+  budget: string | null;
+  request_text: string | null;
+  received_at: string | null;
+  details: Record<string, unknown>;
+
+  // The operator's own hand-written context — the per-lead "holder".
+  notes: string | null;
+  agent_id: string | null;
+
+  retry_state: LeadRetryState;
+  attempt_count: number;
+  next_attempt_at: string | null;
+  last_attempt_at: string | null;
+  last_outcome: string | null;
+
+  status: LeadStatus;
+  created_at: string;
+}
+
+export interface LeadStats {
+  total: number;
+  paused: number;
+  scheduled: number;
+  in_flight: number;
+  succeeded: number;
+  exhausted: number;
+  do_not_call: number;
+}
+
 export interface Prospect {
   id: string;
   google_place_id: string;

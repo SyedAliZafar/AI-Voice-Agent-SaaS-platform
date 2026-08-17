@@ -43,6 +43,16 @@ PROTECTED_ROUTES = [
     ("post", f"/api/prospects/{uuid.uuid4()}/research"),
     ("post", f"/api/prospects/{uuid.uuid4()}/call"),
     ("post", f"/api/prospects/{uuid.uuid4()}/sandbox-chat"),
+    ("get", "/api/leads"),
+    ("post", "/api/leads"),
+    ("get", "/api/leads/stats"),
+    ("get", f"/api/leads/{uuid.uuid4()}"),
+    ("patch", f"/api/leads/{uuid.uuid4()}"),
+    ("delete", f"/api/leads/{uuid.uuid4()}"),
+    ("post", f"/api/leads/{uuid.uuid4()}/start"),
+    ("post", f"/api/leads/{uuid.uuid4()}/pause"),
+    ("post", f"/api/leads/{uuid.uuid4()}/do-not-call"),
+    ("post", f"/api/leads/{uuid.uuid4()}/call"),
 ]
 
 

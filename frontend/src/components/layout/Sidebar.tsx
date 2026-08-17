@@ -10,6 +10,7 @@ import {
   CallsIcon,
   DashboardIcon,
   LiveIcon,
+  PhoneIcon,
   SettingsIcon,
   TargetIcon,
 } from "@/components/icons";
@@ -23,6 +24,7 @@ type NavItem = {
 const NAV: NavItem[] = [
   { href: "/dashboard", label: "Dashboard", icon: DashboardIcon },
   { href: "/prospects", label: "Prospects", icon: TargetIcon },
+  { href: "/leads", label: "Leads", icon: PhoneIcon },
   { href: "/agents", label: "Agents", icon: AgentsIcon },
   { href: "/calls", label: "Calls", icon: CallsIcon },
   { href: "/calls/live", label: "Live", icon: LiveIcon },

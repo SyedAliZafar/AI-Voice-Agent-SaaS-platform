@@ -89,3 +89,33 @@ If the prospect raises something not covered here, fall back to the base script'
 guardrails rather than guessing at facts about {company_name}."""
 
     return campaign_system_prompt.rstrip() + brief + notes_block
+
+
+def build_lead_prompt(
+    campaign_system_prompt: str,
+    lead_name: str,
+    context_text: str,
+    notes: str | None = None,
+) -> str:
+    """Same injection pattern as build_prospect_prompt, but for a hand-entered lead
+    (ADR-011): there is no scraped CompanyResearch, only whatever the operator typed
+    in — `context_text` (source/service/budget/request, assembled by the caller) and
+    `notes`, which lands last and is described as authoritative, same convention as
+    prospect_notes.
+    """
+    context = (context_text or "").strip()
+    context_block = f"\n\n[LEAD DETAILS — {lead_name}]\n{context}" if context else ""
+
+    text = (notes or "").strip()
+    notes_block = (
+        f"""
+
+[OPERATOR NOTES — {lead_name}]
+The operator added this by hand. Trust it over the lead details above where they
+conflict — it is more recent and comes from a human who knows this lead.
+{text}"""
+        if text
+        else ""
+    )
+
+    return campaign_system_prompt.rstrip() + context_block + notes_block

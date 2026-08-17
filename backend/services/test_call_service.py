@@ -40,6 +40,7 @@ async def place_test_call(
     tenant_id: uuid.UUID,
     to_number: str,
     system_prompt_override: str | None = None,
+    lead_id: uuid.UUID | None = None,
 ) -> dict:
     """Place an outbound call for `agent`.
 
@@ -48,6 +49,10 @@ async def place_test_call(
     without overwriting the agent's base `system_prompt` in the database — the campaign
     script stays the source of truth; personalization is call-time only. Only supported
     on the hosted-LLM path today (see `_provision_custom_llm_agent`).
+
+    `lead_id` tags the resulting Call row so call_service's terminal-state writer can
+    hand off to lead_service.evaluate_call_outcome (ADR-011) — None for every other
+    caller (plain test calls, prospect calls).
 
     tenant_id is required: this endpoint spends real telephony money on the caller's
     Retell/Twilio account, so it must never dial on behalf of an agent the caller
@@ -89,7 +94,7 @@ async def place_test_call(
     # Create the Call row now — we have agent_id/tenant_id here, which webhook
     # events alone never carry. See call_service module docstring.
     await call_service.create_outbound_call_record(
-        db, agent.tenant_id, agent.id, call_id, to_number
+        db, agent.tenant_id, agent.id, call_id, to_number, lead_id=lead_id
     )
 
     return {

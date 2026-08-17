@@ -65,6 +65,7 @@ voiceagent/
 │   │   ├── agent.py              # Agent, PhoneNumber, ToolConfig
 │   │   ├── call.py               # Call, CallEvent, Transcript
 │   │   ├── prospect.py           # Prospect — Prospector/Researcher pipeline (see ADR-006)
+│   │   ├── lead.py               # Lead — hand-entered warm leads + retry scheduler state (ADR-011)
 │   │   └── base.py               # DeclarativeBase, TenantMixin, TimestampMixin, UUIDMixin
 │   │
 │   ├── schemas/                  # Pydantic request/response schemas
@@ -72,6 +73,7 @@ voiceagent/
 │   │   ├── agent.py
 │   │   ├── call.py
 │   │   ├── prospect.py
+│   │   ├── lead.py
 │   │   └── webhook.py
 │   │
 │   ├── api/                      # FastAPI routers
@@ -81,6 +83,7 @@ voiceagent/
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
 │   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete
+│   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
 │   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
 │   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phases/completed/phase0.md)
@@ -101,8 +104,9 @@ voiceagent/
 │   │   ├── analytics_service.py  # Metrics computation, sentiment aggregation
 │   │   ├── places_service.py     # Google Places search, city/country extraction, autocomplete — prospecting Agent 1, discovery (ADR-006)
 │   │   ├── research_service.py   # Company research — prospecting Agent 2, knowledge base (ADR-006)
-│   │   ├── script_service.py     # Call-script generation for prospects
-│   │   └── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking (ADR-006)
+│   │   ├── script_service.py     # Call-script generation for prospects AND leads (build_prospect_prompt / build_lead_prompt)
+│   │   ├── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking (ADR-006)
+│   │   └── lead_service.py       # Lead CRUD, retry/backoff state machine, dispatch, outcome evaluation (ADR-011)
 │   │
 │   ├── tools/                    # LLM function-calling tool definitions
 │   │   ├── __init__.py
@@ -118,10 +122,11 @@ voiceagent/
 │   │
 │   ├── workers/                  # Celery tasks
 │   │   ├── __init__.py
-│   │   ├── celery_app.py         # Celery config
+│   │   ├── celery_app.py         # Celery config + beat_schedule (dispatch_due_leads/sweep_stale_leads, ADR-011)
 │   │   ├── transcript_tasks.py   # Post-call transcript processing
 │   │   ├── analytics_tasks.py    # Periodic metric rollups
-│   │   └── prospect_tasks.py     # discover_prospects / research_prospect (ADR-006)
+│   │   ├── prospect_tasks.py     # discover_prospects / research_prospect (ADR-006)
+│   │   └── lead_tasks.py         # dispatch_due_leads / sweep_stale_leads — the lead retry scheduler (ADR-011)
 │   │
 │   ├── middleware/
 │   │   ├── rate_limit.py         # Redis-based rate limiting
@@ -159,6 +164,8 @@ voiceagent/
 │   │   │   │   └── [id]/
 │   │   │   │       └── sandbox/
 │   │   │   │           └── page.tsx  # Text-chat sandbox for one prospect's script — no phone call
+│   │   │   ├── leads/
+│   │   │   │   └── page.tsx      # Bark/warm-lead list + add form + per-lead scheduler controls (ADR-011)
 │   │   │   ├── settings/
 │   │   │   │   └── page.tsx      # Integrations, phone numbers, billing
 │   │   │   └── api/strategist/
@@ -175,6 +182,8 @@ voiceagent/
 │   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
 │   │   │   │                     #   ProspectDetailPanel, CsvImportButton, SandboxChat,
 │   │   │   │                     #   SandboxContextPanel, prospectStatus.ts (status meta/labels)
+│   │   │   │   └── leads/        # LeadCreateForm, LeadRow, LeadDetailPanel, LeadStatsStrip,
+│   │   │   │                     #   leadStatus.ts (retry_state/status meta, ADR-011)
 │   │   │   └── icons.tsx
 │   │   ├── hooks/                 # all data fetching lives here (FRONTEND.md)
 │   │   │   ├── useWebSocket.ts
@@ -183,7 +192,8 @@ voiceagent/
 │   │   │   ├── useLlmModels.ts
 │   │   │   ├── useProspects.ts    # list + stats + research-status polling
 │   │   │   ├── useCityAutocomplete.ts
-│   │   │   └── useProspectSandbox.ts
+│   │   │   ├── useProspectSandbox.ts
+│   │   │   └── useLeads.ts        # list + stats + in_flight polling (ADR-011)
 │   │   └── lib/
 │   │       ├── api.ts            # Axios wrapper + auth-token interceptor
 │   │       ├── types.ts          # Shared TS interfaces, hand-mirrored from backend/schemas/*.py — no codegen, see FRONTEND.md
@@ -211,6 +221,9 @@ voiceagent/
     ├── test_places_service.py    # addressComponents extraction, autocomplete normalization
     ├── test_research_service.py
     ├── test_script_service.py
+    ├── test_leads.py              # /api/leads router: create-paused, lifecycle, tenant scoping, call-now (ADR-011)
+    ├── test_lead_service.py       # backoff math, business-hours snapping, dispatch, outcome evaluation, idempotency
+    ├── test_lead_tasks.py         # dispatch_due_leads / sweep_stale_leads task bodies
     └── test_tools/
         ├── test_book_appointment.py
         └── test_lookup_customer.py
@@ -715,6 +728,101 @@ route (as `api/prospects.py` does), a plain `asyncio.run()` inside the task woul
 and runs the coroutine on a separate thread instead. The same pattern exists (unguarded)
 in `transcript_tasks.py` — worth fixing there too if it bites.
 
+### ADR-011: Lead retry scheduler (Bark.com and other warm leads)
+
+Prospects (ADR-006) are discovered and researched by our own pipeline. Leads
+(`backend/models/lead.py`) are the other direction: warm inbound leads (Bark.com quote
+requests, eventually other sources) that the operator types in by hand — no scraping,
+no research phase. What Leads need instead is a call-until-someone-answers scheduler,
+which Prospects never had.
+
+**A separate table, not a Prospect with `source="bark"`.** Considered and rejected:
+Prospect already carries `research_status`/`outreach_status`/`status`, none of which
+fit a hand-entered warm lead, and a Bark lead has no `google_place_id` identity to key
+on. Bolting retry-scheduler columns onto Prospect would give every Places-sourced row
+unused `retry_state`/`attempt_count`/`next_attempt_at` columns and vice versa. The
+call-placement plumbing is still shared (see below) — only the row shape differs.
+
+**Two independent axes, deliberately kept apart from day one** (contrast Prospect's
+`status`/`outreach_status`, which drifted into overlap by accretion — see ADR-006's
+"two overlapping outreach axes" note):
+- `retry_state` (`paused -> scheduled -> in_flight -> succeeded | exhausted`, or
+  `do_not_call` from any state) — drives the scheduler. Set only by lead_service's
+  state-transition functions, never written directly by a PATCH.
+- `status` (`new | contacted | booked | not_interested | unreachable`) — the
+  operator-facing campaign outcome, same idea as `Prospect.status`.
+
+**Created paused, armed explicitly.** `POST /api/leads` always lands `retry_state
+="paused"`; the scheduler only picks up a lead after `POST /{id}/start`. Auto-arming on
+create was considered and rejected — a lead entered with a typo'd phone number or
+before the operator has finished writing notes would otherwise start dialing
+immediately.
+
+**Prompt assembly reuses the call path, not the research pipeline.** There is no
+`CompanyResearch` for a lead (nothing was scraped), so `script_service.build_lead_prompt`
+is a sibling to `build_prospect_prompt`, not a repurposing of it: it injects a
+`[LEAD DETAILS]` block (source, service requested, budget, city/country, the caller's
+own request text, and anything in the generic `details` JSON) plus the operator's
+`notes` as `[OPERATOR NOTES]`, same "notes win" convention as prospects. Everything
+below the prompt is the *same* code Prospects use — `test_call_service.place_test_call`
+gained an optional `lead_id` param (threaded through to `Call.lead_id`) rather than a
+parallel dispatch path, so provisioning, streaming, ledger de-duplication (ADR-009),
+and webhook handling are identical for a lead call and a prospect call. This inherits
+prospects' existing limitation: `_provision_custom_llm_agent` rejects
+`system_prompt_override`, so a lead can only be called through a hosted-LLM agent
+today.
+
+**Outcome isn't known at dispatch time — it arrives on the webhook.** Placing a call
+just flips `retry_state` to `in_flight` and increments `attempt_count`; whether it
+counts as a success is decided later, when Retell says the call ended.
+`call_service.apply_retell_call_state`'s three callers (`handle_call_ended`,
+`handle_call_analyzed`, `reconcile_call` — the single writer ADR-007 established) each
+now call a new `_maybe_advance_lead(db, call)` once the call reaches a terminal status,
+which hands off to `lead_service.evaluate_call_outcome` if `Call.lead_id` is set. This
+piggybacks on the *existing* self-healing path rather than adding a second one: a
+webhook that never arrives is already covered by reconciliation, and the lead scheduler
+gets that resilience for free.
+
+"Success" is defined as **the call reaching `resolved`/`escalated` status AND at least
+one `caller`-role transcript turn** — a voicemail pickup or instant hangup produces
+`resolved` with zero caller turns and is treated as a failed attempt, not a success,
+per the operator's own bar ("human answered and talked"). `evaluate_call_outcome` is
+guarded on `retry_state == "in_flight"`, which does two jobs at once: it makes the
+function safe to call twice for the same call (`call_ended` then `call_analyzed` both
+reach a terminal status and both call it — the first flips the state, the second is a
+no-op), and it means an operator who paused or do-not-called a lead while its call was
+still ringing is respected rather than silently re-armed by the call's late outcome.
+
+**Backoff ladder**: 1h → 3h → next 09:00 → next 14:00 → +1 day, capped at
+`settings.lead_max_attempts` (5) before the lead is marked `exhausted` for manual
+review. Every computed slot is snapped into Mon-Fri
+`lead_business_hours_start..lead_business_hours_end` in the lead's own timezone
+(`Lead.timezone`, falling back to `settings.default_lead_timezone` — no timezone
+derivation from city/country; the operator sets it explicitly or accepts the default).
+A dispatch that never reaches `_dispatch` at all (no agent assigned, no phone, or a
+`TestCallError` raised before the call is placed) still consumes an attempt against the
+cap — `dispatch_scheduled` increments `attempt_count` itself in those branches, since
+`advance_after_failure` (shared with the placed-and-failed path) does not increment on
+its own, to avoid double-counting a call `_dispatch` already counted.
+
+**Scheduling runs on a clock, not an event** — `backend/workers/lead_tasks.py`'s
+`dispatch_due_leads` (Celery Beat, every 5 minutes, `celery_app.py`'s `beat_schedule`)
+claims `scheduled` leads whose `next_attempt_at` has passed. A tick that runs after
+downtime can find a due slot that's since rolled past business hours (e.g. the beat
+process was down overnight); it reschedules to the next valid window without spending
+an attempt, rather than dialing at 2am or burning a retry on nothing the lead did
+wrong. Celery Beat is a separate process from the worker (a worker alone never reads
+`beat_schedule`) — see CLAUDE.md's Commands and docker-compose.yml's new `beat` service.
+
+**Stale in-flight sweep**, same task file, same cadence: a lead stuck `in_flight` past
+`settings.lead_stale_in_flight_minutes` (20) means either a genuinely long call (the
+sweep is then a no-op — `call_service.reconcile_call` reports "still ongoing" and
+nothing changes) or a lost webhook (ADR-007's exact scenario), reusing that existing
+reconcile path rather than inventing a second one. If reconciling brings the call to a
+terminal status, the same `_maybe_advance_lead` hook that call_service's webhook
+handlers use fires automatically — the sweep's only job is to trigger reconciliation
+for leads old enough that Retell should have concluded them by now.
+
 ## Coding conventions
 
 ### Python
@@ -779,6 +887,7 @@ files, stop.
 | **Add a new router (new resource)** | all of the above, plus register the router in `main.py`, and **add it to the structure tree in this file** |
 | **Add a new service / worker / top-level component** | write it, then update the structure tree in this file in the same change — this is the rule whose absence caused the drift this table exists to prevent |
 | **Change voice-platform behavior** | the relevant `*_adapter.py` only. If you find yourself importing the Retell or Vapi SDK anywhere else, stop — that's the ADR-002 violation. |
+| **Change the lead retry scheduler** (backoff timing, business hours, success criteria) | `lead_service.py` (`compute_next_attempt`/`within_business_hours`/`evaluate_call_outcome`) → `config.py` if a threshold moves → `tests/test_lead_service.py` → `CONTEXT.md` ADR-011 if the policy itself changes, not just a number |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
 do real work inline in a webhook handler (ADR-005). See [EFFICIENCY.md](EFFICIENCY.md)
@@ -828,6 +937,25 @@ for how to move through these efficiently.
 
 If step 1 never happens (no tunnel, unset `PUBLIC_BASE_URL`, tunnel restarted mid-call),
 `POST /api/calls/sync` reconciles from the platform instead — see ADR-007.
+
+### Lead retry scheduler (ADR-011)
+1. Operator types in a lead (Bark.com or otherwise) via `POST /api/leads` — lands
+   `retry_state="paused"`.
+2. Operator assigns an agent, writes notes, then `POST /{id}/start` arms it:
+   `retry_state="scheduled"`, `next_attempt_at` set to the next business-hours slot.
+3. Celery Beat's `dispatch_due_leads` (every 5 min) claims due leads still in the
+   window, builds a personalized prompt (`script_service.build_lead_prompt`), and
+   places the call through the same `test_call_service.place_test_call` path Prospects
+   use, tagged with `lead_id`. `retry_state="in_flight"`, `attempt_count` +1.
+4. The call proceeds exactly like any other outbound call (see "Outbound call" above)
+   — nothing lead-specific happens mid-call.
+5. On the call's `call_ended`/`call_analyzed` webhook (or a reconcile),
+   `call_service`'s terminal-state hook calls `lead_service.evaluate_call_outcome`:
+   answered-and-talked → `retry_state="succeeded"`; otherwise the backoff ladder picks
+   the next `next_attempt_at`, or `retry_state="exhausted"` past the attempt cap.
+6. `sweep_stale_leads` (same cadence) reconciles any lead stuck `in_flight` past
+   `lead_stale_in_flight_minutes`, covering a lost webhook the same way ADR-007 already
+   does for ordinary calls.
 
 ### Agent testing sandbox
 Try an agent's persona/system_prompt over text before spending a real call on it —

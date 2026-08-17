@@ -2,7 +2,7 @@
 
 > **This started as a target-state document; the structural move described below has
 > since happened** — `components/ui/`, `components/layout/`, and
-> `components/features/{agents,calls,prospects}/` all exist and match CONTEXT.md's
+> `components/features/{agents,calls,prospects,leads}/` all exist and match CONTEXT.md's
 > structure tree. It stays the reference for the *conventions* (where a new component
 > goes, tokens, fetching-in-hooks) rather than a still-pending migration. Where it
 > says "today", that's current reality; where it says "target", read it as "the
@@ -33,7 +33,8 @@ frontend/src/
 │   └── features/             # domain components, grouped by resource
 │       ├── agents/           #   AgentCard, AgentBuilder, Stepper, PromptEditor
 │       ├── calls/            #   CallTable, TranscriptViewer, LiveCallPanel
-│       └── prospects/        #   Search/filter/group tree/detail panel + sandbox chat
+│       ├── prospects/        #   Search/filter/group tree/detail panel + sandbox chat
+│       └── leads/            #   Create form/row/detail panel + stats (ADR-011)
 ├── hooks/                    # all data fetching lives here
 └── lib/                      # api client, types, formatting, constants
 ```

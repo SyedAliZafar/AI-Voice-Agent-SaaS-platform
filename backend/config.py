@@ -96,6 +96,16 @@ class Settings(BaseSettings):
     priority_weight_website: float = 1.5
     priority_weight_phone: float = 1.0
 
+    # Lead retry scheduler (ADR-011) — Bark.com and other hand-entered warm leads.
+    # Fallback IANA tz for a lead with no timezone of its own.
+    default_lead_timezone: str = "Europe/London"
+    lead_business_hours_start: int = 9
+    lead_business_hours_end: int = 18
+    lead_max_attempts: int = 5
+    # A lead stuck "in_flight" longer than this (webhook lost, tunnel down) is treated
+    # as stale and reconciled via the platform (ADR-007), not left to retry forever.
+    lead_stale_in_flight_minutes: int = 20
+
     # Storage
     s3_bucket: str = "voiceagent-recordings"
     s3_access_key: str = ""

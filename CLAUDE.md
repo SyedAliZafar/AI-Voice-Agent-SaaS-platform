@@ -22,6 +22,7 @@ uv run alembic -c backend/migrations/alembic.ini revision --autogenerate -m "...
 # .env, relative to the CWD. They also hit the SHARED Neon database — a migration you
 # apply lands on your teammates immediately. See RUN.md.
 uv run celery -A backend.workers.celery_app worker --loglevel=info  # run worker
+uv run celery -A backend.workers.celery_app beat --loglevel=info    # run scheduler (lead retry, ADR-011)
 ```
 
 ### Frontend (Next.js, in `frontend/`)

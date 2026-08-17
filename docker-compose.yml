@@ -168,6 +168,24 @@ services:
       - ./backend:/app/backend
     command: celery -A backend.workers.celery_app worker --loglevel=info
 
+  # Fires the lead retry scheduler (ADR-011: dispatch_due_leads/sweep_stale_leads) on
+  # celery_app.py's beat_schedule. A worker alone never runs a beat_schedule — it only
+  # executes tasks it's handed, so this is a separate process, not the worker's job.
+  # No Bark leads means no cost to leaving this running; skip it if leads aren't in use yet.
+  beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_started
+    volumes:
+      - ./backend:/app/backend
+    command: celery -A backend.workers.celery_app beat --loglevel=info
+
 volumes:
   pgdata:
   miniodata:
