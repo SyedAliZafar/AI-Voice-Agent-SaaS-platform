@@ -59,7 +59,7 @@ async def _sweep_stale_leads() -> None:
     call_ended webhook never arrived (ADR-007's exact scenario). Reconciling here
     reuses the platform-authoritative self-healing path rather than reinventing it;
     if reconcile brings the call to a terminal status, call_service's own hook
-    (_maybe_advance_lead) takes it from there.
+    (_fanout_lead_post_call) takes it from there.
     """
     cutoff = datetime.now(UTC) - timedelta(minutes=settings.lead_stale_in_flight_minutes)
     adapter = RetellAdapter()

@@ -53,6 +53,13 @@ PROTECTED_ROUTES = [
     ("post", f"/api/leads/{uuid.uuid4()}/pause"),
     ("post", f"/api/leads/{uuid.uuid4()}/do-not-call"),
     ("post", f"/api/leads/{uuid.uuid4()}/call"),
+    # Integrations hold third-party credentials, so an unauthenticated read here would be
+    # a credential disclosure rather than just a data leak.
+    ("get", "/api/integrations"),
+    ("get", "/api/integrations/crm"),
+    ("put", "/api/integrations/crm"),
+    ("delete", "/api/integrations/crm"),
+    ("post", "/api/integrations/crm/test"),
 ]
 
 
@@ -206,6 +213,27 @@ async def test_token_for_one_tenant_does_not_leak_via_creation(
 
     agents = await agent_service.list_agents(db_session, tenant_id)
     assert [a.name for a in agents] == ["New"]
+
+
+@pytest.mark.asyncio
+async def test_cannot_read_another_tenants_crm_credentials(
+    client, tenant_id, auth_headers, other_auth_headers
+):
+    """The highest-consequence cross-tenant read on the API: this row holds a live HubSpot
+    key. A 404 rather than a 403, same as every other resource, so ids stay
+    non-enumerable."""
+    await client.put(
+        "/api/integrations/crm",
+        json={"kind": "crm", "provider": "hubspot", "config": {"api_key": "pat-na1-secret"}},
+        headers=auth_headers,
+    )
+
+    resp = await client.get("/api/integrations/crm", headers=other_auth_headers)
+    assert resp.status_code == 404
+    assert "pat-na1-secret" not in resp.text
+
+    listed = await client.get("/api/integrations", headers=other_auth_headers)
+    assert listed.json() == []
 
 
 @pytest.mark.asyncio

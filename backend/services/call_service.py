@@ -381,10 +381,29 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     return changed
 
 
-async def _maybe_advance_lead(db: AsyncSession, call: Call) -> None:
-    """If this call was placed by the lead retry scheduler (ADR-011) and has just
-    reached a terminal status, hand off to lead_service to record the outcome and
-    either close out the lead or schedule its next attempt.
+async def _fanout_lead_post_call(db: AsyncSession, call: Call) -> None:
+    """Everything that must happen once a lead's call reaches a terminal status.
+
+    Was `_maybe_advance_lead`, which did exactly one thing. Renamed when phase5 gave it a
+    second and third job (CRM push, NDA intent extraction) — the name now describes the
+    seam rather than one of its consumers, so adding the next one doesn't rename it again.
+
+    **All three callers must keep going through this one function.** `handle_call_ended`,
+    `handle_call_analyzed` and `reconcile_call` each reach terminal state by a different
+    route, and routing them all through here is what ADR-007's single-writer rule buys:
+    anything hung off this point inherits reconciliation's self-healing for free, so a
+    webhook that never arrives doesn't need its own recovery path. That's how the lead
+    scheduler got resilient (ADR-011), and it's why the CRM sync and the NDA extractor
+    belong here rather than in the webhook handler.
+
+    Two rules for whatever gets added below:
+    - **Enqueue, never execute.** This runs on the webhook request path, which has a
+      <200ms budget (ADR-005). Celery does the work.
+    - **Assume it runs more than once per call.** call_ended and call_analyzed both reach
+      a terminal status, and a later reconcile can too. `evaluate_call_outcome` handles
+      that with its own `in_flight` guard; every new consumer needs its own equivalent
+      (phase5 Session 2 keys on `Call.crm_engagement_id`, Session 3 on a unique
+      constraint).
 
     Imported locally, not at module level: lead_service doesn't import call_service
     today, but keeping the dependency one-directional and lazy avoids ever having to
@@ -394,7 +413,13 @@ async def _maybe_advance_lead(db: AsyncSession, call: Call) -> None:
         return
     from backend.services import lead_service
 
+    # 1. Scheduler bookkeeping — succeeded, or back on the backoff ladder (ADR-011).
+    #    Stays inline and awaited: it's two local queries, and the retry state must be
+    #    correct before anything downstream reads it.
     await lead_service.evaluate_call_outcome(db, call)
+
+    # 2. CRM push (phase5 Session 2) and 3. NDA intent extraction (Session 4) get
+    #    enqueued here. Nothing to enqueue yet — those task bodies don't exist.
 
 
 async def handle_call_ended(
@@ -415,7 +440,7 @@ async def handle_call_ended(
 
     await apply_retell_call_state(db, call, data)
     await db.commit()
-    await _maybe_advance_lead(db, call)
+    await _fanout_lead_post_call(db, call)
 
 
 async def handle_call_analyzed(
@@ -434,7 +459,7 @@ async def handle_call_analyzed(
 
     await apply_retell_call_state(db, call, payload)
     await db.commit()
-    await _maybe_advance_lead(db, call)
+    await _fanout_lead_post_call(db, call)
 
 
 async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
@@ -460,7 +485,7 @@ async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
     changed = await apply_retell_call_state(db, call, payload)
     if changed:
         await db.commit()
-        await _maybe_advance_lead(db, call)
+        await _fanout_lead_post_call(db, call)
     return changed
 
 

@@ -354,7 +354,7 @@ async def advance_after_failure(db: AsyncSession, lead: Lead, outcome: str) -> N
 
 async def evaluate_call_outcome(db: AsyncSession, call: Call) -> None:
     """Decide whether a just-terminal lead call counts as success ("human answered and
-    talked") or another retry is due. Called from call_service._maybe_advance_lead.
+    talked") or another retry is due. Called from call_service._fanout_lead_post_call.
 
     Guarded on retry_state == "in_flight" so this only ever fires once per attempt:
     call_ended and call_analyzed both reach a terminal Call.status and both call this,

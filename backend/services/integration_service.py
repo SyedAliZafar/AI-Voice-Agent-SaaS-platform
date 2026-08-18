@@ -101,6 +101,34 @@ async def create_hubspot_contact(email: str, phone: str, notes: str, api_key: st
         return resp.json()
 
 
+async def verify_hubspot_credentials(api_key: str) -> None:
+    """Is this HubSpot token usable? Raises IntegrationError with the provider's own text
+    if not; returns None on success.
+
+    Backs POST /api/integrations/{kind}/test, so an operator finds out their token is
+    wrong while they're on the settings page rather than from a silently failing CRM sync
+    three days later.
+
+    A one-record read of the object we actually write to, deliberately: a token can be
+    valid and still lack the `crm.objects.contacts.*` scopes a private app has to grant
+    explicitly, and asking for the wrong thing would report healthy right up until the
+    first real write. Read-only, so it can be run as often as anyone likes and never
+    creates anything.
+
+    Timeouts are NOT translated to IntegrationTimeoutError here. That distinction exists
+    because a mutating request may have landed despite the timeout (see the class
+    docstring); nothing about a failed GET is ambiguous — retrying it is free.
+    """
+    _require(api_key, "api_key", "crm")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            "https://api.hubapi.com/crm/v3/objects/contacts",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params={"limit": 1},
+        )
+        _raise_for_status_with_body(resp, "HubSpot")
+
+
 def _local_datetime(start_time: str, time_zone: str) -> datetime:
     """Resolve an LLM-supplied start time to an aware datetime in `time_zone`.
 

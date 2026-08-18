@@ -50,6 +50,7 @@ voiceagent/
 │   │   └── phase3.md             # Call lifecycle correctness + reaching DeepSeek
 │   └── in-progress/              # Still open — promote only when fully verified
 │       ├── phase4.md             # Remediation queue (Sessions 1-11)
+│       ├── phase5.md             # CRM push + post-call NDA dispatch for Leads (Sessions 1-6)
 │       ├── outliers.md           # Real-call findings feeding phase4
 │       ├── session5.md           # Session 5 handoff (has an open "what's left" list)
 │       └── promptstotest.md      # Prompts pending a real-call verification pass
@@ -66,6 +67,8 @@ voiceagent/
 │   │   ├── call.py               # Call, CallEvent, Transcript
 │   │   ├── prospect.py           # Prospect — Prospector/Researcher pipeline (see ADR-006)
 │   │   ├── lead.py               # Lead — hand-entered warm leads + retry scheduler state (ADR-011)
+│   │   ├── integration.py        # Integration — per-tenant CRM connection (phase5 S1); NOT a ToolConfig row, see its docstring
+│   │   ├── nda.py                # NdaDispatch — one NDA per lead call, unique(lead_id, call_id) (phase5 S3)
 │   │   └── base.py               # DeclarativeBase, TenantMixin, TimestampMixin, UUIDMixin
 │   │
 │   ├── schemas/                  # Pydantic request/response schemas
@@ -74,6 +77,8 @@ voiceagent/
 │   │   ├── call.py
 │   │   ├── prospect.py
 │   │   ├── lead.py
+│   │   ├── integration.py        # + mask_config/mask_secret — responses never echo a stored secret
+│   │   ├── nda.py
 │   │   └── webhook.py
 │   │
 │   ├── api/                      # FastAPI routers
@@ -84,6 +89,7 @@ voiceagent/
 │   │   ├── analytics.py          # Metrics, aggregations
 │   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete
 │   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
+│   │   ├── integrations.py       # Connect a tenant's CRM: GET/PUT/DELETE /{kind} + POST /{kind}/test — the repo's first credential CRUD surface
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
 │   │   ├── ws.py                 # WebSocket endpoint for live call streaming (dashboard-facing)
 │   │   └── retell_ws.py          # Retell Custom LLM WebSocket (in progress — see phases/completed/phase0.md)
@@ -100,7 +106,8 @@ voiceagent/
 │   │   ├── public_url.py         # Resolves PUBLIC_BASE_URL; "auto" discovers the live quick-tunnel host from cloudflared (ADR-007)
 │   │   ├── llm_service.py        # Provider-agnostic LLM calls (DeepSeek/OpenAI, ADR-008), tool execution
 │   │   ├── sandbox_service.py    # Text-chat agent testing sandbox — no phone call, see "Agent testing sandbox" flow
-│   │   ├── integration_service.py # CRM, calendar, custom webhook integrations
+│   │   ├── integration_service.py # *Calling* third parties: Cal.com book/cancel/reschedule/slots, HubSpot contact + credential verify
+│   │   ├── integration_config_service.py # *Storing which* third parties a tenant connected — CRUD + validation for models/integration.py. Owns no HTTP; delegates verification to integration_service
 │   │   ├── analytics_service.py  # Metrics computation, sentiment aggregation
 │   │   ├── places_service.py     # Google Places search, city/country extraction, autocomplete — prospecting Agent 1, discovery (ADR-006)
 │   │   ├── research_service.py   # Company research — prospecting Agent 2, knowledge base (ADR-006)
@@ -224,6 +231,8 @@ voiceagent/
     ├── test_leads.py              # /api/leads router: create-paused, lifecycle, tenant scoping, call-now (ADR-011)
     ├── test_lead_service.py       # backoff math, business-hours snapping, dispatch, outcome evaluation, idempotency
     ├── test_lead_tasks.py         # dispatch_due_leads / sweep_stale_leads task bodies
+    ├── test_integrations.py       # /api/integrations router: validation, tenant scoping, merge-not-replace PUT, secret masking
+    ├── test_nda_model.py          # NdaDispatch: the unique(lead_id, call_id) guarantee, states, tenant NDA fields
     └── test_tools/
         ├── test_book_appointment.py
         └── test_lookup_customer.py
@@ -777,8 +786,10 @@ just flips `retry_state` to `in_flight` and increments `attempt_count`; whether 
 counts as a success is decided later, when Retell says the call ended.
 `call_service.apply_retell_call_state`'s three callers (`handle_call_ended`,
 `handle_call_analyzed`, `reconcile_call` — the single writer ADR-007 established) each
-now call a new `_maybe_advance_lead(db, call)` once the call reaches a terminal status,
-which hands off to `lead_service.evaluate_call_outcome` if `Call.lead_id` is set. This
+now call a new `_fanout_lead_post_call(db, call)` once the call reaches a terminal status
+(named `_maybe_advance_lead` when ADR-011 landed; renamed in phase5 Session 1, when it
+gained further consumers — see the note at the end of this ADR), which hands off to
+`lead_service.evaluate_call_outcome` if `Call.lead_id` is set. This
 piggybacks on the *existing* self-healing path rather than adding a second one: a
 webhook that never arrives is already covered by reconciliation, and the lead scheduler
 gets that resilience for free.
@@ -819,9 +830,24 @@ wrong. Celery Beat is a separate process from the worker (a worker alone never r
 sweep is then a no-op — `call_service.reconcile_call` reports "still ongoing" and
 nothing changes) or a lost webhook (ADR-007's exact scenario), reusing that existing
 reconcile path rather than inventing a second one. If reconciling brings the call to a
-terminal status, the same `_maybe_advance_lead` hook that call_service's webhook
+terminal status, the same `_fanout_lead_post_call` hook that call_service's webhook
 handlers use fires automatically — the sweep's only job is to trigger reconciliation
 for leads old enough that Retell should have concluded them by now.
+
+**2026-08-17 — the hook is now a fanout point, and that's deliberately load-bearing.**
+`_maybe_advance_lead` did one thing, so it was named after it. phase5 gives the same
+terminal-state moment two more consumers (a CRM push, and NDA intent extraction), so it
+was renamed `_fanout_lead_post_call`: the name now describes the seam rather than one of
+its consumers.
+
+Everything hung off that point inherits reconciliation's self-healing for free — which is
+the whole reason it's the right seam and not the webhook handler. A consumer added here
+does not need its own recovery path for a webhook that never arrives, because
+`reconcile_call` reaches the same function. Two constraints for anything added:
+*enqueue, never execute* (this runs on the webhook's <200ms budget, ADR-005), and *assume
+it runs more than once per call* — `call_ended`, `call_analyzed` and a later reconcile can
+all reach a terminal status, so each consumer needs its own idempotency guard the way
+`evaluate_call_outcome` has its `in_flight` check.
 
 ## Coding conventions
 
@@ -888,6 +914,8 @@ files, stop.
 | **Add a new service / worker / top-level component** | write it, then update the structure tree in this file in the same change — this is the rule whose absence caused the drift this table exists to prevent |
 | **Change voice-platform behavior** | the relevant `*_adapter.py` only. If you find yourself importing the Retell or Vapi SDK anywhere else, stop — that's the ADR-002 violation. |
 | **Change the lead retry scheduler** (backoff timing, business hours, success criteria) | `lead_service.py` (`compute_next_attempt`/`within_business_hours`/`evaluate_call_outcome`) → `config.py` if a threshold moves → `tests/test_lead_service.py` → `CONTEXT.md` ADR-011 if the policy itself changes, not just a number |
+| **Add an integration provider or config key** | `integration_config_service.py`'s `SUPPORTED` / `ALLOWED_CONFIG_KEYS` (one line each — no migration; `config` is JSONB) → a `verify_*_credentials` function in `integration_service.py` and a branch in `integration_config_service.verify` → `schemas/integration.py`'s `SECRET_CONFIG_KEYS` if it brings a new secret name → `tests/test_integrations.py`. Do **not** add credentials to `ToolConfig` — see `models/integration.py` for why |
+| **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
 do real work inline in a webhook handler (ADR-005). See [EFFICIENCY.md](EFFICIENCY.md)
