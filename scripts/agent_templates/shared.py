@@ -79,7 +79,6 @@ GENERIC_OBJECTION_BANK = """\
 | "I need to think about it / ask my partner" | Don't chase a maybe. Offer a short recording of this demo call to share, plus a specific follow-up time. |
 | "We tried something like this before, it sucked" | Probe what failed (usually generic bots/agencies with bad qualifying logic or templated work). Differentiate: built for their business, not templated. |
 | "What if it messes up with a real customer" | Explain human escalation/fallback exists, and the system gets tuned on real calls before going live for them. |
-
 {extra_rows}\
 """
 

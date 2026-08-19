@@ -257,25 +257,38 @@ async def check_websocket() -> None:
         )
     finally:
         from sqlalchemy import delete
+        from sqlalchemy.exc import IntegrityError
 
         from backend.models.call import CallEvent, Transcript
 
-        async with AsyncSessionLocal() as db:
-            # retell_ws.py writes a Transcript row turn-by-turn during the exchange above,
-            # and (since Session 4's llm_timing baseline) a CallEvent row per LLM call via
-            # record_llm_events — neither cascades on call_id, so both must go before the
-            # Call or the FK delete fails and leaves every row orphaned.
-            call_row = (
-                await db.execute(select(Call).where(Call.external_id == external_id))
-            ).scalar_one_or_none()
-            if call_row is not None:
-                await db.execute(delete(Transcript).where(Transcript.call_id == call_row.id))
-                await db.execute(delete(CallEvent).where(CallEvent.call_id == call_row.id))
-                await db.execute(delete(Call).where(Call.id == call_row.id))
-            await db.execute(delete(Agent).where(Agent.id == agent_id))
-            if created_tenant:
-                await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
-            await db.commit()
+        # Ordering the deletes children-first is necessary but NOT sufficient here:
+        # retell_ws.py's _persist_and_publish_turn runs *after* the terminal response
+        # frame is sent (deliberately — it keeps DB work off the turn-latency path), so
+        # the API container is still committing this call's Transcript/CallEvent rows
+        # while we clean up. A row landing between the CallEvent delete and the Call
+        # delete fails the FK and rolls the whole transaction back, orphaning every row.
+        # Retry the sequence instead of racing it once and losing.
+        for attempt in range(5):
+            try:
+                async with AsyncSessionLocal() as db:
+                    call_row = (
+                        await db.execute(select(Call).where(Call.external_id == external_id))
+                    ).scalar_one_or_none()
+                    if call_row is not None:
+                        await db.execute(
+                            delete(Transcript).where(Transcript.call_id == call_row.id)
+                        )
+                        await db.execute(delete(CallEvent).where(CallEvent.call_id == call_row.id))
+                        await db.execute(delete(Call).where(Call.id == call_row.id))
+                    await db.execute(delete(Agent).where(Agent.id == agent_id))
+                    if created_tenant:
+                        await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
+                    await db.commit()
+                break
+            except IntegrityError:
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
         print("       cleaned up diagnostic rows")
 
 

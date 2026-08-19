@@ -393,6 +393,22 @@ async def test_import_csv_tolerates_excel_bom(client, auth_headers):
 
 
 @pytest.mark.asyncio
+async def test_import_csv_tolerates_header_casing_and_spacing(client, auth_headers):
+    """Real-world exports (Excel, Google Sheets, scrapers) write "Business Name" /
+    "Phone" rather than the snake_case the importer stores internally — headers should
+    be matched loosely rather than forcing operators to hand-edit every file.
+    """
+    content = "Business Name,Phone,City\nAcme HVAC,+491701234567,Berlin\n"
+
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(content), headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["imported"] == 1
+
+
+@pytest.mark.asyncio
 async def test_import_csv_is_tenant_scoped(
     client, db_session, tenant_id, other_tenant_id, auth_headers, other_auth_headers
 ):

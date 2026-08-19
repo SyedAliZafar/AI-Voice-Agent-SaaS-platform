@@ -99,8 +99,57 @@ system — this is a cheap win, get it right.\
     "validated": False,
 }
 
+ROOFING = {
+    "key": "roofing",
+    "label": "Roofing",
+    # Leads on the estimate pipeline rather than generic missed calls: for roofers the
+    # expensive loss isn't the call itself, it's the estimate that never got scheduled
+    # before a competitor got on the roof first. Crew scheduling / labour tracking is
+    # deliberately the last question, not the hook — it's an ops-software sell and
+    # belongs in the upsell beat, not the first 30 seconds.
+    "qualifying_flow": """\
+1. When someone calls for an estimate while your crews are up on a job, how does that \
+call get handled — office person, voicemail, or does it just get missed?
+2. How long does it usually take from that first call to actually having an estimator \
+at the property?
+3. Roughly how many estimate requests do you think you lose in a week to slow follow-up \
+or a competitor getting there first?
+4. What's an average roof worth to you — so a missed estimate has a real number \
+attached to it?
+5. How do you handle crew scheduling and tracking hours across jobs right now — \
+whiteboard, spreadsheet, texting the foreman, or dedicated software?\
+""",
+    "vocabulary": """\
+**Roofing:** tear-off vs. overlay, squares, decking, underlayment, ridge/valley/\
+flashing, dry-in, roof pitch, storey count, leak repair vs. full replacement, storm/hail \
+damage, insurance claim, adjuster, supplement, permit and final inspection, material vs. \
+workmanship warranty, material drop, crew vs. sub.
+
+**Crew/ops side (upsell vocabulary, not opener vocabulary):** crew scheduling, foreman \
+hours, job costing, day-of dispatch, weather delay reschedule.
+
+Wrong vocabulary here is an instant tell that this is a generic bot, not a specialist \
+system — this is a cheap win, get it right.\
+""",
+    "extra_objection_rows": (
+        '| "You can\'t quote a roof over the phone" | Agree immediately — no price gets '
+        "quoted. The agent captures what the estimator actually needs (leak vs. full "
+        "replacement, roof age, storey count, insurance claim or cash) and books the "
+        "inspection, so the estimator shows up already informed instead of the call "
+        "dying in voicemail. |\n"
+        '| "It\'s storm season, we\'re already slammed" | That\'s exactly when estimate '
+        "calls go unanswered and land with whoever picks up first. Frame as capacity "
+        "during the surge, not extra work on top of it. |\n"
+        '| "We already use [job scheduling software]" | Don\'t compete with it — ask '
+        "what happens to the call *before* a job exists in that system. The gap is "
+        "intake and follow-up, not scheduling. |"
+    ),
+    "validated": False,
+}
+
 INDUSTRIES = {
     "hvac_solar": HVAC_SOLAR,
     "dentist": DENTIST,
     "car_rentals": CAR_RENTALS,
+    "roofing": ROOFING,
 }

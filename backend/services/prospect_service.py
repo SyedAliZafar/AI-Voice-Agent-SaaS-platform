@@ -130,6 +130,15 @@ def _cell(row: dict[str, str | None], name: str) -> str:
     return (row.get(name) or "").strip()
 
 
+def _normalize_header(h: str | None) -> str:
+    """Casing/spacing/punctuation in a CSV's header row is an artifact of whatever
+    exported it (Excel, Google Sheets, a scraper) — "Business Name" and "business_name"
+    are the same column. Collapse both to the snake_case form CSV_REQUIRED_COLUMNS /
+    CSV_OPTIONAL_COLUMNS and every _cell() lookup below expect.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
+
+
 def normalize_website(raw: str | None) -> str | None:
     """Make an operator-typed website fetchable, or return None.
 
@@ -164,7 +173,11 @@ async def import_from_csv(
     """Create prospects from an operator-supplied CSV.
 
     Columns: business_name, phone (required); city, country, source, niche, website,
-    address (optional). Rows with an unusable phone or no business_name are skipped and
+    address (optional). Header matching is case/spacing/punctuation-insensitive (see
+    _normalize_header), so "Business Name" or "PHONE" both resolve fine — but the
+    normalized form must still land on exactly these names (e.g. "Phone Number" would
+    normalize to phone_number, not phone, and still be treated as missing). Rows with an
+    unusable phone or no business_name are skipped and
     counted, not fatal. A missing website is NOT an invalid row — it just means that
     prospect gets degraded (name/address-only) research, which the result's
     with_website/without_website split reports up front.
@@ -180,7 +193,8 @@ async def import_from_csv(
     rather than a duplicate set.
     """
     reader = csv.DictReader(io.StringIO(content))
-    headers = {(h or "").strip().lower() for h in (reader.fieldnames or [])}
+    reader.fieldnames = [_normalize_header(h) for h in (reader.fieldnames or [])]
+    headers = set(reader.fieldnames)
     missing = [c for c in CSV_REQUIRED_COLUMNS if c not in headers]
     if missing:
         raise CsvImportError(f"CSV is missing required column(s): {', '.join(missing)}")
