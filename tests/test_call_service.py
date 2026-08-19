@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from backend.models.call import Call
 from backend.services import call_service
 
 
@@ -98,16 +99,28 @@ async def test_handle_call_ended_prefers_platform_duration(db_session, tenant_id
 
 
 class _StubAdapter:
-    """Stands in for RetellAdapter.get_call in reconcile tests."""
+    """Stands in for RetellAdapter in reconcile and end_call tests."""
 
-    def __init__(self, payload: dict | None = None, raises: bool = False):
+    def __init__(
+        self,
+        payload: dict | None = None,
+        raises: bool = False,
+        stop_raises: bool = False,
+    ):
         self.payload = payload or {}
         self.raises = raises
+        self.stop_raises = stop_raises
+        self.stopped: list[str] = []
 
     async def get_call(self, call_external_id: str) -> dict:
         if self.raises:
             raise RuntimeError("platform unreachable")
         return self.payload
+
+    async def stop_call(self, call_external_id: str) -> None:
+        if self.stop_raises:
+            raise RuntimeError("platform refused the hangup")
+        self.stopped.append(call_external_id)
 
 
 @pytest.mark.asyncio
@@ -335,3 +348,79 @@ async def test_apply_retell_call_state_parses_transcript_object_into_turns(db_se
     # sync_full_text=False in apply_retell_call_state — Retell's own raw "transcript"
     # string wins over a synthesized one.
     assert transcript.full_text == "user: Hi\nagent: Hello!"
+
+
+@pytest.mark.asyncio
+async def test_end_call_hangs_up_and_records_terminal_state(db_session, tenant_id):
+    """The emergency stop's happy path: the platform is told to hang up, and the row is
+    closed out from the platform's own account of how the call ended.
+    """
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "live_1", "+491701234567"
+    )
+    adapter = _StubAdapter(
+        {
+            "call_status": "ended",
+            "disconnection_reason": "agent_hangup",
+            "duration_ms": 9_000,
+        }
+    )
+
+    changed = await call_service.end_call(db_session, call, adapter)
+
+    assert adapter.stopped == ["live_1"]
+    assert changed is True
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated.status == "resolved"
+    assert updated.duration_sec == 9
+
+
+@pytest.mark.asyncio
+async def test_end_call_hangs_up_even_if_the_reconcile_fails(db_session, tenant_id):
+    """Ordering guarantee: the hangup must not be undone or skipped by bookkeeping that
+    fails afterwards. The row stays in_progress for the webhook to settle, but the call
+    is down — which is the part the operator needed.
+    """
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "live_2", "+491701234567"
+    )
+    adapter = _StubAdapter(raises=True)  # get_call blows up; stop_call still works
+
+    changed = await call_service.end_call(db_session, call, adapter)
+
+    assert adapter.stopped == ["live_2"]
+    assert changed is False
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_end_call_propagates_a_failed_hangup(db_session, tenant_id):
+    """A hangup that didn't happen must never look like one that did — the caller has to
+    be able to tell the operator the call is still live.
+    """
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "live_3", "+491701234567"
+    )
+
+    with pytest.raises(RuntimeError, match="refused the hangup"):
+        await call_service.end_call(db_session, call, _StubAdapter(stop_raises=True))
+
+
+@pytest.mark.asyncio
+async def test_end_call_rejects_a_call_never_placed_on_the_platform(db_session, tenant_id):
+    """No external_id means nothing was ever dialed, so there is no call to hang up —
+    better to say so than to no-op and imply something was stopped.
+    """
+    call = Call(
+        tenant_id=tenant_id,
+        agent_id=uuid.uuid4(),
+        caller_number="+491701234567",
+        status="in_progress",
+        started_at=datetime.now(UTC),
+    )
+    db_session.add(call)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="no external_id"):
+        await call_service.end_call(db_session, call, _StubAdapter())

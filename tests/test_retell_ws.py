@@ -38,11 +38,15 @@ from sqlalchemy.pool import NullPool
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from backend.api import retell_ws
 from backend.api.retell_ws import (
     _duplicate_tool_result,
     _find_duplicate_ledger_entry,
     _ledger_entry,
     _ledger_note,
+    _looks_like_ivr,
+    _PreambleGuard,
+    _strip_meta_preamble,
     _system_prompt_with_context,
     _to_conversation_history,
 )
@@ -390,10 +394,15 @@ def test_llm_websocket_does_not_greet_again_on_reconnect(tmp_path):
 
 
 def test_llm_websocket_caller_speaking_first_cancels_the_greeting(tmp_path):
-    """If they answer with "Hello?" while the opener is still generating, the opener must
-    be dropped rather than spoken over the top of their turn. current_response_id is a
-    sentinel for the greeting precisely so an incoming response_id of 0 reads as a
-    barge-in and not as Retell resending the same turn."""
+    """If they cut in with something substantive while the opener is still generating,
+    the opener must be dropped rather than spoken over the top of their turn.
+    current_response_id is a sentinel for the greeting precisely so an incoming
+    response_id of 0 reads as a barge-in and not as Retell resending the same turn.
+
+    barge_in_min_turn_ms=0 disables the overlap window so this exercises the cancelling
+    path specifically — with the window on, a barge-in this early is absorbed instead,
+    which is what test_llm_websocket_filler_barge_in_lets_the_greeting_finish covers.
+    """
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'greet_cancel.db'}"
     tenant_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -419,6 +428,55 @@ def test_llm_websocket_caller_speaking_first_cancels_the_greeting(tmp_path):
         patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
         patch("backend.services.llm_service.stream_agent_response", MagicMock(side_effect=_stream)),
         patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+        patch("backend.api.retell_ws.settings.barge_in_min_turn_ms", 0),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json({"interaction_type": "call_details", "call": {"call_id": "x"}})
+                assert greeting_started.wait(timeout=5), "greeting never started"
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 0,
+                        "transcript": [{"role": "user", "content": "Who is this?"}],
+                    }
+                )
+                frames = _recv_until_complete(ws)
+
+    assert [f["content"] for f in frames if f["content"]] == ["Hi, you've reached Krucx."]
+
+
+def test_llm_websocket_filler_barge_in_lets_the_greeting_finish(tmp_path):
+    """The mirror of the test above: "Hello?" over the opener is not a decision to take
+    the floor, it is someone checking the line is live. Cancelling the opener there is
+    what produced the fragment-and-apologise loop on call b23851eb, so the opener must
+    survive and the caller's turn is answered straight after it."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'greet_filler.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_greet_filler_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id)
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    greeting_started = threading.Event()
+
+    async def _stream(*args, **kwargs):
+        history = args[1]
+        if any("speak first" in m.get("content", "") for m in history):
+            greeting_started.set()
+            # Long enough that the caller's "Hello?" lands mid-opener, short enough that
+            # the absorbed path still completes well inside the receive timeout.
+            await asyncio.sleep(0.2)
+            yield "Hi, this is the assistant for Krucx."
+        else:
+            yield "Good to speak to you."
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", MagicMock(side_effect=_stream)),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
     ):
         with TestClient(app) as client:
             with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
@@ -432,9 +490,12 @@ def test_llm_websocket_caller_speaking_first_cancels_the_greeting(tmp_path):
                         "transcript": [{"role": "user", "content": "Hello?"}],
                     }
                 )
-                frames = _recv_until_complete(ws)
+                spoken = []
+                # Two turns now complete, not one: the opener, then the answer to them.
+                for _ in range(2):
+                    spoken += [f["content"] for f in _recv_until_complete(ws) if f["content"]]
 
-    assert [f["content"] for f in frames if f["content"]] == ["Hi, you've reached Krucx."]
+    assert spoken == ["Hi, this is the assistant for Krucx.", "Good to speak to you."]
 
 
 def test_llm_websocket_kill_switch_off_uses_blocking_path(tmp_path):
@@ -674,7 +735,10 @@ def test_llm_websocket_persist_failure_does_not_break_response(tmp_path):
 def test_llm_websocket_barge_in_cancels_stale_generation(tmp_path):
     """ADR-009: a response_required with a NEW response_id while a turn is still
     generating cancels the stale task instead of letting it finish — the caller hears
-    the new turn, not a lingering answer to the question they already talked over."""
+    the new turn, not a lingering answer to the question they already talked over.
+
+    barge_in_min_turn_ms=0 disables the overlap window so the substantive utterance below
+    cancels immediately; the window's own behavior is covered separately."""
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'barge_in.db'}"
     tenant_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -691,19 +755,20 @@ def test_llm_websocket_barge_in_cancels_stale_generation(tmp_path):
         call_count["n"] += 1
         if call_count["n"] == 1:
             try:
-                yield "stale-chunk"
+                yield "This is the stale answer that must be cancelled."
                 # Never completes on its own (bounded so a broken cancellation path
                 # fails the test in ~30s instead of hanging the suite forever).
                 await asyncio.sleep(30)
             finally:
                 cancelled["flag"] = True
         else:
-            yield "fresh-response"
+            yield "This is the fresh answer after the barge-in."
 
     with (
         patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
         patch("backend.services.llm_service.stream_agent_response", fake_stream),
         patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+        patch("backend.api.retell_ws.settings.barge_in_min_turn_ms", 0),
     ):
         with TestClient(app) as client:
             with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
@@ -717,7 +782,7 @@ def test_llm_websocket_barge_in_cancels_stale_generation(tmp_path):
                 )
                 first_frame = ws.receive_json()
                 assert first_frame["response_id"] == 1
-                assert first_frame["content"] == "stale-chunk"
+                assert first_frame["content"] == "This is the stale answer that must be cancelled."
 
                 # Barge-in: a new turn arrives before the first one finished.
                 ws.send_json(
@@ -744,7 +809,7 @@ def test_llm_websocket_barge_in_cancels_stale_generation(tmp_path):
                 assert pong == {"response_type": "ping_pong", "timestamp": 99}
 
     assert all(f["response_id"] == 2 for f in frames)
-    assert "".join(f["content"] for f in frames) == "fresh-response"
+    assert "".join(f["content"] for f in frames) == "This is the fresh answer after the barge-in."
 
 
 def test_llm_websocket_ping_pong_answered_while_generating(tmp_path):
@@ -760,7 +825,7 @@ def test_llm_websocket_ping_pong_answered_while_generating(tmp_path):
     test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
 
     async def fake_stream(*args, **kwargs):
-        yield "chunk"
+        yield "A first chunk long enough to reach the wire promptly."
         await asyncio.sleep(30)  # bounded — see barge-in test's comment
         yield "unreachable"
 
@@ -780,7 +845,7 @@ def test_llm_websocket_ping_pong_answered_while_generating(tmp_path):
                     }
                 )
                 partial = ws.receive_json()
-                assert partial["content"] == "chunk"
+                assert partial["content"] == "A first chunk long enough to reach the wire promptly."
 
                 ws.send_json({"interaction_type": "ping_pong", "timestamp": 42})
                 pong = ws.receive_json()
@@ -1284,3 +1349,406 @@ def test_llm_websocket_duplicate_request_skips_real_dispatch_and_reaches_check_d
     assert captured_check_results[1]["reference"] == "conf123"
     assert "conf123" in captured_check_results[1]["instruction"]
     assert "".join(f["content"] for f in frames) == "You're already booked for that time."
+
+
+# --- Barge-in guard (_should_let_turn_finish and friends) --------------------------
+#
+# Regression cover for call b23851eb, where Retell reported an interruption for every
+# grunt the prospect made, each one cancelled the reply mid-word, and the fragments he
+# heard made him say "what?" — which cancelled the next reply too. See
+# backend/config.py's barge_in_min_turn_ms.
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["Yo.", "What?", "yeah", "Mhm.", "uh huh", "OK okay", "  Hello?  ", "Right, yeah, ok"],
+)
+def test_filler_utterances_never_cancel_a_turn(utterance):
+    assert retell_ws._is_filler(utterance) is True
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "",
+        "Stop.",  # a real instruction, however short — must always cut the agent off
+        "wait",
+        "no thanks",
+        "What's that?",  # carries "that": a genuine request to repeat, not backchannel
+        "how much does it cost",
+        "yeah but what about the price",  # over the word ceiling even though it opens filler
+    ],
+)
+def test_substantive_utterances_still_cancel(utterance):
+    assert retell_ws._is_filler(utterance) is False
+
+
+def test_should_let_turn_finish_absorbs_early_overlap_then_stops():
+    """The window is about *when* the interruption landed, independent of what was said:
+    a substantive utterance overlapping the first moments of a reply is still overlap,
+    but the same words a second later are a real interruption."""
+    transcript = [{"role": "user", "content": "how much does it cost"}]
+    assert retell_ws._should_let_turn_finish(100, transcript) is True
+    assert retell_ws._should_let_turn_finish(5000, transcript) is False
+
+
+def test_should_let_turn_finish_absorbs_filler_however_late():
+    """Backchannel is never an interruption, no matter how long the agent has been
+    talking — this is the half of the guard that actually breaks the b23851eb loop,
+    since by the third "what?" the window has long since expired."""
+    assert retell_ws._should_let_turn_finish(60_000, [{"role": "user", "content": "what?"}]) is True
+
+
+def test_with_agent_turn_splices_the_reply_we_just_finished():
+    """Retell built the queued frame's transcript before the absorbed turn finished, so
+    without this the next generation cannot see what it just said and repeats it."""
+    data = {"response_id": 3, "transcript": [{"role": "user", "content": "yeah"}]}
+    spliced = retell_ws._with_agent_turn(data, "Here is the pitch.")
+    assert spliced["transcript"] == [
+        {"role": "user", "content": "yeah"},
+        {"role": "agent", "content": "Here is the pitch."},
+    ]
+    # The original frame is untouched — it may still be read elsewhere.
+    assert len(data["transcript"]) == 1
+
+
+def test_with_agent_turn_is_a_no_op_when_retell_already_has_the_turn():
+    data = {"transcript": [{"role": "agent", "content": "Here is the pitch."}]}
+    assert retell_ws._with_agent_turn(data, "Here is the pitch.") is data
+    assert retell_ws._with_agent_turn({"transcript": []}, "   ") == {"transcript": []}
+
+
+def test_llm_websocket_filler_barge_in_does_not_truncate_the_reply(tmp_path):
+    """End to end, mid-call: the agent is part-way through a sentence when the prospect
+    says "Yo." The reply must land whole, and the follow-up turn must be able to see it.
+
+    This is the exact shape of the b23851eb failure — before the guard, the assertion
+    below saw only "Here's the thing" and the caller heard a two-word fragment.
+    """
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'filler_barge.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_filler_barge_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id, system_prompt="You are Ali.")
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+
+    call_count = {"n": 0}
+    second_turn_history = {}
+
+    async def fake_stream(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Long enough to clear _PreambleGuard's probe on its own, so it reaches the
+            # wire before the grunt lands — this test is about the barge-in, not buffering.
+            yield "Here's the thing about what we actually do for you"
+            await asyncio.sleep(0.2)
+            yield " — we answer the calls you miss."
+        else:
+            second_turn_history["history"] = args[1]
+            yield "Happy to explain."
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", fake_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 1,
+                        "transcript": [{"role": "user", "content": "what do you do"}],
+                    }
+                )
+                assert (
+                    ws.receive_json()["content"]
+                    == "Here's the thing about what we actually do for you"
+                )
+                # The grunt lands mid-sentence.
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 2,
+                        "transcript": [
+                            {"role": "user", "content": "what do you do"},
+                            {"role": "user", "content": "Yo."},
+                        ],
+                    }
+                )
+                turn_one = _recv_until_complete(ws)
+                turn_two = _recv_until_complete(ws)
+
+    # Turn 1 finished its sentence instead of being guillotined after two words...
+    assert "".join(f["content"] for f in turn_one) == " — we answer the calls you miss."
+    # ...and turn 2 both ran and could see it, so it won't say the same thing again.
+    assert "".join(f["content"] for f in turn_two) == "Happy to explain."
+    assert second_turn_history["history"][-1] == {
+        "role": "assistant",
+        "content": (
+            "Here's the thing about what we actually do for you — we answer the calls you miss."
+        ),
+    }
+
+
+class TestStripMetaPreamble:
+    """The fix for call 274a1b16, where the agent read its own stage directions to a
+    live prospect before delivering the actual opener."""
+
+    def test_strips_the_leaked_preamble_from_the_real_call(self):
+        # Verbatim from the transcript that motivated this.
+        leaked = (
+            "This is the first turn — Beat 1 of the opener. One or two short sentences, "
+            "who I am and a check it's an okay moment. Hello, this is the assistant for "
+            "Krucx. I'm calling about how you handle missed calls."
+        )
+        out = _strip_meta_preamble(leaked)
+        assert out.startswith("Hello, this is the assistant for Krucx.")
+        assert "Beat 1" not in out
+        assert "first turn" not in out
+
+    def test_leaves_ordinary_speech_completely_alone(self):
+        speech = "Hello, this is the assistant for Krucx. Is now an okay moment?"
+        assert _strip_meta_preamble(speech) == speech
+
+    def test_does_not_strip_a_marker_that_appears_later(self):
+        """Anchored to the front: a caller asking about the script must still get an
+        answer, not have it silently truncated."""
+        text = "Happy to explain. Our opener is deliberately short."
+        assert _strip_meta_preamble(text) == text
+
+    def test_all_meta_is_spoken_unchanged_rather_than_going_silent(self):
+        """Deliberate trade-off — dead air on a just-answered call is worse than one odd
+        line, and returning "" would look like the LLM produced nothing."""
+        text = "Beat 1 of the opener. This is the first turn."
+        assert _strip_meta_preamble(text) == text
+
+    def test_single_sentence_is_untouched(self):
+        text = "Hello, this is the assistant for Krucx."
+        assert _strip_meta_preamble(text) == text
+
+
+class TestPreambleGuard:
+    """Streamed audio can't be recalled, so the guard buffers just enough to judge."""
+
+    def test_clean_opening_is_released_without_waiting_for_a_sentence(self):
+        """The latency guarantee: an ordinary turn must not be held to a full sentence
+        just because a rare one might leak."""
+        guard = _PreambleGuard()
+        long_clean = "Hello there, this is the assistant calling from Krucx today"
+        assert guard.feed(long_clean) == long_clean
+        # Released — everything after is a straight pass-through.
+        assert guard.feed(" and more") == " and more"
+
+    def test_holds_then_strips_a_suspicious_opening(self):
+        guard = _PreambleGuard()
+        assert guard.feed("This is the first turn — Beat 1 of the opener.") == ""
+        out = guard.feed(" Hello, this is the assistant for Krucx.")
+        assert out.startswith("Hello, this is the assistant for Krucx.")
+        assert "Beat 1" not in out
+
+    def test_short_reply_that_never_hits_a_threshold_comes_out_on_flush(self):
+        guard = _PreambleGuard()
+        assert guard.feed("Hi there") == ""
+        assert guard.flush() == "Hi there"
+
+    def test_flush_is_empty_once_released(self):
+        guard = _PreambleGuard()
+        guard.feed("Hello there, this is the assistant calling from Krucx today")
+        assert guard.flush() == ""
+
+    def test_run_on_without_punctuation_is_capped_not_buffered_forever(self):
+        """Without _MAX_HOLD a punctuation-free reply would silently un-stream the whole
+        turn."""
+        guard = _PreambleGuard()
+        out = ""
+        for _ in range(40):
+            out = guard.feed("Beat 1 blah blah ")
+            if out:
+                break
+        assert out, "guard never released despite exceeding _MAX_HOLD"
+
+
+class TestLooksLikeIvr:
+    """Strict on purpose: a false positive hangs up on a real person."""
+
+    def test_detects_the_menu_from_the_real_call(self):
+        # Verbatim from the transcript that motivated this.
+        assert _looks_like_ivr(
+            "Hello. You're through to A and D Elkins Limited. To direct your call "
+            "efficiently, we have a few options for you to choose from. Please press one "
+            "for accounts. Press two for solid roofing maintenance."
+        )
+
+    def test_detects_a_transfer_failure_message(self):
+        assert _looks_like_ivr(
+            "Your call cannot be transferred. Please press 1 to return to the main menu."
+        )
+
+    @pytest.mark.parametrize(
+        "utterance",
+        [
+            "Hello?",
+            "Yeah, who's this?",
+            "Sorry, we're not interested in options like that right now.",
+            "You'd want accounts for that, I'll put you through.",
+            "Press ahead, I'm listening.",
+        ],
+    )
+    def test_leaves_real_people_alone(self, utterance):
+        assert not _looks_like_ivr(utterance)
+
+    def test_empty_transcript_is_not_a_menu(self):
+        assert not _looks_like_ivr("")
+
+    def test_one_marker_alone_is_not_enough(self):
+        """A single phrase is not independent evidence — two markers are required."""
+        assert not _looks_like_ivr("Press one moment please.")
+
+
+def test_llm_websocket_hangs_up_on_an_ivr_menu(tmp_path):
+    """End to end: a menu on the line ends the call with end_call=True, without spending
+    an LLM call on it, and leaves an auditable CallEvent behind."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'ivr.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_ivr_1"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id, system_prompt="You are Ali.")
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    mock_stream = MagicMock(side_effect=_stream_returning("should never be spoken"))
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", mock_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 1,
+                        "transcript": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "To direct your call, please press one for accounts. "
+                                    "Press two for maintenance."
+                                ),
+                            }
+                        ],
+                    }
+                )
+                frame = ws.receive_json()
+
+    assert frame["end_call"] is True
+    assert frame["content_complete"] is True
+    assert frame["content"] == ""
+    # The whole point is not paying for the turn.
+    mock_stream.assert_not_called()
+
+    async def _fetch_events():
+        # No polling needed, and that is the assertion: the row is committed before the
+        # hangup frame goes out, so observing the frame means the row already exists.
+        # Written after the frame it would lose the race with Retell's disconnect.
+        async with test_session_factory() as session:
+            return list((await session.execute(select(CallEvent))).scalars().all())
+
+    events = asyncio.run(_fetch_events())
+    assert [e.event_type for e in events] == ["ivr_hangup"]
+    assert "press one for accounts" in events[0].payload["utterance"]
+
+
+def test_llm_websocket_does_not_hang_up_when_the_flag_is_off(tmp_path):
+    """The flag exists so a false positive can be switched off without a deploy."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'ivr_off.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_ivr_2"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id, system_prompt="You are Ali.")
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch(
+            "backend.services.llm_service.stream_agent_response",
+            MagicMock(side_effect=_stream_returning("Hello, this is the assistant for Krucx.")),
+        ),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+        patch.object(retell_ws.settings, "ivr_auto_hangup_enabled", False),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 1,
+                        "transcript": [
+                            {"role": "user", "content": "Please press one for accounts. Press two."}
+                        ],
+                    }
+                )
+                frames = _recv_until_complete(ws)
+
+    assert all(f["end_call"] is False for f in frames)
+
+
+# --- Hard stop: being hard to interrupt must never mean impossible to interrupt -------
+#
+# Regression cover for call 6906e4de, where "No. Wait." landed inside the overlap window,
+# was absorbed as probable noise, and the agent talked straight over the prospect.
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "No. Wait.",
+        "stop",
+        "Stop talking!",
+        "wait wait wait",
+        "hold on",
+        "hang on a second",
+        "shut up",
+        "I'm not interested",
+        "let me talk",
+        "please take me off your list",
+        "don't call me again",
+        "no",
+        "Bye.",
+    ],
+)
+def test_hard_stop_utterances_always_cancel(utterance):
+    assert retell_ws._is_hard_stop(utterance) is True
+    # Overrides BOTH absorb rules: brand-new turn (inside the window) and, where the
+    # words would otherwise read as filler, the filler rule too.
+    assert retell_ws._should_let_turn_finish(0, [{"role": "user", "content": utterance}]) is False
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["yeah", "mhm", "how much does it cost", "that sounds interesting", "okay sure", ""],
+)
+def test_non_stop_utterances_are_not_hard_stops(utterance):
+    assert retell_ws._is_hard_stop(utterance) is False
+
+
+def test_hard_stop_beats_the_overlap_window():
+    """The exact 6906e4de failure: an explicit stop arriving in the first moments of a
+    reply must cut it off, not be swallowed as start-of-turn overlap."""
+    transcript = [{"role": "user", "content": "No. Wait."}]
+    assert retell_ws._should_let_turn_finish(50, transcript) is False
+    assert retell_ws._should_let_turn_finish(200, transcript) is False
+
+
+def test_filler_still_absorbed_after_the_hard_stop_check():
+    """The hard-stop check must not accidentally swallow the filler rule it precedes."""
+    assert retell_ws._should_let_turn_finish(60_000, [{"role": "user", "content": "yeah"}]) is True

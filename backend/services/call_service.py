@@ -268,6 +268,20 @@ async def record_llm_events(db: AsyncSession, call: Call, llm_events: list[dict]
         db.add(CallEvent(call_id=call.id, event_type="llm_timing", payload=event, ts=now))
 
 
+async def record_call_event(
+    db: AsyncSession, call: Call, event_type: str, payload: dict
+) -> None:
+    """One CallEvent of an arbitrary type — the general form of the typed writers above.
+
+    Exists for events that are neither tool calls nor LLM timings, the first being
+    "ivr_hangup" (retell_ws ended a call because the far end was a phone menu). Without a
+    row, an auto-hangup is invisible: the call just shows a short duration and nobody can
+    tell a menu from a prospect who hung up, which is exactly the thing you need to audit
+    when tuning the detector. Caller commits.
+    """
+    db.add(CallEvent(call_id=call.id, event_type=event_type, payload=payload, ts=datetime.now(UTC)))
+
+
 async def record_tool_event(db: AsyncSession, call: Call, event: dict) -> None:
     """One CallEvent(event_type="tool_call") row per llm_service._execute_tool_calls
     on_tool_event callback — a "dispatched" row written before the tool's handler runs
@@ -493,6 +507,32 @@ async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
         await db.commit()
         await _fanout_lead_post_call(db, call)
     return changed
+
+
+async def end_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
+    """Hang up a live call now, then record how it ended. Returns True if the row changed.
+
+    The emergency stop. Deliberately two steps in this order: the hangup is what the
+    operator actually needs and must not be delayed or skipped by bookkeeping, so it goes
+    first and is allowed to raise; the follow-up reconcile is best-effort tidying.
+
+    Terminal state is written by reconciling against Retell rather than set here, because
+    ADR-007 makes apply_retell_call_state the single writer for it — inventing a second
+    one would mean this path could disagree with the webhook about how the call ended,
+    and Retell (which knows the real disconnection_reason and duration) is the authority.
+    If the reconcile fails or races Retell finalizing the call, the row stays in_progress
+    and the ordinary call_ended webhook — or POST /api/calls/sync — closes it out. The
+    call is still hung up either way, which is the part that mattered.
+    """
+    if not call.external_id:
+        raise ValueError("Call has no external_id — nothing to hang up on the platform")
+
+    await adapter.stop_call(call.external_id)
+    logger.info(
+        "call stopped by operator",
+        extra={"call_id": str(call.id), "external_call_id": call.external_id},
+    )
+    return await reconcile_call(db, call, adapter)
 
 
 async def reconcile_stale_calls(db: AsyncSession, tenant_id: uuid.UUID, adapter: Any) -> int:

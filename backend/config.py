@@ -36,6 +36,30 @@ class Settings(BaseSettings):
     # we start there has already expired by the time the phone is picked up. Retell is
     # the only side that knows when the call was answered. Max 5000 per Retell's API.
     greeting_delay_ms: int = 1500
+    # Hang up automatically when the "caller" turns out to be a phone menu (IVR) rather
+    # than a person — see retell_ws._looks_like_ivr. Outbound prospecting hits switchboards
+    # constantly, and on call 274a1b16 the agent delivered its opener into "press one for
+    # accounts" and was then disconnected by the menu, paying for the airtime.
+    #
+    # A flag because this is the one place the agent ends a call on its own judgement: a
+    # false positive hangs up on a real person. Detection is deliberately strict (two
+    # independent menu markers) and this exists so it can be switched off instantly if a
+    # real caller ever trips it, without a deploy.
+    ivr_auto_hangup_enabled: bool = True
+    # Barge-in guard (see retell_ws._should_let_turn_finish). Retell reports an
+    # interruption for any caller audio, including a grunt or a "what?" — cancelling the
+    # agent mid-word on those produced a death spiral on call b23851eb: every reply was
+    # truncated after two words, the caller said "what?" because he heard a fragment,
+    # and that "what?" cancelled the next reply too. Nothing broke the loop.
+    #
+    # A barge-in inside this window of the agent starting to speak is treated as overlap
+    # rather than a decision to interrupt: the turn is allowed to finish its sentence and
+    # the new turn runs straight after. 0 disables the window (always cancel).
+    barge_in_min_turn_ms: int = 400
+    # Independently of the window above, a barge-in whose new caller utterance is nothing
+    # but backchannel ("yeah", "mhm", "what?") never cancels a turn — see
+    # retell_ws._FILLER_UTTERANCES. False restores the old always-cancel behavior.
+    barge_in_ignore_filler: bool = True
 
     # Voice platforms
     retell_api_key: str = ""
@@ -43,7 +67,48 @@ class Settings(BaseSettings):
     # From-number for outbound test calls — set after importing a Twilio number into Retell
     # (see scripts/setup_retell_number.py). Empty until then.
     retell_from_number: str = ""
-    retell_default_voice_id: str = "11labs-Adrian"
+    retell_default_voice_id: str = "retell-Maren"
+    # How readily Retell stops the agent's TTS when it hears the caller: 0 = very hard to
+    # interrupt, 1 = stops instantly. Retell's own default is 1.0, and leaving it there is
+    # what kept shredding replies even after retell_ws's barge-in guard stopped OUR side
+    # cancelling — there are two independent interruption layers and this is the other one
+    # (call fae0d38c, 2026-08-19). 0.3 then proved too deaf in the other direction on
+    # call 6906e4de ("you just keep on saying something"): our guard can stop GENERATING
+    # but cannot retract audio Retell has already buffered, so Retell has to be willing
+    # to cut the speech too. 0.5 is the balance point.
+    # Sent at agent-provisioning time and part of the
+    # provisioning cache key, so it can't be silently lost on re-provision the way a
+    # hand-edit in Retell's dashboard is: the backend creates its own agent and a
+    # dashboard edit to any other agent has no effect whatsoever.
+    retell_interruption_sensitivity: float = 0.5
+    # How eagerly the agent starts speaking after the caller finishes (0 = patient, 1 =
+    # eager). begin_message_delay_ms already covers "let them say hello first"; this is
+    # the gap after every later turn. Leaning eager on purpose: the opener's whole hook
+    # is "you're literally talking to the AI right now," and a laggy reply undercuts
+    # that in a way a slightly-quick one doesn't.
+    retell_responsiveness: float = 0.7
+    # Background ambience on the agent's line (Retell enum, e.g. "coffee-shop",
+    # "convention-hall") or None for silence. Deliberately off: two separate calls
+    # (b23851eb, fae0d38c) had audio-quality complaints from callers, and ambient noise
+    # doesn't just risk annoying them — it competes with Retell's own speech recognition
+    # on their INCOMING audio, which is how a real word becomes "(unintelligible audio)"
+    # and trips the barge-in guard for no reason. The product's hook is voice clarity;
+    # don't spend it on atmosphere.
+    retell_ambient_sound: str | None = None
+    # Lets the TTS engine inflect delivery ([excited]/[pause]-style cues) instead of
+    # reading every line flat. Verified accepted for retell-Maren via a disposable probe
+    # agent (create + get-agent + delete, no orphan left behind) — Retell's schema
+    # doesn't reject it for a "platform"-provider voice the way it might for one that
+    # genuinely doesn't support it, but only a real call confirms it's audible, not just
+    # accepted.
+    retell_expressive_mode: bool = True
+    # Deliberately a short, sales-call-safe subset of Retell's full tag list (which also
+    # offers "sigh" and "clear throat" — plausible for a support line, a bad look on an
+    # outbound pitch, where they could read as the agent being annoyed with the prospect
+    # or physically flustered). "empathetic" earns its place after call 6906e4de, where
+    # the prospect said the call "feels like shit" and the agent had nothing but words to
+    # soften that with.
+    retell_expressive_emotion_tags: list[str] = ["emphasis", "curious", "empathetic", "pause"]
     # Our own public https URL (the dev tunnel's address, e.g. the cloudflared
     # trycloudflare.com host — see docker-compose.yml's "tunnel" profile). Retell's
     # Custom LLM WebSocket needs to dial wss://<this host>/llm-websocket, so this gets

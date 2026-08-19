@@ -29,6 +29,11 @@ from backend.services.retell_adapter import RetellAdapter
 
 settings = get_settings()
 
+# Sentinel for "this key is absent from voice_config," distinct from "present and None" —
+# see its use resolving ambientSound below, where None is itself a meaningful override
+# value ("this campaign is explicitly silent"), not just an unset/falsy placeholder.
+_NOT_SET = object()
+
 
 class TestCallError(Exception):
     """Raised for operator-actionable failures (missing from-number, etc)."""
@@ -190,9 +195,12 @@ async def _provision_custom_llm_agent(
     shareable across personalized and non-personalized calls: nothing prospect-specific is
     baked into the provisioned agent, so no per-prospect re-provisioning is needed.
 
-    Caches {agent_id, ws_url, webhook_url} under voice_config["retell_custom"], keyed on
-    both URLs so a tunnel restart (which changes PUBLIC_BASE_URL) is detected and
-    re-provisions automatically instead of silently pointing Retell at a dead websocket.
+    Caches {agent_id, ws_url, webhook_url, begin_message_delay_ms, voice_id,
+    interruption_sensitivity} under voice_config["retell_custom"], keyed on every one of
+    them: a tunnel restart (which changes PUBLIC_BASE_URL) is detected and re-provisions
+    instead of silently pointing Retell at a dead websocket, and likewise any
+    creation-time agent setting that changed must force a new agent rather than quietly
+    reusing one still carrying the old value.
     """
     try:
         base_url = await public_url.get_public_base_url(settings.public_base_url)
@@ -246,22 +254,50 @@ async def _provision_custom_llm_agent(
     # at creation, so a changed value has to force a re-provision or the setting would
     # silently never reach a previously-provisioned agent.
     begin_message_delay_ms = settings.greeting_delay_ms
+    voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
+    interruption_sensitivity = settings.retell_interruption_sensitivity
+    responsiveness = settings.retell_responsiveness
+    # Per-agent override, resolved via a sentinel rather than `.get(..., settings.x)`:
+    # None is a MEANINGFUL value here ("this campaign is explicitly silent," set from the
+    # dashboard's Ambient sound picker), and `dict.get`'s default only fires when the key
+    # is missing entirely, not when it's present-but-None — the same reason `or` doesn't
+    # work for voice_id can't be reused here, since voice_id has no valid falsy override.
+    ambient_sound = (agent.voice_config or {}).get("ambientSound", _NOT_SET)
+    if ambient_sound is _NOT_SET:
+        ambient_sound = settings.retell_ambient_sound
+    expressive_mode = settings.retell_expressive_mode
+    expressive_emotion_tags = settings.retell_expressive_emotion_tags
 
+    # Every creation-time setting joins the key for the same reason: each is fixed on the
+    # Retell agent at creation, so without it here a changed value would hit the cache,
+    # reuse the old agent, and silently never take effect — which is exactly how call
+    # fae0d38c ran on 11labs-Adrian at Retell's default sensitivity while the dashboard
+    # showed a hand-edited agent nothing in this code path uses.
     if (
         cached.get("agent_id")
         and cached.get("ws_url") == ws_url
         and cached.get("webhook_url") == webhook_url
         and cached.get("begin_message_delay_ms") == begin_message_delay_ms
+        and cached.get("voice_id") == voice_id
+        and cached.get("interruption_sensitivity") == interruption_sensitivity
+        and cached.get("responsiveness") == responsiveness
+        and cached.get("ambient_sound") == ambient_sound
+        and cached.get("expressive_mode") == expressive_mode
+        and cached.get("expressive_emotion_tags") == expressive_emotion_tags
     ):
         return cached["agent_id"]
 
-    voice_id = (agent.voice_config or {}).get("voiceId") or settings.retell_default_voice_id
     agent_external_id = await adapter.create_agent_with_custom_llm(
         name=agent.name,
         llm_websocket_url=ws_url,
         voice_id=voice_id,
         webhook_url=webhook_url,
         begin_message_delay_ms=begin_message_delay_ms,
+        interruption_sensitivity=interruption_sensitivity,
+        responsiveness=responsiveness,
+        ambient_sound=ambient_sound,
+        expressive_mode=expressive_mode,
+        expressive_emotion_tags=expressive_emotion_tags,
     )
 
     agent.voice_config = {
@@ -271,6 +307,12 @@ async def _provision_custom_llm_agent(
             "ws_url": ws_url,
             "webhook_url": webhook_url,
             "begin_message_delay_ms": begin_message_delay_ms,
+            "voice_id": voice_id,
+            "interruption_sensitivity": interruption_sensitivity,
+            "responsiveness": responsiveness,
+            "ambient_sound": ambient_sound,
+            "expressive_mode": expressive_mode,
+            "expressive_emotion_tags": expressive_emotion_tags,
         },
     }
     await db.commit()

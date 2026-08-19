@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 BASE_URL = "https://api.retellai.com"
 
+# Retell's ambient_sound enum, obtained from the API itself (create-agent's 400 for an
+# invalid value names every accepted one) rather than guessed from docs or dashboard
+# screenshots — the exact mistake that produced two prior sessions' worth of dashboard
+# settings that were never real. Labels are ours; ids must match Retell's strings exactly.
+AMBIENT_SOUND_CATALOG: list[dict[str, str]] = [
+    {"id": "coffee-shop", "label": "Coffee shop"},
+    {"id": "convention-hall", "label": "Convention hall"},
+    {"id": "summer-outdoor", "label": "Summer outdoor"},
+    {"id": "mountain-outdoor", "label": "Mountain outdoor"},
+    {"id": "static-noise", "label": "Static noise"},
+    {"id": "call-center", "label": "Call center"},
+]
+
 
 class RetellAdapter(VoicePlatformAdapter):
     def __init__(self) -> None:
@@ -69,6 +82,11 @@ class RetellAdapter(VoicePlatformAdapter):
         voice_id: str,
         webhook_url: str | None = None,
         begin_message_delay_ms: int | None = None,
+        interruption_sensitivity: float | None = None,
+        responsiveness: float | None = None,
+        ambient_sound: str | None = None,
+        expressive_mode: bool | None = None,
+        expressive_emotion_tags: list[str] | None = None,
     ) -> str:
         """Provision an agent backed by OUR Custom LLM WebSocket (ADR-003) — Retell dials
         `llm_websocket_url` (appending the call's own call_id itself, per Retell's
@@ -79,6 +97,19 @@ class RetellAdapter(VoicePlatformAdapter):
         begin_message_delay_ms holds the agent's opener after the call is answered
         (ADR-010). It has to be Retell's parameter rather than a sleep on our side: the
         websocket opens during call setup, so we can't tell ringing apart from pickup.
+
+        interruption_sensitivity is the *other* barge-in control (0 = very hard to
+        interrupt, 1 = stops instantly). retell_ws._should_let_turn_finish only governs
+        whether WE cancel generation; this governs whether Retell stops speaking what we
+        already sent. Left unset it defaults to 1.0 on Retell's side, which silently
+        undoes the guard by chopping the audio anyway — see settings.
+
+        responsiveness/ambient_sound/expressive_mode/expressive_emotion_tags are plain
+        pass-throughs, no correctness properties of their own — see the matching
+        settings.retell_* fields for why those defaults are what they are. They're
+        parameters here rather than hardcoded so a caller (or a test) can still override
+        them; test_call_service is the only real caller and always passes settings'
+        values explicitly.
         """
         body: dict[str, Any] = {
             "agent_name": name,
@@ -92,6 +123,19 @@ class RetellAdapter(VoicePlatformAdapter):
             body["webhook_url"] = webhook_url
         if begin_message_delay_ms:
             body["begin_message_delay_ms"] = begin_message_delay_ms
+        # `is not None`, not truthiness: 0.0 is a meaningful value for both fields
+        # ("never interrupt" / "as patient as possible") and must not be dropped as
+        # falsy.
+        if interruption_sensitivity is not None:
+            body["interruption_sensitivity"] = interruption_sensitivity
+        if responsiveness is not None:
+            body["responsiveness"] = responsiveness
+        if ambient_sound is not None:
+            body["ambient_sound"] = ambient_sound
+        if expressive_mode is not None:
+            body["enable_expressive_mode"] = expressive_mode
+        if expressive_emotion_tags is not None:
+            body["expressive_emotion_tags"] = expressive_emotion_tags
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(f"{BASE_URL}/create-agent", headers=self.headers, json=body)
@@ -151,6 +195,76 @@ class RetellAdapter(VoicePlatformAdapter):
             resp.raise_for_status()
             return dict(resp.json())
 
+    async def stop_call(self, call_external_id: str) -> None:
+        """Hang up a call that is happening right now.
+
+        The emergency stop: an agent talking to the wrong person, looping on an IVR, or
+        reading a broken prompt aloud has to be stoppable in seconds, and until this
+        existed the only way was Retell's dashboard. See call_service.end_call for the
+        path that also writes the call's terminal state, and scripts/kill_calls.py for
+        the operator-facing version that works with no API server running.
+
+        Idempotent from the caller's perspective — "already over" is the outcome the
+        caller wanted, so it is not an error. Retell signals that two different ways,
+        both verified against the live API:
+          - 404 for a call id it doesn't know at all;
+          - 400 "Can only stop an ongoing call." for one that has already ended.
+        The 400 matters more than it looks: hanging up inherently races the call ending
+        on its own, so without this a stop issued a second too late reports failure for
+        a call that is, in fact, down.
+
+        The 400 is matched on its message rather than the status code alone, so a genuine
+        malformed-request 400 still surfaces. Every other status is a real failure (bad
+        key, network) and must propagate — a silent failure here means someone believes a
+        live call was killed when it is still talking.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}/v2/stop-call/{call_external_id}", headers=self.headers
+            )
+            if resp.status_code == 404 or (resp.status_code == 400 and "ongoing call" in resp.text):
+                logger.info(
+                    "stop_call: call already ended or unknown to Retell",
+                    extra={"call_external_id": call_external_id},
+                )
+                return
+            resp.raise_for_status()
+
+    async def list_live_calls(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Calls Retell currently considers live, newest first.
+
+        Filters on `ongoing` alone. Retell's call_status enum is exactly
+        {not_connected, ongoing, ended, error} — "not_connected" is a call that never
+        got picked up, which is terminal rather than live, so including it would fill an
+        emergency listing with dead calls and make --all fire pointless hangups at them.
+
+        Our own `calls` table can't answer "what is live right now": a call whose webhook
+        never arrived sits at status="in_progress" forever (the gap POST /api/calls/sync
+        exists to close), so an emergency stop has to ask the platform, not the database.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}/v2/list-calls",
+                headers=self.headers,
+                json={
+                    # A bare array, NOT the {op, type, value} filter object the bundled
+                    # retell SDK's call_list_params types describe — the live REST API
+                    # rejects that shape with "call_status must be array". The SDK's
+                    # generated types are ahead of the deployed API here; verified against
+                    # the real endpoint, so don't "fix" this to match the SDK.
+                    "filter_criteria": {"call_status": ["ongoing"]},
+                    "limit": limit,
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        # v2/list-calls returns a bare array today; the SDK models a paginated
+        # {items: [...]} shape. Accept either so a Retell-side pagination rollout
+        # doesn't silently turn "kill everything live" into a no-op.
+        if isinstance(body, dict):
+            return list(body.get("items") or [])
+        return list(body)
+
     async def create_outbound_call(
         self, from_number: str, to_number: str, agent_external_id: str
     ) -> str:
@@ -207,9 +321,7 @@ class RetellAdapter(VoicePlatformAdapter):
 
         try:
             return bool(
-                retell_verify(
-                    body=raw_body, api_key=settings.retell_api_key, signature=signature
-                )
+                retell_verify(body=raw_body, api_key=settings.retell_api_key, signature=signature)
             )
         except Exception:
             logger.warning("retell signature verification raised", exc_info=True)

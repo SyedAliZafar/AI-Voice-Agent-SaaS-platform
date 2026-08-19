@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { TranscriptViewer } from "@/components/features/calls/TranscriptViewer";
 import { ArrowLeftIcon } from "@/components/icons";
 import { Card, Skeleton } from "@/components/ui";
-import { api } from "@/lib/api";
+import { api, getApiErrorMessage } from "@/lib/api";
 import { CALL_STATUS_META, formatCost, formatDuration, sentimentMeta } from "@/lib/format";
 import { Call, Transcript } from "@/lib/types";
 
@@ -14,7 +14,32 @@ export default function CallDetailPage({ params }: { params: { id: string } }) {
   const [call, setCall] = useState<Call | null>(null);
   const [transcript, setTranscript] = useState<Transcript | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hangingUp, setHangingUp] = useState(false);
+  const [hangUpError, setHangUpError] = useState<string | null>(null);
   const router = useRouter();
+
+  async function hangUp() {
+    // Irreversible and affects a real person mid-conversation, so it asks first — but
+    // only once, and the request goes out immediately after. Anything slower defeats the
+    // purpose of an emergency stop.
+    if (!window.confirm("Hang up this call now? The person on the line will be cut off.")) {
+      return;
+    }
+    setHangingUp(true);
+    setHangUpError(null);
+    try {
+      const res = await api.post<Call>(`/calls/${params.id}/end`);
+      setCall(res.data);
+    } catch (err) {
+      // Never leave the operator believing a live call was stopped when it wasn't — the
+      // API returns 502 rather than 200 precisely so this branch can say so.
+      setHangUpError(
+        getApiErrorMessage(err, "Couldn't hang up. The call may still be live — try again."),
+      );
+    } finally {
+      setHangingUp(false);
+    }
+  }
 
   useEffect(() => {
     api
@@ -84,10 +109,32 @@ export default function CallDetailPage({ params }: { params: { id: string } }) {
         <ArrowLeftIcon width={16} height={16} /> Back to calls
       </button>
 
-      <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-        <span className="font-mono">{call.caller_number}</span>
-      </h1>
-      <p className="mt-1 text-sm text-slate-500">Call ID {call.id}</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+            <span className="font-mono">{call.caller_number}</span>
+          </h1>
+          <p className="mt-1 text-sm text-slate-500">Call ID {call.id}</p>
+        </div>
+
+        {/* Only while the call can actually be hung up. A finished call has nothing to
+            stop, and offering the button anyway invites a click that does nothing. */}
+        {call.status === "in_progress" && (
+          <button
+            onClick={hangUp}
+            disabled={hangingUp}
+            className="shrink-0 rounded-lg bg-red-600 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {hangingUp ? "Hanging up…" : "Hang up"}
+          </button>
+        )}
+      </div>
+
+      {hangUpError && (
+        <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {hangUpError}
+        </p>
+      )}
 
       <div className="mt-5 grid grid-cols-2 gap-4 lg:grid-cols-4">
         {stats.map((s) => (

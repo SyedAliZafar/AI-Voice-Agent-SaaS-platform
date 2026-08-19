@@ -1,5 +1,14 @@
 """Tool registry — add new tools here and they're automatically available
 to every agent's DeepSeek conversation.
+
+transfer_call is deliberately NOT registered. Its handler raises (there is no real
+voice-platform transfer wired up yet — see tools/transfer_call.py and phase4.md), and
+offering an unimplemented escape hatch to the model is worse than offering none: on call
+b23851eb the agent, confused by its own fragmented replies, decided its audio was broken
+and reached for transfer_call twice. Both raised, it had no fallback, and it spent the
+rest of the call apologising for a fault that did not exist. flag_for_human_review is the
+working escalation path until the transfer integration lands; re-add TransferCallTool
+here the moment its handler does something real.
 """
 
 from collections.abc import Callable, Coroutine
@@ -15,7 +24,6 @@ from backend.tools.flag_for_human_review import FlagForHumanReviewTool
 from backend.tools.lookup_customer import LookupCustomerTool
 from backend.tools.reschedule_appointment import RescheduleAppointmentTool
 from backend.tools.send_sms import SendSmsTool
-from backend.tools.transfer_call import TransferCallTool
 
 _REGISTRY: dict[str, BaseTool] = {
     tool.name: tool
@@ -28,7 +36,6 @@ _REGISTRY: dict[str, BaseTool] = {
         LookupCustomerTool(),
         CreateLeadTool(),
         FlagForHumanReviewTool(),
-        TransferCallTool(),
         SendSmsTool(),
     ]
 }

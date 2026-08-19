@@ -25,7 +25,9 @@ a cancellable asyncio.Task via llm_service.stream_agent_response, sending one
 {"content": chunk, "content_complete": False} frame per delta so the caller hears
 partial audio instead of dead air. If a new response_required with a different
 response_id arrives while a turn is still generating (a barge-in), the in-flight task is
-cancelled rather than left to finish — but cancellation only ever interrupts *speech*: a
+cancelled rather than left to finish — unless _should_let_turn_finish absorbs it, which
+is how mere overlap or a "yeah"/"what?" backchannel stops shredding the agent's replies
+into two-word fragments — but cancellation only ever interrupts *speech*: a
 tool call already dispatched (e.g. book_appointment's Cal.com POST) is shielded so it
 still completes and gets recorded, never abandoned mid-flight with an unknown outcome.
 settings.llm_streaming_enabled is the kill switch — False restores the original
@@ -42,6 +44,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -265,11 +268,23 @@ _SPEECH_BLOCK = (
     "- You do not have a personal first name unless your instructions give you one. "
     "Introduce yourself by who you're calling for (e.g. 'this is the assistant for "
     "Krucx') rather than inventing a human name that won't match anything the caller "
-    "may later be told.\n"
+    "may later be told. A person named in your instructions as someone to book a call "
+    "WITH is a human colleague, never you — do not introduce yourself as them, or the "
+    "prospect meets a different person under that name on the very next call.\n"
     "- Never read stage directions, section headings, or notes-to-self aloud. If your "
     "instructions describe an action rather than words to say, perform it silently.\n"
     "- Output only the words to be spoken: no quotation marks wrapping your whole reply, "
-    "no markdown, no asterisks, no bullet points, no emoji."
+    "no markdown, no asterisks, no bullet points, no emoji.\n"
+    "- Keep every reply to one or two short sentences — about 25 spoken words, and "
+    "never more than 40. This is a phone call, not an email: the other person cannot "
+    "skim, and a long answer is one they will interrupt halfway through and remember "
+    "none of. Make your single most useful point, then stop and let them respond. If "
+    "there is more to say, say it on your next turn once they have replied.\n"
+    "- Never deliver a statement and a question in the same breath. Land one, stop, and "
+    "let them answer. Stacking them is what makes a call feel like being talked at.\n"
+    "- If they tell you to stop, slow down, or say you are talking too much, they are "
+    "right. Stop immediately, apologise in one short sentence, ask one open question, "
+    "then say nothing until they have finished answering it."
 )
 
 
@@ -314,6 +329,184 @@ def _system_prompt_with_context(system_prompt: str, caller_number: str, time_zon
     )
 
 
+# --- Meta-preamble stripping ------------------------------------------------------
+#
+# On call 274a1b16 the agent spoke its own stage directions to a live prospect:
+#   "This is the first turn — Beat 1 of the opener. One or two short sentences, who I am
+#    and a check it's an okay moment. Hello, this is the assistant for Krucx..."
+# _SPEECH_BLOCK already tells the model not to do this, and the model did it anyway.
+# A prompt instruction is a strong suggestion, not a guarantee, so the guarantee is here
+# in code: nothing that reads as a stage direction reaches the caller's ear.
+#
+# Markers are deliberately narrow and drawn from how the outbound templates actually
+# talk about themselves (scripts/agent_templates/shared.py's "Beat 1/2/3" structure) —
+# a generic "sounds meta" heuristic would eventually eat a real sentence.
+_META_PREAMBLE_MARKERS = re.compile(
+    r"beat\s*\d"
+    r"|this is (?:the |my )?(?:first|second|third|next|opening) (?:turn|beat)"
+    r"|the opener\b"
+    r"|one or two (?:short )?sentences"
+    r"|under (?:about )?\d+\s*words"
+    r"|stage direction"
+    r"|my instructions\b"
+    r"|^\s*\[",
+    re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])[\s—-]+")
+
+
+def _strip_meta_preamble(text: str) -> str:
+    """Drop leading sentences that are stage directions rather than speech.
+
+    Only *leading* sentences, and only while a real sentence still remains: the observed
+    failure is narration prepended to an otherwise-fine opener, and anchoring to the front
+    means a legitimate later mention (a caller asking "what's your opener?") is untouched.
+
+    If every sentence looks like a direction the text is returned UNCHANGED, with a
+    warning. That's the deliberate trade: the alternative is emitting nothing, and dead
+    air on a just-answered call is worse than one odd-sounding line — the caller at least
+    says "hello?" and the next turn recovers. Returning "" here would also make the
+    fallback machinery below think the LLM produced nothing.
+    """
+    sentences = [s for s in _SENTENCE_SPLIT.split(text.strip()) if s.strip()]
+    if len(sentences) < 2:
+        # Nothing to strip *to* — a single sentence is either the real line or the
+        # all-meta case handled below.
+        return text
+
+    kept = list(sentences)
+    while kept and _META_PREAMBLE_MARKERS.search(kept[0]):
+        kept.pop(0)
+
+    if not kept:
+        logger.warning(
+            "llm_websocket: entire utterance looks like a stage direction; speaking it "
+            "unchanged rather than going silent",
+            extra={"text": text[:200]},
+        )
+        return text
+    if len(kept) != len(sentences):
+        logger.warning(
+            "llm_websocket: stripped stage-direction preamble before speaking",
+            extra={"removed": " ".join(sentences[: len(sentences) - len(kept)])[:200]},
+        )
+    return " ".join(kept)
+
+
+# --- IVR (phone menu) detection ----------------------------------------------------
+#
+# "Strong" markers are ones a person effectively never says on a cold call; "weak" ones
+# are menu-ish but plausible in real speech ("for accounts, that'd be Dave"). Requiring
+# two independent strong markers — or one strong plus one weak — keeps a human from being
+# hung up on because they said the word "options" once. The transcript that motivated this
+# ("press one for accounts... press two... press three...") clears the bar several times
+# over, which is the point: a real menu is unmistakable and repetitive.
+_IVR_STRONG = re.compile(
+    r"press\s+(?:\d|one|two|three|four|five|six|seven|eight|nine|zero|star|hash|pound)\b"
+    r"|dial\s+(?:the\s+)?extension"
+    r"|if you know the extension"
+    r"|your call cannot be transferred"
+    r"|please hold while (?:i|we) (?:try|connect|transfer)"
+    r"|at the tone"
+    r"|has not been recognised|has not been recognized",
+    re.IGNORECASE,
+)
+_IVR_WEAK = re.compile(
+    r"\bfor (?:accounts|sales|support|billing|enquiries|inquiries|reception)\b"
+    r"|main menu|\bmenu\b"
+    r"|leave a message"
+    r"|extension number"
+    r"|to direct your call"
+    r"|options? (?:for you )?to choose",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_ivr(text: str) -> bool:
+    """Whether an incoming utterance is a phone menu rather than a person.
+
+    Counts *distinct* matches, not total: a single phrase repeated by a stuttering
+    transcription must not on its own clear a threshold meant to represent independent
+    evidence.
+    """
+    if not text:
+        return False
+    strong = {m.group(0).lower() for m in _IVR_STRONG.finditer(text)}
+    weak = {m.group(0).lower() for m in _IVR_WEAK.finditer(text)}
+    return len(strong) >= 2 or (len(strong) >= 1 and len(weak) >= 1)
+
+
+class _PreambleGuard:
+    """Holds back the start of a streamed turn until it can be checked for stage
+    directions, then passes everything through untouched.
+
+    Necessary because _strip_meta_preamble needs a whole sentence to judge, while
+    streaming exists to emit partial ones — and audio already handed to Retell is already
+    on its way to the caller's ear. Only the opening is buffered: once released this is a
+    pass-through, so streaming's benefit (ADR-009) survives for the rest of the turn.
+
+    Two-stage so a well-behaved turn barely pays for this. First a short _PROBE of text
+    is accumulated and tested for a marker; almost always there isn't one, and everything
+    is released immediately and streamed normally from then on. Only when the opening
+    actually looks like a direction does it keep buffering to a sentence boundary, which
+    is the point where the offending sentence can be cut cleanly. So the latency cost
+    lands on exactly the turns that were about to embarrass us, not on every turn.
+
+    _MAX_HOLD caps the suspicious case, in case the model produces a long run-on with no
+    punctuation — without it a pathological reply would buffer the whole turn and
+    silently un-stream it.
+    """
+
+    # Enough text to recognise a marker ("Beat 1", "This is the first turn") without
+    # waiting for a whole clause. Markers all appear at the very start of the leak.
+    _PROBE = 48
+    # Headroom to see past the first sentence boundary — the observed leak was one
+    # direction sentence followed by the real opener — without waiting for a whole reply.
+    _MAX_HOLD = 240
+
+    def __init__(self) -> None:
+        self._buf: list[str] = []
+        self._released = False
+        self._suspect = False
+
+    def feed(self, chunk: str) -> str:
+        """Take one streamed delta; return what should go on the wire now (may be "")."""
+        if self._released:
+            return chunk
+
+        self._buf.append(chunk)
+        held = "".join(self._buf)
+
+        if not self._suspect:
+            # Not enough to judge yet, and nothing suspicious so far — but a sentence
+            # boundary means the opening is complete and can be judged now regardless.
+            if len(held) < self._PROBE and not _SENTENCE_SPLIT.search(held):
+                return ""
+            if not _META_PREAMBLE_MARKERS.search(held):
+                return self._release(held, strip=False)
+            self._suspect = True
+
+        if not _SENTENCE_SPLIT.search(held) and len(held) < self._MAX_HOLD:
+            return ""
+        return self._release(held, strip=True)
+
+    def _release(self, held: str, *, strip: bool) -> str:
+        self._released = True
+        self._buf.clear()
+        return _strip_meta_preamble(held) if strip else held
+
+    def flush(self) -> str:
+        """Whatever is still held when the stream ends. Empty once already released.
+
+        A short reply can end before either release condition is met, so this is the
+        path most ordinary greetings actually take — not just an edge case.
+        """
+        if self._released or not self._buf:
+            return ""
+        return self._release("".join(self._buf), strip=True)
+
+
 _GREETING_SENTINEL = object()
 
 _BEGIN_MESSAGE_INSTRUCTION = (
@@ -342,6 +535,188 @@ def _call_already_in_progress(data: dict[str, Any]) -> bool:
     """
     call = data.get("call") or {}
     return bool(call.get("transcript") or call.get("transcript_object"))
+
+
+# Backchannel — the noises a listener makes to show they're still there, plus the short
+# confusion tokens someone emits when they've just heard a truncated sentence. None of
+# these is a decision to take the floor, and treating them as one is what turned call
+# b23851eb into a two-word-reply death spiral (see settings.barge_in_min_turn_ms).
+# Deliberately excludes anything that carries a request — "stop", "wait", "hold on",
+# "no thanks", "not interested" must always cut the agent off immediately.
+_FILLER_UTTERANCES = frozenset(
+    {
+        "ah",
+        "aha",
+        "alright",
+        "aye",
+        "cool",
+        "correct",
+        "eh",
+        "er",
+        "erm",
+        "exactly",
+        "fine",
+        "gotcha",
+        "great",
+        "hello",
+        "hey",
+        "hi",
+        "hm",
+        "hmm",
+        "huh",
+        "mhm",
+        "mm",
+        "mmhmm",
+        "mmm",
+        "nice",
+        "oh",
+        "ok",
+        "okay",
+        "really",
+        "right",
+        "sorry",
+        "sure",
+        "true",
+        "uh",
+        "uhhuh",
+        "uhm",
+        "um",
+        "well",
+        "what",
+        "whats",
+        "wow",
+        "yeah",
+        "yep",
+        "yes",
+        "yo",
+        "yup",
+    }
+)
+
+# Above this many words an utterance is treated as substantive no matter what it contains
+# — a real interruption is longer and more insistent than a grunt.
+_MAX_FILLER_WORDS = 3
+
+# Words that mean "stop talking", and which must therefore cut the agent off INSTANTLY —
+# before the overlap window, before anything. Call 6906e4de is why this exists: the
+# prospect said "No. Wait." 200ms into a reply, the overlap window absorbed it as
+# probable noise, and the agent talked straight through him. His verdict was
+# "you just keep on saying something and it's really hard for me to make a conversation
+# with you." An overlap window that swallows an explicit instruction to stop is not a
+# guard, it is a bulldozer.
+#
+# Matched as a substring on word boundaries rather than requiring the WHOLE utterance to
+# be one of these (unlike _FILLER_UTTERANCES, which must match every word): "no wait
+# hang on" and "sorry, stop" are still unambiguous stop requests, and a caller trying to
+# reclaim the floor rarely says exactly one clean word.
+_HARD_STOP_WORDS = frozenset(
+    {
+        "stop",
+        "wait",
+        "no",
+        "nope",
+        "hold",
+        "enough",
+        "quiet",
+        "listen",
+        "shush",
+        "bye",
+        "goodbye",
+        "unsubscribe",
+        "remove",
+    }
+)
+_HARD_STOP_PHRASES = (
+    "not interested",
+    "hang on",
+    "hold on",
+    "shut up",
+    "let me talk",
+    "let me speak",
+    "stop talking",
+    "hear me out",
+    "take me off",
+    "don't call",
+    "do not call",
+)
+
+
+def _is_hard_stop(utterance: str) -> bool:
+    """Whether the caller is explicitly telling the agent to stop. Overrides every
+    absorb rule — see _should_let_turn_finish."""
+    lowered = utterance.lower()
+    if any(phrase in lowered for phrase in _HARD_STOP_PHRASES):
+        return True
+    words = {"".join(ch for ch in w if ch.isalnum()) for w in lowered.split()}
+    return bool(words & _HARD_STOP_WORDS)
+
+
+def _latest_caller_utterance(transcript: list[dict[str, Any]]) -> str:
+    """The most recent thing the other party said, or "" if they haven't spoken."""
+    for turn in reversed(transcript or []):
+        if turn.get("role") != "agent":
+            return str(turn.get("content") or "")
+    return ""
+
+
+def _is_filler(utterance: str) -> bool:
+    """Whether an utterance is pure backchannel and so must not cancel a live turn.
+
+    Punctuation is stripped rather than split on, so "What's that?" reduces to
+    {"whats", "that"}... which is *not* all-filler, and correctly interrupts. Only
+    genuinely contentless runs like "Yo.", "What?", "yeah yeah" pass.
+    """
+    words = ["".join(ch for ch in w if ch.isalnum()) for w in utterance.lower().split()]
+    words = [w for w in words if w]
+    if not words or len(words) > _MAX_FILLER_WORDS:
+        return False
+    return all(word in _FILLER_UTTERANCES for word in words)
+
+
+def _should_let_turn_finish(elapsed_ms: float, transcript: list[dict[str, Any]]) -> bool:
+    """Whether a genuine barge-in should be absorbed — the in-flight turn finishes its
+    sentence and the new turn runs immediately after — instead of cancelling mid-word.
+
+    An explicit stop request (_is_hard_stop) is never absorbed, whatever else is true.
+    Otherwise, two independent reasons to absorb, either sufficient:
+      * the agent has been speaking for less than settings.barge_in_min_turn_ms, so the
+        caller's audio overlaps the very start of the reply and is far more likely to be
+        the tail of their own previous sentence, or room noise, than a decision to
+        interrupt something they have not heard yet;
+      * the caller's newest utterance is pure backchannel (_is_filler).
+
+    Absorbing is not the same as dropping the frame: the new response_id is still
+    answered, just after the current one finishes, so every turn Retell asks for gets
+    exactly one terminal frame and no reply is ever left truncated. The cost is the new
+    reply waiting out the remainder of the current one — sub-second in practice, and far
+    cheaper than the fragment-and-apologise loop it replaces.
+    """
+    utterance = _latest_caller_utterance(transcript)
+    # First and unconditional: being hard to interrupt must never mean being impossible
+    # to interrupt (call 6906e4de).
+    if _is_hard_stop(utterance):
+        return False
+    if settings.barge_in_ignore_filler and _is_filler(utterance):
+        return True
+    return elapsed_ms < settings.barge_in_min_turn_ms
+
+
+def _with_agent_turn(data: dict[str, Any], spoken: str) -> dict[str, Any]:
+    """A copy of a queued response_required frame with the reply we just finished
+    speaking appended to its transcript.
+
+    Needed only on the absorbed-barge-in path: Retell built that frame's transcript
+    *before* the current turn finished, so without this the next generation cannot see
+    what it just said and cheerfully says it again.
+    """
+    if not spoken.strip():
+        return data
+    transcript = list(data.get("transcript") or [])
+    if transcript and transcript[-1].get("role") == "agent":
+        # Retell got there first on the resend — don't double-count the same words.
+        return data
+    transcript.append({"role": "agent", "content": spoken})
+    return {**data, "transcript": transcript}
 
 
 def _to_conversation_history(transcript: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -408,6 +783,30 @@ async def _persist_and_publish_turn(
         )
 
 
+async def _record_ivr_hangup(call_id: str, utterance: str) -> None:
+    """Leave a durable trace that we, not the far end, ended this call and why.
+
+    Best-effort and fire-and-forget, like every other write on this path: the hangup
+    frame is already sent, and a Postgres hiccup must not be able to keep a call alive.
+    Stores the utterance that triggered it so a false positive can be diagnosed from the
+    row rather than from logs that may have rotated.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            call = await call_service.get_call_by_external_id(db, call_id)
+            if call:
+                await call_service.record_call_event(
+                    db, call, "ivr_hangup", {"utterance": utterance[:1000]}
+                )
+                await db.commit()
+    except Exception:
+        logger.warning(
+            "llm_websocket: failed to record ivr hangup",
+            extra={"call_id": call_id},
+            exc_info=True,
+        )
+
+
 @router.websocket("/llm-websocket/{call_id}")
 async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
     await websocket.accept()
@@ -461,6 +860,13 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
     send_lock = asyncio.Lock()
     current_task: asyncio.Task | None = None
     current_response_id: Any = None
+    # When the in-flight turn started generating, on the event loop's clock — the input
+    # to _should_let_turn_finish's "is this barge-in just overlap?" window.
+    current_turn_started_at: float = 0.0
+    # What the in-flight turn actually said, set as it finishes. Read only on the
+    # absorbed-barge-in path, where the queued frame's transcript predates it and
+    # _with_agent_turn has to splice it back in.
+    last_spoken_text: str = ""
     # Tasks that must be allowed to finish even if the turn that spawned them is
     # cancelled: shielded tool-call execution (ADR-009 §4a), the fire-and-forget
     # CallEvent writes for llm_service's on_tool_event sink (§4b), and — once a turn's
@@ -561,13 +967,42 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
         opens during call *setup*, so a timer started here expires while the phone is
         still ringing — it looked like it worked and did nothing on a real call.
         """
+        nonlocal last_spoken_text
         response_id = data.get("response_id")
         transcript_so_far = data.get("transcript", [])
+
+        # Hang up on a phone menu before spending an LLM call — or more airtime — on it.
+        # Checked here rather than in the receive loop so it sees the same transcript the
+        # turn would have answered, and skipped on the greeting turn, where the other
+        # party hasn't spoken and there is nothing to classify yet.
+        caller_said = _latest_caller_utterance(transcript_so_far)
+        if not greeting and settings.ivr_auto_hangup_enabled and _looks_like_ivr(caller_said):
+            logger.warning(
+                "llm_websocket: caller looks like an IVR menu, ending call",
+                extra={"call_id": call_id, "utterance": caller_said[:200]},
+            )
+            # Written BEFORE the hangup frame, which is the opposite of every other write
+            # on this path. Everywhere else the rule is "never put a DB round-trip in
+            # front of speech" — but this turn's "speech" is a hangup, so no human is
+            # waiting on it, and end_call makes Retell drop the socket immediately. A
+            # write started after the frame reliably loses the race with that disconnect
+            # (verified: the row never landed), and an auto-hangup with no row explaining
+            # it is the single hardest thing here to debug after the fact.
+            await _record_ivr_hangup(call_id, caller_said)
+            await _send(
+                {
+                    "response_type": "response",
+                    "response_id": response_id,
+                    "content": "",
+                    "content_complete": True,
+                    "end_call": True,
+                }
+            )
+            return
+
         conversation_history = _to_conversation_history(transcript_so_far)
         if greeting:
-            conversation_history.append(
-                {"role": "system", "content": _BEGIN_MESSAGE_INSTRUCTION}
-            )
+            conversation_history.append({"role": "system", "content": _BEGIN_MESSAGE_INSTRUCTION})
         if completed_tool_calls:
             conversation_history.insert(
                 0, {"role": "system", "content": _ledger_note(completed_tool_calls)}
@@ -588,6 +1023,11 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
 
         try:
             if streaming_enabled:
+                # Streamed audio can't be recalled once sent, so the opening is held back
+                # until there's enough of it to tell speech from stage direction (see
+                # _PreambleGuard). Costs a fraction of a second at the very start of a
+                # turn; everything after the first release streams as before.
+                guard = _PreambleGuard()
                 async for chunk in llm_service.stream_agent_response(
                     turn_system_prompt,
                     conversation_history,
@@ -599,12 +1039,29 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                     spawn_tracked=_spawn_tracked,
                     check_duplicate=_check_duplicate,
                 ):
-                    spoken.append(chunk)
+                    out = guard.feed(chunk)
+                    if not out:
+                        continue
+                    spoken.append(out)
                     await _send(
                         {
                             "response_type": "response",
                             "response_id": response_id,
-                            "content": chunk,
+                            "content": out,
+                            "content_complete": False,
+                            "end_call": False,
+                        }
+                    )
+                # The stream can end while the guard is still holding the opening — a
+                # short reply may never reach the release threshold at all.
+                tail = guard.flush()
+                if tail:
+                    spoken.append(tail)
+                    await _send(
+                        {
+                            "response_type": "response",
+                            "response_id": response_id,
+                            "content": tail,
                             "content_complete": False,
                             "end_call": False,
                         }
@@ -621,6 +1078,10 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                     spawn_tracked=_spawn_tracked,
                     check_duplicate=_check_duplicate,
                 )
+                # The blocking path has the whole reply in hand, so it needs no buffering
+                # — but it must not be the one path that still reads directions aloud.
+                if text:
+                    text = _strip_meta_preamble(text)
         except asyncio.CancelledError:
             # A barge-in (a new response_id arrived) — not an LLM failure. Must not be
             # caught by the broad except below, or an interrupted caller would hear an
@@ -680,6 +1141,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
         # drop the turn's persistence, which is what _persist_and_publish_turn's own
         # "not called at all for a cancelled turn" docstring assumes never happens once
         # the terminal frame has actually been sent.
+        last_spoken_text = full_text
         await asyncio.shield(
             _spawn_tracked(
                 _persist_and_publish_turn(call_id, transcript_so_far, full_text, llm_events)
@@ -719,6 +1181,7 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                 # during the opening pause. A sentinel can't collide, so their speech
                 # always cancels the opener instead of being mistaken for a resend.
                 current_response_id = _GREETING_SENTINEL
+                current_turn_started_at = asyncio.get_running_loop().time()
                 current_task = asyncio.create_task(
                     _generate({"response_id": 0, "transcript": []}, greeting=True)
                 )
@@ -729,13 +1192,27 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
                         # Retell resending the same still-in-flight turn — let the
                         # original generation finish rather than restarting it.
                         continue
-                    # A genuine barge-in: cancel the stale generation and wait for it to
-                    # actually stop before starting the new one, so only one task is
-                    # ever mid-send on this socket at a time.
-                    current_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await current_task
+                    elapsed_ms = (
+                        asyncio.get_running_loop().time() - current_turn_started_at
+                    ) * 1000
+                    if _should_let_turn_finish(elapsed_ms, data.get("transcript") or []):
+                        # Overlap or backchannel, not a decision to take the floor: let
+                        # the sentence land, then answer this turn with what we just said
+                        # spliced into its (by now stale) transcript. Not cancelling is
+                        # the whole point — cancelling here is what fragmented every
+                        # reply on call b23851eb.
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await current_task
+                        data = _with_agent_turn(data, last_spoken_text)
+                    else:
+                        # A genuine barge-in: cancel the stale generation and wait for it
+                        # to actually stop before starting the new one, so only one task
+                        # is ever mid-send on this socket at a time.
+                        current_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await current_task
                 current_response_id = response_id
+                current_turn_started_at = asyncio.get_running_loop().time()
                 current_task = asyncio.create_task(_generate(data))
             # update_only: no response required, nothing to do.
     except WebSocketDisconnect:

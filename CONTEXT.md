@@ -124,7 +124,7 @@ voiceagent/
 │   │   ├── reschedule_appointment.py # (ADR-009 §4c, phases/in-progress/outliers.md §5)
 │   │   ├── lookup_customer.py
 │   │   ├── create_lead.py
-│   │   ├── transfer_call.py
+│   │   ├── transfer_call.py      # NOT registered — handler raises; see tools/__init__.py
 │   │   └── send_sms.py
 │   │
 │   ├── workers/                  # Celery tasks
@@ -334,6 +334,22 @@ tenant. Both the webhook path and the reconcile path write through **one** funct
 `apply_retell_call_state()` — if they were separate writers they could disagree about
 the same call's outcome.
 
+**Hanging up a live call** (`call_service.end_call`, `POST /api/calls/{id}/end`,
+`scripts/kill_calls.py`) follows the same rule: it tells Retell to stop the call, then
+*reconciles* rather than writing a terminal status itself, so `apply_retell_call_state`
+stays the single writer and this path can't disagree with the webhook about how the call
+ended. The hangup goes first and is allowed to raise; the reconcile is best-effort
+tidying. If it fails, the row stays `in_progress` for the webhook or `/sync` to settle —
+the call is still down, which is the part that mattered.
+
+The CLI exists *alongside* the endpoint on purpose: the moment you most need to stop a
+call is often the moment the API server, worker, and tunnel are all down. `kill_calls.py`
+needs only `RETELL_API_KEY` — no database, no tunnel, no app import. It lists by default;
+`--all` and `--call-id` are the destructive forms. "Live" is asked of Retell
+(`adapter.list_live_calls`, filtering `call_status=ongoing`) rather than read from our
+`calls` table, which can't be trusted for it — an in_progress row may be a call that
+ended hours ago with a lost webhook.
+
 Status mapping lives there too: `disconnection_reason` distinguishes `resolved` from
 `escalated` (`call_transfer`) and `failed` (dial failures, `error*`), which is richer than
 the "everything that ended is resolved" assumption this code started with.
@@ -447,6 +463,43 @@ new one — deliberately only on a response_id change, not on `update_only` inte
 which fires on noise/backchannel ("mhm") too often to safely mean "the caller is talking."
 The receive loop no longer blocks on generation, so `ping_pong` keeps being answered while
 a turn streams.
+
+**ADR-009a: not every barge-in is an interruption.** Cancelling on *every* response_id
+change turned out to be too eager, and call `b23851eb` (2026-08-19) is the case that
+proved it: Retell reports an interruption for any caller audio at all, so a grunt shredded
+each reply after two or three words, the fragments made the prospect say "what?", and that
+"what?" cancelled the next reply too. Every agent turn for 100 seconds was 2–6 words long;
+the prospect's own summary was *"the problem is you stopped too many times."* The model
+then inferred from its own mangled context that it had a bad line, apologised for a
+non-existent fault, and reached for `transfer_call` — which raises (see below).
+
+`retell_ws._should_let_turn_finish` gates the cancellation on two independent tests, either
+sufficient to *absorb* the barge-in: the turn is younger than
+`settings.barge_in_min_turn_ms` (700ms — audio overlapping the very start of a reply is
+far more likely to be the tail of the caller's own sentence than a reaction to words they
+have not heard yet), or the caller's newest utterance is pure backchannel
+(`_FILLER_UTTERANCES` — "yeah", "mhm", "what?"; deliberately excludes anything carrying a
+request, so "stop", "wait", "no thanks" always cut the agent off instantly).
+
+Absorbing is *not* dropping the frame: the new `response_id` is still answered, just after
+the current turn finishes, so every turn Retell asks for gets exactly one terminal frame
+and no reply is ever left truncated. Because Retell built the queued frame's transcript
+before the absorbed turn finished, `_with_agent_turn` splices the just-spoken reply back
+in — without it the next generation cannot see what it just said and repeats it.
+`settings.barge_in_ignore_filler=false` plus `barge_in_min_turn_ms=0` restores the old
+always-cancel behavior.
+
+**Reply length.** Two mechanisms, deliberately separate. `retell_ws._SPEECH_BLOCK` asks for
+one to three sentences (~40 words) so replies *end* naturally; `llm_service.MAX_TOKENS`
+(200, was 1024) is only a hard stop bounding the pathological case, since a cap alone
+truncates mid-word — which sounds exactly like the bug above. Short replies also spend
+less time exposed to being interrupted at all.
+
+**`transfer_call` is not registered.** Its handler raises (no real voice-platform transfer
+is wired up yet — phase4.md), and offering an unimplemented escape hatch to the model is
+worse than offering none: under stress it reaches for it, gets an error it cannot act on,
+and has no fallback. `flag_for_human_review` is the working escalation path until the
+transfer integration lands.
 
 **Barge-in must interrupt speech, never a side effect.** This is the part worth
 remembering: `asyncio.CancelledError` lands wherever a cancelled task is currently
@@ -935,6 +988,7 @@ files, stop.
 | **Add an integration provider or config key** | `integration_config_service.py`'s `SUPPORTED` / `ALLOWED_CONFIG_KEYS` (one line each — no migration; `config` is JSONB) → a `verify_*_credentials` function in `integration_service.py` and a branch in `integration_config_service.verify` → `schemas/integration.py`'s `SECRET_CONFIG_KEYS` if it brings a new secret name → `tests/test_integrations.py`. Do **not** add credentials to `ToolConfig` — see `models/integration.py` for why |
 | **Add an outbound industry vertical** | one entry in `scripts/agent_templates/industries.py` (`qualifying_flow` / `vocabulary` / `extra_objection_rows` / `validated: False`) → add it to the `INDUSTRIES` dict → `uv run python scripts/build_agent_matrix.py --industry <key>`. Nothing else changes: `compose.py` picks it up for every existing style and service automatically. Keep `validated: False` until it has real-call data behind it — `compose.py` renders the unvalidated banner off that flag |
 | **Add a one-off diagnostic agent** (not a sales leaf) | its own `scripts/seed_<name>_agent.py` with the prompt inline, mirroring `seed_email_transcription_test_agent.py` — deliberately *outside* the `agent_templates` matrix, since an agent with no hook/qualifying/close would otherwise bend every style and service module around it. `use_custom_llm=True` so it runs the same `retell_ws.py` path as real agents |
+| **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
 | **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
@@ -1004,6 +1058,35 @@ If step 1 never happens (no tunnel, unset `PUBLIC_BASE_URL`, tunnel restarted mi
 6. `sweep_stale_leads` (same cadence) reconciles any lead stuck `in_flight` past
    `lead_stale_in_flight_minutes`, covering a lost webhook the same way ADR-007 already
    does for ordinary calls.
+
+### Guardrails on what the agent says and who it says it to
+Two guards sit between the model and the caller in `retell_ws.py`, both added after call
+274a1b16 — a real prospecting call that demonstrated each failure once.
+
+**Stage directions never reach the caller** (`_strip_meta_preamble`, `_PreambleGuard`).
+The agent read its own script notes aloud: *"This is the first turn — Beat 1 of the
+opener. One or two short sentences…"* before delivering the actual line. `_SPEECH_BLOCK`
+already forbade this; the model did it anyway, which is the lesson — a prompt instruction
+is a strong suggestion, not a guarantee, so anything that must never happen needs a check
+in code. Leading sentences matching the outbound templates' own beat vocabulary
+(`scripts/agent_templates/shared.py`) are dropped before the words go out.
+
+Streaming makes this harder than it sounds: audio handed to Retell is already on its way
+to the ear, so `_PreambleGuard` buffers the opening. It is two-stage so the latency cost
+lands only where it's earned — a short probe is checked for markers, and a clean opening
+(almost always) is released immediately and streams normally thereafter. If every
+sentence looks like a direction the text is spoken **unchanged**: dead air on a
+just-answered call is worse than one odd line.
+
+**Phone menus end the call** (`_looks_like_ivr`, `IVR_AUTO_HANGUP_ENABLED`). Outbound
+dialing hits switchboards constantly; the agent used to pitch into "press one for
+accounts" and pay for the airtime. A menu on the line now ends the call with
+`end_call: true` before any LLM call is spent on the turn. Detection requires two
+independent markers because a false positive hangs up on a real person, and the flag
+exists so it can be switched off without a deploy. The `CallEvent(event_type="ivr_hangup")`
+row is written **before** the hangup frame — the opposite of every other write here,
+because `end_call` makes Retell drop the socket immediately and a write started after it
+loses that race.
 
 ### Agent testing sandbox
 Try an agent's persona/system_prompt over text before spending a real call on it —

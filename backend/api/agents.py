@@ -12,6 +12,8 @@ from backend.schemas.agent import (
     AgentCreate,
     AgentResponse,
     AgentUpdate,
+    AmbientSoundInfo,
+    AmbientSoundsResponse,
     LlmModelInfo,
     LlmModelsResponse,
     SandboxChatRequest,
@@ -20,6 +22,7 @@ from backend.schemas.agent import (
     TestCallResponse,
 )
 from backend.services import agent_service, llm_service, sandbox_service, test_call_service
+from backend.services.retell_adapter import AMBIENT_SOUND_CATALOG
 
 router = APIRouter()
 settings = get_settings()
@@ -50,6 +53,24 @@ async def list_llm_models(
     )
 
 
+@router.get("/ambient-sounds", response_model=AmbientSoundsResponse)
+async def list_ambient_sounds(
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """The background-noise options selectable per-agent (Custom LLM path only — see
+    test_call_service._provision_custom_llm_agent). Sourced from Retell's own accepted
+    values (backend/services/retell_adapter.AMBIENT_SOUND_CATALOG), not hand-maintained
+    here — a dashboard-vs-code enum mismatch is exactly how the last three settings on
+    this campaign silently did nothing.
+
+    Declared BEFORE /{agent_id} for the same routing reason as /models above.
+    """
+    return AmbientSoundsResponse(
+        options=[AmbientSoundInfo(**o) for o in AMBIENT_SOUND_CATALOG],
+        default=settings.retell_ambient_sound,
+    )
+
+
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
     tenant_id: uuid.UUID = Depends(get_current_tenant),
@@ -69,7 +90,7 @@ async def create_agent(
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def get_agent(
-    agent_id: uuid.UUID,    
+    agent_id: uuid.UUID,
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
@@ -113,9 +134,7 @@ async def test_call(
     configured conversation model).
     """
     try:
-        result = await test_call_service.place_test_call(
-            db, agent_id, tenant_id, payload.to_number
-        )
+        result = await test_call_service.place_test_call(db, agent_id, tenant_id, payload.to_number)
     except test_call_service.TestCallError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return result

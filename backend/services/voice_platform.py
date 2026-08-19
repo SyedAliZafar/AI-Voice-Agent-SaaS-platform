@@ -73,6 +73,23 @@ class VoicePlatformAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support get_call")
 
+    async def stop_call(self, call_external_id: str) -> None:
+        """Hang up a call that is currently live.
+
+        The emergency stop — see RetellAdapter.stop_call. Implementations should treat
+        "already ended" as success, since that is the state the caller asked for.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support stop_call")
+
+    async def list_live_calls(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Calls the platform currently considers unfinished (dialing or talking).
+
+        Asked of the platform rather than our own `calls` table because a call whose
+        webhook never arrived is stuck at in_progress locally — the emergency stop must
+        not inherit that bug. Each entry carries at least the platform's call id.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support list_live_calls")
+
     def verify_webhook_signature(self, raw_body: str, signature: str | None) -> bool:
         """Verify a platform webhook's signature over the raw request body.
 

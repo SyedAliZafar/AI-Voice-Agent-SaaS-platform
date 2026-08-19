@@ -13,7 +13,7 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
 def _validate_llm_model(value: str) -> str:
-    """"" is valid (means "use settings.default_llm_model"). Otherwise the model's
+    """ "" is valid (means "use settings.default_llm_model"). Otherwise the model's
     *provider* must be resolvable — deliberately not "must have a configured key",
     so an agent can be set to a model before that provider's API key exists.
     """
@@ -74,6 +74,21 @@ class LlmModelInfo(BaseModel):
 class LlmModelsResponse(BaseModel):
     models: list[LlmModelInfo]
     default: str
+
+
+class AmbientSoundInfo(BaseModel):
+    id: str
+    label: str
+
+
+class AmbientSoundsResponse(BaseModel):
+    options: list[AmbientSoundInfo]
+    # Whether the tenant's own campaigns have no per-agent override (voice_config has no
+    # "ambientSound" key) rather than an explicit choice — distinct from "off", which is
+    # an explicit `null` override the frontend can tell apart via the agent's own
+    # voice_config, not this field. This is only the fleet-wide fallback every agent
+    # inherits unless it overrides.
+    default: str | None
 
 
 class SandboxMessage(BaseModel):

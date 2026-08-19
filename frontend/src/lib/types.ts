@@ -25,6 +25,18 @@ export interface LlmModelsResponse {
   default: string;
 }
 
+export interface AmbientSound {
+  id: string;
+  label: string;
+}
+
+export interface AmbientSoundsResponse {
+  options: AmbientSound[];
+  // The fleet-wide fallback every agent inherits unless voice_config has its own
+  // "ambientSound" key (including explicit `null` for "this campaign is silent").
+  default: string | null;
+}
+
 export interface CityAutocompleteResult {
   place_id: string;
   label: string;

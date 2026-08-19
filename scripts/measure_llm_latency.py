@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import AsyncOpenAI  # noqa: E402
 
-from backend.config import get_settings  # noqa: E402
+from backend.services import llm_service  # noqa: E402
 
 # Representative of a real turn: a short system prompt plus a caller utterance mid-call.
 # Deliberately not a one-word prompt — prompt length affects TTFT and we want a realistic
@@ -122,17 +122,18 @@ async def main() -> int:
     )
     args = parser.parse_args()
 
-    settings = get_settings()
-    if not settings.deepseek_api_key:
-        print("ERROR: DEEPSEEK_API_KEY is not set in .env", file=sys.stderr)
+    try:
+        # Resolves provider from MODEL_CATALOG (or a prefix guess) the same way a real
+        # call does, so --model gpt-4o-mini or --model deepseek-reasoner both work
+        # without a hardcoded base_url here going stale as the catalog grows.
+        client = llm_service.get_client(args.model)
+    except llm_service.LLMConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    client = AsyncOpenAI(api_key=settings.deepseek_api_key, base_url="https://api.deepseek.com")
 
     print(f"Model: {args.model}   Runs: {args.runs}")
     print(
-        "Measuring streaming time-to-first-token "
-        "(sequential, to avoid self-inflicted queueing)..."
+        "Measuring streaming time-to-first-token (sequential, to avoid self-inflicted queueing)..."
     )
     print()
 

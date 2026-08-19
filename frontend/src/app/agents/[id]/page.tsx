@@ -8,7 +8,15 @@ import { ArrowLeftIcon, PhoneIcon, SparkleIcon } from "@/components/icons";
 import { Badge, Button, Card, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { OBJECTIVE_LABELS, type CampaignIntake } from "@/lib/builder";
-import { Agent, LlmModel } from "@/lib/types";
+import { AmbientSound, Agent, LlmModel } from "@/lib/types";
+
+// <select> option values must be strings, but the actual states this picker represents
+// are "no override" (voice_config has no ambientSound key) and "explicitly off"
+// (ambientSound: null) — neither of which IS a string. These two sentinels stand in for
+// them and are translated back to the real value in changeAmbientSound below; every
+// other option value is a real Retell sound id and passes through unchanged.
+const AMBIENT_INHERIT = "__inherit__";
+const AMBIENT_OFF = "__off__";
 
 interface TestCallResult {
   call_id: string;
@@ -28,6 +36,9 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   const [models, setModels] = useState<LlmModel[]>([]);
   const [defaultModel, setDefaultModel] = useState("");
   const [savingModel, setSavingModel] = useState(false);
+  const [ambientSounds, setAmbientSounds] = useState<AmbientSound[]>([]);
+  const [defaultAmbientSound, setDefaultAmbientSound] = useState<string | null>(null);
+  const [savingAmbient, setSavingAmbient] = useState(false);
   const router = useRouter();
 
   useEffect(() => {
@@ -42,6 +53,13 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
         setDefaultModel(res.data.default);
       })
       .catch(() => setModels([]));
+    api
+      .get<{ options: AmbientSound[]; default: string | null }>("/agents/ambient-sounds")
+      .then((res) => {
+        setAmbientSounds(res.data.options);
+        setDefaultAmbientSound(res.data.default);
+      })
+      .catch(() => setAmbientSounds([]));
   }, [params.id]);
 
   if (loadError) {
@@ -86,6 +104,22 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
   // The model actually in effect: the agent's own choice, or the backend's configured
   // default (empty llm_model means "use settings.default_llm_model").
   const effectiveModelId = agent.llm_model || defaultModel;
+
+  // Mirrors the backend's own tri-state resolution in test_call_service.py exactly:
+  // key absent -> inherit, key present as null -> explicitly off, key present as a
+  // string -> that sound. "in" (not truthiness) is required to tell "absent" apart
+  // from "present and null" the same way the backend's sentinel-based .get() does.
+  const hasAmbientOverride = "ambientSound" in voiceConfig;
+  const ambientOverrideValue = voiceConfig.ambientSound as string | null | undefined;
+  const selectedAmbientValue = !hasAmbientOverride
+    ? AMBIENT_INHERIT
+    : ambientOverrideValue === null
+      ? AMBIENT_OFF
+      : (ambientOverrideValue as string);
+  const effectiveAmbientLabel = hasAmbientOverride
+    ? (ambientSounds.find((s) => s.id === ambientOverrideValue)?.label ?? "Off")
+    : (ambientSounds.find((s) => s.id === defaultAmbientSound)?.label ?? "Off");
+
   const effectiveModelLabel =
     models.find((m) => m.id === effectiveModelId)?.label || effectiveModelId || "the configured model";
 
@@ -130,6 +164,32 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
       setCallError(getApiErrorMessage(err, "Couldn't change the model."));
     } finally {
       setSavingModel(false);
+    }
+  }
+
+  async function changeAmbientSound(selected: string) {
+    if (!agent) return;
+    setSavingAmbient(true);
+    setCallError(null);
+    // voice_config is a flat dict the backend merges on top of (PATCH replaces the whole
+    // field, per backend/api/agents.py's generic AgentUpdate) — every other key
+    // (voiceId, campaign, the retell/retell_custom provisioning cache) must be preserved
+    // explicitly or this write would silently drop them.
+    const nextVoiceConfig = { ...agent.voice_config };
+    if (selected === AMBIENT_INHERIT) {
+      delete nextVoiceConfig.ambientSound;
+    } else if (selected === AMBIENT_OFF) {
+      nextVoiceConfig.ambientSound = null;
+    } else {
+      nextVoiceConfig.ambientSound = selected;
+    }
+    try {
+      await api.patch(`/agents/${agent.id}`, { voice_config: nextVoiceConfig });
+      setAgent({ ...agent, voice_config: nextVoiceConfig });
+    } catch (err) {
+      setCallError(getApiErrorMessage(err, "Couldn't change the background sound."));
+    } finally {
+      setSavingAmbient(false);
     }
   }
 
@@ -307,6 +367,33 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
                     <option key={m.id} value={m.id} disabled={!m.configured}>
                       {m.label}
                       {!m.configured ? " (no API key configured)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {agent.use_custom_llm && (
+              <div className="mt-4 border-t border-slate-100 pt-4">
+                <label className="mb-1.5 block text-xs font-medium text-slate-700">
+                  Background sound
+                </label>
+                <p className="mb-2 text-xs text-slate-500">
+                  Ambient noise on the agent&apos;s line. Off by default — background sound
+                  competes with Retell&apos;s speech recognition on what the caller says, so
+                  only turn this on if you have a specific reason to want it.
+                </p>
+                <select
+                  value={selectedAmbientValue}
+                  onChange={(e) => changeAmbientSound(e.target.value)}
+                  disabled={savingAmbient}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-300 focus:outline-none disabled:opacity-50"
+                >
+                  <option value={AMBIENT_INHERIT}>Campaign default ({effectiveAmbientLabel})</option>
+                  <option value={AMBIENT_OFF}>Off (silent)</option>
+                  {ambientSounds.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.label}
                     </option>
                   ))}
                 </select>

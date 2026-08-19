@@ -257,6 +257,16 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://abc123.trycloudflare.com"
         mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
 
         result = await test_call_service.place_test_call(
             db_session, agent.id, tenant_id, "+491701234567"
@@ -275,6 +285,13 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
         # ADR-010: the opening pause has to be Retell's parameter — our websocket opens
         # during call setup, so we can't tell ringing from pickup on our side.
         begin_message_delay_ms=1500,
+        # The other half of barge-in control: retell_ws's guard stops US cancelling,
+        # this stops Retell chopping audio we already sent (call fae0d38c).
+        interruption_sensitivity=0.3,
+        responsiveness=0.7,
+        ambient_sound=None,
+        expressive_mode=True,
+        expressive_emotion_tags=["emphasis", "curious", "empathetic", "pause"],
     )
     mock_adapter.create_llm.assert_not_awaited()
     mock_adapter.create_outbound_call.assert_awaited_once_with(
@@ -284,11 +301,19 @@ async def test_place_test_call_custom_llm_provisions_and_caches(db_session, tena
     )
 
     refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    # Every creation-time setting is cached, not just the URLs: a changed value has to
+    # miss this key and force a new agent, or it silently never reaches Retell.
     assert refreshed.voice_config["retell_custom"] == {
         "agent_id": "custom_agent_1",
         "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
         "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
         "begin_message_delay_ms": 1500,
+        "voice_id": "11labs-Adrian",
+        "interruption_sensitivity": 0.3,
+        "responsiveness": 0.7,
+        "ambient_sound": None,
+        "expressive_mode": True,
+        "expressive_emotion_tags": ["emphasis", "curious", "empathetic", "pause"],
     }
 
 
@@ -310,9 +335,7 @@ async def test_place_test_call_custom_llm_requires_public_base_url(db_session, t
 
 
 @pytest.mark.asyncio
-async def test_place_test_call_custom_llm_persists_prompt_override_on_call(
-    db_session, tenant_id
-):
+async def test_place_test_call_custom_llm_persists_prompt_override_on_call(db_session, tenant_id):
     """A personalized prospect call on the custom-LLM path can't push its prompt to
     Retell (our websocket answers, not Retell's LLM), so the override has to land on the
     Call row for retell_ws.py to read back by external_id. The agent's own saved script
@@ -341,6 +364,16 @@ async def test_place_test_call_custom_llm_persists_prompt_override_on_call(
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://abc123.trycloudflare.com"
         mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
 
         await test_call_service.place_test_call(
             db_session,
@@ -395,9 +428,7 @@ async def test_place_test_call_hosted_llm_does_not_persist_prompt_override_on_ca
             system_prompt_override="Base script\n[COMPANY BRIEF] personalized for Acme",
         )
 
-    call = await call_service.get_call_by_external_id(
-        db_session, "call_hosted_personalized_1"
-    )
+    call = await call_service.get_call_by_external_id(db_session, "call_hosted_personalized_1")
     assert call.system_prompt_override is None
 
 
@@ -436,6 +467,16 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://new-tunnel.trycloudflare.com"
         mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
 
         await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
@@ -445,6 +486,11 @@ async def test_place_test_call_custom_llm_reprovisions_on_tunnel_change(db_sessi
         voice_id="11labs-Adrian",
         webhook_url="https://new-tunnel.trycloudflare.com/webhooks/retell",
         begin_message_delay_ms=1500,
+        interruption_sensitivity=0.3,
+        responsiveness=0.7,
+        ambient_sound=None,
+        expressive_mode=True,
+        expressive_emotion_tags=["emphasis", "curious", "empathetic", "pause"],
     )
     mock_adapter.create_outbound_call.assert_awaited_once_with(
         from_number="+15551234567",
@@ -490,6 +536,16 @@ async def test_place_test_call_custom_llm_reprovisions_when_greeting_delay_chang
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://abc123.trycloudflare.com"
         mock_settings.greeting_delay_ms = 2000
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
 
         await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
 
@@ -500,6 +556,304 @@ async def test_place_test_call_custom_llm_reprovisions_when_greeting_delay_chang
     )
     refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
     assert refreshed.voice_config["retell_custom"]["agent_id"] == "agent_with_delay"
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_reprovisions_when_voice_or_sensitivity_changes(
+    db_session, tenant_id
+):
+    """Regression for call fae0d38c: voice_id and interruption_sensitivity are fixed on
+    the Retell agent at creation, but neither was in the provisioning cache key. A cached
+    agent was therefore reused forever — the call ran on 11labs-Adrian at Retell's default
+    sensitivity while the operator was editing a *different* agent in Retell's dashboard
+    and wondering why nothing changed. Changing either must mint a new agent.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {
+        "retell_custom": {
+            "agent_id": "agent_old_voice",
+            "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+            "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
+            "begin_message_delay_ms": 1500,
+            "voice_id": "11labs-Adrian",
+            "interruption_sensitivity": 1.0,
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_new_voice"
+    mock_adapter.create_outbound_call.return_value = "call_voice"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "retell-Maren"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once()
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["voice_id"] == "retell-Maren"
+    assert kwargs["interruption_sensitivity"] == 0.3
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.voice_config["retell_custom"]["agent_id"] == "agent_new_voice"
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_reprovisions_when_responsiveness_or_ambient_changes(
+    db_session, tenant_id
+):
+    """Same failure mode as the voice/sensitivity regression above, for the two settings
+    added right after it: responsiveness and ambient_sound are also fixed on the Retell
+    agent at creation, so both must be in the cache key too, or tuning either would
+    silently do nothing on a call that already has a cached agent.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {
+        "retell_custom": {
+            "agent_id": "agent_no_ambience",
+            "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+            "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
+            "begin_message_delay_ms": 1500,
+            "voice_id": "retell-Maren",
+            "interruption_sensitivity": 0.5,
+            "responsiveness": None,
+            "ambient_sound": None,
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_with_ambience"
+    mock_adapter.create_outbound_call.return_value = "call_ambience"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "retell-Maren"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.5
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = "coffee-shop"
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once()
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["responsiveness"] == 0.7
+    assert kwargs["ambient_sound"] == "coffee-shop"
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.voice_config["retell_custom"]["agent_id"] == "agent_with_ambience"
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_reprovisions_when_expressive_settings_change(
+    db_session, tenant_id
+):
+    """Same failure mode again, for expressive_mode/expressive_emotion_tags: verified via
+    a disposable probe agent that Retell's schema accepts these for retell-Maren, but
+    accepted-at-creation is exactly the trap this whole cache key exists to catch — a
+    value not in the key just gets silently ignored on every subsequent call.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {
+        "retell_custom": {
+            "agent_id": "agent_flat_delivery",
+            "ws_url": "wss://abc123.trycloudflare.com/llm-websocket",
+            "webhook_url": "https://abc123.trycloudflare.com/webhooks/retell",
+            "begin_message_delay_ms": 1500,
+            "voice_id": "retell-Maren",
+            "interruption_sensitivity": 0.5,
+            "responsiveness": 0.7,
+            "ambient_sound": None,
+            "expressive_mode": False,
+            "expressive_emotion_tags": [],
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_expressive"
+    mock_adapter.create_outbound_call.return_value = "call_expressive"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "retell-Maren"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.5
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_agent_with_custom_llm.assert_awaited_once()
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["expressive_mode"] is True
+    assert kwargs["expressive_emotion_tags"] == ["emphasis", "curious", "empathetic", "pause"]
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.voice_config["retell_custom"]["agent_id"] == "agent_expressive"
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_per_agent_ambient_sound_overrides_default(
+    db_session, tenant_id
+):
+    """voice_config["ambientSound"] is the per-agent override the dashboard's Ambient
+    sound picker writes (backend/api/agents.py's generic PATCH .../{agent_id}, same
+    mechanism voiceId already uses) — it must win over settings.retell_ambient_sound.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {"ambientSound": "call-center"}
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_call_center"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "retell-Maren"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.5
+        mock_settings.retell_responsiveness = 0.7
+        # The global default is silence — the per-agent override must still win.
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["ambient_sound"] == "call-center"
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_custom_llm_per_agent_ambient_sound_can_force_silence(
+    db_session, tenant_id
+):
+    """The other half of the tri-state: an agent can explicitly override to `null`
+    (silence) even if the fleet-wide default is later changed to a real sound — this is
+    what distinguishes voice_config lacking the key (inherit) from voice_config having
+    the key set to None (explicit silence), and is exactly why the resolution in
+    test_call_service uses a sentinel instead of `dict.get(key, default)`.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
+    )
+    agent.voice_config = {"ambientSound": None}
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "agent_silent"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "retell-Maren"
+        mock_settings.public_base_url = "https://abc123.trycloudflare.com"
+        mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.5
+        mock_settings.retell_responsiveness = 0.7
+        # Fleet default is a real sound this time — the agent's explicit None must win.
+        mock_settings.retell_ambient_sound = "coffee-shop"
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    kwargs = mock_adapter.create_agent_with_custom_llm.await_args.kwargs
+    assert kwargs["ambient_sound"] is None
 
 
 @pytest.mark.asyncio
@@ -583,6 +937,16 @@ async def test_place_test_call_custom_llm_auto_self_heals_after_tunnel_restart(
         mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "auto"
         mock_settings.greeting_delay_ms = 1500
+        mock_settings.retell_interruption_sensitivity = 0.3
+        mock_settings.retell_responsiveness = 0.7
+        mock_settings.retell_ambient_sound = None
+        mock_settings.retell_expressive_mode = True
+        mock_settings.retell_expressive_emotion_tags = [
+            "emphasis",
+            "curious",
+            "empathetic",
+            "pause",
+        ]
 
         result = await test_call_service.place_test_call(
             db_session, agent.id, tenant_id, "+491701234567"

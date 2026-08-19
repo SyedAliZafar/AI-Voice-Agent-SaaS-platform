@@ -2,6 +2,7 @@
 
 import uuid
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +32,42 @@ async def sync_calls(
     """
     updated = await call_service.reconcile_stale_calls(db, tenant_id, RetellAdapter())
     return CallSyncResponse(updated=updated)
+
+
+@router.post("/{call_id}/end", response_model=CallResponse)
+async def end_call(
+    call_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Hang up a live call immediately — the emergency stop.
+
+    Tenant-scoped like every other route here, so one tenant can't hang up another's
+    call. For the case where this API isn't running at all (which is exactly when an
+    operator most needs to stop a call), use `scripts/kill_calls.py` instead — it talks
+    to Retell directly and needs nothing but the API key.
+
+    Returns the call row after the post-hangup reconcile. It may still read in_progress
+    if Retell hadn't finalized the call yet — the hangup has still happened, and the
+    call_ended webhook (or POST /sync) settles the row shortly after.
+    """
+    call = await call_service.get_call(db, call_id, tenant_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if not call.external_id:
+        raise HTTPException(
+            status_code=422, detail="Call was never placed on the platform — nothing to hang up"
+        )
+
+    try:
+        await call_service.end_call(db, call, RetellAdapter())
+    except httpx.HTTPError as exc:
+        # The hangup itself failed — never report success for this, or an operator walks
+        # away believing a live call was stopped when it is still talking.
+        raise HTTPException(
+            status_code=502, detail=f"Voice platform refused the hangup: {exc}"
+        ) from exc
+    return call
 
 
 @router.get("", response_model=list[CallResponse])

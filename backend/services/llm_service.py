@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
-MAX_TOKENS = 1024
+# A hard stop, not a style knob — brevity is asked for in the prompt (retell_ws's
+# [SPEECH] block), which is what makes replies end naturally instead of being guillotined
+# mid-word. This ceiling only bounds the pathological case: at the old 1024 a single turn
+# could run to ~750 spoken words, five minutes of uninterruptible monologue down a phone
+# line. 200 leaves generous headroom over a good spoken turn (~60 tokens) and over
+# tool-call arguments, which are billed to the same budget.
+MAX_TOKENS = 200
 
 # Ceiling on a single provider's warm-up request (see warm_up_providers). Generous:
 # the point is to bound a hung connection, not to race a slow-but-working one.
