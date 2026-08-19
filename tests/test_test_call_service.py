@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from backend.schemas.agent import AgentCreate
-from backend.services import agent_service, test_call_service
+from backend.services import agent_service, call_service, test_call_service
 
 
 @pytest.mark.asyncio
@@ -310,24 +310,95 @@ async def test_place_test_call_custom_llm_requires_public_base_url(db_session, t
 
 
 @pytest.mark.asyncio
-async def test_place_test_call_custom_llm_rejects_prompt_override(db_session, tenant_id):
+async def test_place_test_call_custom_llm_persists_prompt_override_on_call(
+    db_session, tenant_id
+):
+    """A personalized prospect call on the custom-LLM path can't push its prompt to
+    Retell (our websocket answers, not Retell's LLM), so the override has to land on the
+    Call row for retell_ws.py to read back by external_id. The agent's own saved script
+    stays untouched, and nothing prospect-specific is baked into the provisioned Retell
+    agent — same contract the hosted path already had, different delivery route.
+    """
     agent = await agent_service.create_agent(
         db_session,
         tenant_id,
         AgentCreate(name="SDR", platform="retell", system_prompt="Hi", use_custom_llm=True),
     )
 
-    with patch("backend.services.test_call_service.settings") as mock_settings:
+    mock_adapter = AsyncMock()
+    mock_adapter.create_agent_with_custom_llm.return_value = "custom_agent_1"
+    mock_adapter.create_outbound_call.return_value = "call_personalized_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+        patch(
+            "backend.services.tunnel_check.check_public_url_reachable",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
         mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
         mock_settings.public_base_url = "https://abc123.trycloudflare.com"
-        with pytest.raises(test_call_service.TestCallError, match="use_custom_llm"):
-            await test_call_service.place_test_call(
-                db_session,
-                agent.id,
-                tenant_id,
-                "+491701234567",
-                system_prompt_override="Personalized for Acme",
-            )
+        mock_settings.greeting_delay_ms = 1500
+
+        await test_call_service.place_test_call(
+            db_session,
+            agent.id,
+            tenant_id,
+            "+491701234567",
+            system_prompt_override="Hi\n[COMPANY BRIEF] personalized for Acme",
+        )
+
+    call = await call_service.get_call_by_external_id(db_session, "call_personalized_1")
+    assert call.system_prompt_override == "Hi\n[COMPANY BRIEF] personalized for Acme"
+
+    # The Retell-side agent must stay generic — no prompt is pushed on this path at all.
+    mock_adapter.create_llm.assert_not_awaited()
+    mock_adapter.update_llm.assert_not_awaited()
+
+    refreshed = await agent_service.get_agent(db_session, agent.id, tenant_id)
+    assert refreshed.system_prompt == "Hi"  # unchanged in the DB
+
+
+@pytest.mark.asyncio
+async def test_place_test_call_hosted_llm_does_not_persist_prompt_override_on_call(
+    db_session, tenant_id
+):
+    """The hosted path already delivered the override to Retell at provisioning time.
+    Storing it on the Call row too would wrongly imply the websocket should honor it —
+    for an agent whose calls never reach the websocket.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="SDR", platform="retell", system_prompt="Base script"),
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_llm.return_value = "llm_1"
+    mock_adapter.create_agent_with_llm.return_value = "agent_1"
+    mock_adapter.create_outbound_call.return_value = "call_hosted_personalized_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+
+        await test_call_service.place_test_call(
+            db_session,
+            agent.id,
+            tenant_id,
+            "+491701234567",
+            system_prompt_override="Base script\n[COMPANY BRIEF] personalized for Acme",
+        )
+
+    call = await call_service.get_call_by_external_id(
+        db_session, "call_hosted_personalized_1"
+    )
+    assert call.system_prompt_override is None
 
 
 @pytest.mark.asyncio

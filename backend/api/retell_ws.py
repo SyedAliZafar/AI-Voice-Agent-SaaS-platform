@@ -15,7 +15,10 @@ Tenant/agent resolution: Retell's frames carry only call_id, no auth header (see
 backend/api/deps.py's docstring on why HTTP auth can't apply here). We resolve
 tenant_id/agent_id by looking the Call row up by external_id — the same chain
 call_service already uses for webhook events — which only works for calls this backend
-originated (outbound-only today, per call_service's module docstring).
+originated (outbound-only today, per call_service's module docstring). That same Call row
+also carries `system_prompt_override`, the per-call personalized script a prospect call
+builds — it takes precedence over Agent.system_prompt for exactly the same reason the
+lookup exists at all: call_id is the only thing Retell's frames give us to key on.
 
 Streaming (ADR-009 — see CONTEXT.md): response_required/reminder_required turns run on
 a cancellable asyncio.Task via llm_service.stream_agent_response, sending one
@@ -428,7 +431,13 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
             await websocket.close(code=1008)
             return
 
-        system_prompt = agent.system_prompt
+        # A prospect call personalizes the campaign script per company
+        # (script_service.build_prospect_prompt) and parks the result on the Call row,
+        # since Retell's frames carry only call_id and there's no other channel to hand
+        # this socket a call-scoped prompt. Null for plain test/lead calls, which fall
+        # back to the agent's saved script. Read here, once per connection, alongside
+        # everything else — same reasoning as llm_model below.
+        system_prompt = call.system_prompt_override or agent.system_prompt
         llm_model = agent.llm_model or None  # None -> llm_service.get_agent_response's default
         caller_context: dict[str, Any] = {
             "caller_number": call.caller_number,

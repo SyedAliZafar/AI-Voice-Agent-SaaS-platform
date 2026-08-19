@@ -58,6 +58,7 @@ def _seed_db(
     tenant_id: uuid.UUID,
     call_external_id: str,
     system_prompt: str = "You are a helpful assistant.",
+    call_system_prompt_override: str | None = None,
 ) -> None:
     async def _run() -> None:
         engine = create_async_engine(db_url, poolclass=NullPool)
@@ -84,6 +85,7 @@ def _seed_db(
                     status="in_progress",
                     started_at=datetime.now(UTC),
                     external_id=call_external_id,
+                    system_prompt_override=call_system_prompt_override,
                 )
             )
             await session.commit()
@@ -219,6 +221,88 @@ def test_llm_websocket_ping_pong_and_streamed_response(tmp_path):
     assert call_args.args[1] == [{"role": "user", "content": "Hi"}]
     assert call_args.args[2]["agent_id"] == str(agent_id)
     assert call_args.args[2]["tenant_id"] == str(tenant_id)
+
+
+def test_llm_websocket_prefers_the_calls_personalized_prompt(tmp_path):
+    """A prospect call parks its personalized script (base + [COMPANY BRIEF]) on the Call
+    row, because Retell's frames carry only call_id and there's no other way to hand this
+    socket a call-scoped prompt. When present it must win over Agent.system_prompt —
+    otherwise the agent would dial a researched prospect and read the generic script.
+    """
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'personalized.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_personalized"
+    _seed_db(
+        db_url,
+        agent_id,
+        tenant_id,
+        call_external_id,
+        system_prompt="You are Ali.",
+        call_system_prompt_override="You are Ali.\n[COMPANY BRIEF] Acme runs 40 HVAC vans.",
+    )
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    mock_stream = MagicMock(side_effect=_stream_returning("Hi Acme!"))
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", mock_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 1,
+                        "transcript": [{"role": "user", "content": "Hi"}],
+                    }
+                )
+                _recv_until_complete(ws)
+
+    prompt = mock_stream.call_args.args[0]
+    assert "[COMPANY BRIEF] Acme runs 40 HVAC vans." in prompt
+    # Still wrapped in the usual per-turn [CONTEXT] block — the override replaces the
+    # agent's script, not the context envelope built around it.
+    assert "[CONTEXT]" in prompt
+
+
+def test_llm_websocket_falls_back_to_agent_prompt_without_override(tmp_path):
+    """The null case — a plain test call or lead-retry call has no personalization, and
+    must keep reading the agent's saved script exactly as before this field existed.
+    """
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'no_override.db'}"
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    call_external_id = "call_plain"
+    _seed_db(db_url, agent_id, tenant_id, call_external_id, system_prompt="You are Ali.")
+
+    test_engine = create_async_engine(db_url, poolclass=NullPool)
+    test_session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    mock_stream = MagicMock(side_effect=_stream_returning("Hello!"))
+
+    with (
+        patch("backend.api.retell_ws.AsyncSessionLocal", test_session_factory),
+        patch("backend.services.llm_service.stream_agent_response", mock_stream),
+        patch("backend.api.retell_ws.call_ws.publish_call_event", AsyncMock()),
+    ):
+        with TestClient(app) as client:
+            with client.websocket_connect(f"/llm-websocket/{call_external_id}") as ws:
+                ws.receive_json()  # config
+                ws.send_json(
+                    {
+                        "interaction_type": "response_required",
+                        "response_id": 1,
+                        "transcript": [{"role": "user", "content": "Hi"}],
+                    }
+                )
+                _recv_until_complete(ws)
+
+    assert mock_stream.call_args.args[0].startswith("You are Ali.")
+    assert "[COMPANY BRIEF]" not in mock_stream.call_args.args[0]
 
 
 def test_llm_websocket_speaks_first_on_call_details(tmp_path):

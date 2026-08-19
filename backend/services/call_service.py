@@ -129,10 +129,15 @@ async def create_outbound_call_record(
     external_id: str,
     caller_number: str,
     lead_id: uuid.UUID | None = None,
+    system_prompt_override: str | None = None,
 ) -> Call:
     """Called by test_call_service right after the voice platform confirms an
     outbound call was placed — see module docstring for why creation happens here
     rather than on the call_started webhook.
+
+    `system_prompt_override` is only meaningful for use_custom_llm agents: it's how a
+    personalized, call-scoped prompt reaches backend/api/retell_ws.py, which resolves it
+    off this row rather than from Agent.system_prompt. See Call.system_prompt_override.
     """
     call = Call(
         tenant_id=tenant_id,
@@ -142,6 +147,7 @@ async def create_outbound_call_record(
         started_at=datetime.now(UTC),
         external_id=external_id,
         lead_id=lead_id,
+        system_prompt_override=system_prompt_override,
     )
     db.add(call)
     await db.commit()

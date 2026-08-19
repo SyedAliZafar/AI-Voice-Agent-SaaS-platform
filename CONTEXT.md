@@ -696,6 +696,25 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    that's the point) and every agent is selectable regardless of platform, since
    nothing here dials a phone.
 
+   **Per-call personalized prompts.** `place_test_call(system_prompt_override=...)` is
+   how a prospect or lead call swaps in a personalized script for one call without
+   overwriting `Agent.system_prompt` — the campaign script stays the source of truth.
+   The two engines deliver it by different routes, because they have different places
+   to put it:
+   - **Hosted LLM** — pushed to Retell's own LLM at provisioning time
+     (`_provision_hosted_llm_agent` passes it to `adapter.create_llm/update_llm`).
+     Nothing is stored on the Call row; Retell already has the prompt.
+   - **Custom LLM** — our websocket answers, and Retell's frames carry only `call_id`,
+     so there is no channel to hand the socket a call-scoped prompt. It's persisted to
+     `Call.system_prompt_override` at `create_outbound_call_record` time, and
+     `api/retell_ws.py` prefers it over `Agent.system_prompt` on the same
+     `get_call_by_external_id` lookup it already does to resolve tenant/agent. The
+     provisioned Retell agent stays generic, so no per-prospect re-provisioning is
+     needed and one Retell agent serves personalized and plain calls alike.
+
+   Null on the Call row means "no personalization" — plain test calls and any hosted-LLM
+   call — and the websocket falls back to the agent's saved script.
+
    `GET /city-autocomplete` proxies Google's Places Autocomplete (New) — type-ahead for
    the discovery "Where" field, debounced client-side with a per-session token for
    Google's session-based Autocomplete billing SKU (distinct from Text Search's). The
@@ -776,10 +795,9 @@ own request text, and anything in the generic `details` JSON) plus the operator'
 below the prompt is the *same* code Prospects use — `test_call_service.place_test_call`
 gained an optional `lead_id` param (threaded through to `Call.lead_id`) rather than a
 parallel dispatch path, so provisioning, streaming, ledger de-duplication (ADR-009),
-and webhook handling are identical for a lead call and a prospect call. This inherits
-prospects' existing limitation: `_provision_custom_llm_agent` rejects
-`system_prompt_override`, so a lead can only be called through a hosted-LLM agent
-today.
+and webhook handling are identical for a lead call and a prospect call. Both engines
+carry the personalized prompt (see "Per-call personalized prompts" below), so a lead or
+prospect can be called through a hosted-LLM *or* a custom-LLM agent.
 
 **Outcome isn't known at dispatch time — it arrives on the webhook.** Placing a call
 just flips `retry_state` to `in_flight` and increments `attempt_count`; whether it
@@ -992,10 +1010,9 @@ Try an agent's persona/system_prompt over text before spending a real call on it
 `frontend/src/app/agents/[id]/sandbox/page.tsx` → `POST /api/agents/{id}/sandbox-chat` →
 `sandbox_service.chat()` → `llm_service.get_agent_response()`. Stateless: the client
 resends the whole message history each turn, the same shape a live call already uses —
-no new table, no session store. Unlike the live custom-LLM path (which rejects
-`system_prompt_override` because the WS handler reads `Agent.system_prompt` fresh from
-the DB per call), the sandbox can run with an unsaved prompt draft — that's the point of
-the feature. Tools default off (`tools_enabled=False`): `book_appointment`/`create_lead`
+no new table, no session store. It takes a `system_prompt_override` directly as an
+argument rather than off a Call row (there is no call), so the sandbox can run with an
+unsaved prompt draft — that's the point of the feature. Tools default off (`tools_enabled=False`): `book_appointment`/`create_lead`
 make real HTTP calls to Cal.com/HubSpot via `integration_service.py`, and a text chat
 shouldn't hit those by accident.
 

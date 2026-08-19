@@ -33,6 +33,14 @@ class Call(Base, UUIDMixin, TimestampMixin, TenantMixin):
     lead_id: Mapped[UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("leads.id"), nullable=True, index=True
     )
+    # Per-call personalized script (base campaign script + [COMPANY BRIEF]/[OPERATOR
+    # NOTES], built by script_service.build_prospect_prompt) for use_custom_llm agents.
+    # The hosted-LLM path pushes its override straight to Retell at provisioning time and
+    # never needs this; our own Custom LLM websocket (backend/api/retell_ws.py) has no
+    # other channel to receive a call-scoped prompt — Retell's frames carry only call_id —
+    # so the override rides on the Call row it already looks up by external_id.
+    # Null for plain test calls and lead-retry calls, which use Agent.system_prompt as-is.
+    system_prompt_override: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     events: Mapped[list["CallEvent"]] = relationship(back_populates="call")
     transcript: Mapped["Transcript"] = relationship(back_populates="call", uselist=False)

@@ -47,8 +47,10 @@ async def place_test_call(
     `system_prompt_override` lets a caller (e.g. prospect_service's per-company call)
     push a *personalized* variant (base script + [COMPANY BRIEF]) for just this call,
     without overwriting the agent's base `system_prompt` in the database — the campaign
-    script stays the source of truth; personalization is call-time only. Only supported
-    on the hosted-LLM path today (see `_provision_custom_llm_agent`).
+    script stays the source of truth; personalization is call-time only. Supported on both
+    engines, by different routes: the hosted path pushes it to Retell's LLM at
+    provisioning time, while the custom-LLM path stores it on the Call row for
+    backend/api/retell_ws.py to pick up (see Call.system_prompt_override).
 
     `lead_id` tags the resulting Call row so call_service's terminal-state writer can
     hand off to lead_service.evaluate_call_outcome (ADR-011) — None for every other
@@ -78,9 +80,7 @@ async def place_test_call(
     adapter = RetellAdapter()
 
     if agent.use_custom_llm:
-        agent_external_id = await _provision_custom_llm_agent(
-            db, adapter, agent, system_prompt_override
-        )
+        agent_external_id = await _provision_custom_llm_agent(db, adapter, agent)
     else:
         prompt = system_prompt_override or agent.system_prompt
         agent_external_id = await _provision_hosted_llm_agent(db, adapter, agent, prompt)
@@ -93,8 +93,18 @@ async def place_test_call(
 
     # Create the Call row now — we have agent_id/tenant_id here, which webhook
     # events alone never carry. See call_service module docstring.
+    #
+    # The override is persisted only on the custom-LLM path: the hosted path already
+    # pushed it to Retell during provisioning, and storing it here too would imply the
+    # websocket should honor it for an agent whose calls never reach the websocket.
     await call_service.create_outbound_call_record(
-        db, agent.tenant_id, agent.id, call_id, to_number, lead_id=lead_id
+        db,
+        agent.tenant_id,
+        agent.id,
+        call_id,
+        to_number,
+        lead_id=lead_id,
+        system_prompt_override=system_prompt_override if agent.use_custom_llm else None,
     )
 
     return {
@@ -168,29 +178,22 @@ async def _provision_custom_llm_agent(
     db: AsyncSession,
     adapter: RetellAdapter,
     agent: Agent,
-    system_prompt_override: str | None,
 ) -> str:
     """OUR Custom LLM WebSocket (backend/api/retell_ws.py) answers instead of Retell's
     hosted LLM — DeepSeek + server-side tools, ADR-003's actual target.
 
     Unlike the hosted path, no prompt is pushed to Retell at provisioning time: the WS
-    handler reads Agent.system_prompt fresh from the DB per call. That means a
-    call-time system_prompt_override has nowhere to live yet for this path — rejected
-    explicitly below rather than silently ignored. (Tracked follow-up, not a bug: see
-    phase0.md's next-files list.)
+    handler reads the prompt fresh from the DB per call. A call-time
+    system_prompt_override therefore does NOT belong here — it rides on the Call row
+    instead (Call.system_prompt_override, written by place_test_call below), which is what
+    retell_ws.py already looks up by external_id. That's also why the Retell agent stays
+    shareable across personalized and non-personalized calls: nothing prospect-specific is
+    baked into the provisioned agent, so no per-prospect re-provisioning is needed.
 
     Caches {agent_id, ws_url, webhook_url} under voice_config["retell_custom"], keyed on
     both URLs so a tunnel restart (which changes PUBLIC_BASE_URL) is detected and
     re-provisions automatically instead of silently pointing Retell at a dead websocket.
     """
-    if system_prompt_override:
-        raise TestCallError(
-            "Personalized prompts (system_prompt_override) aren't supported yet for "
-            "use_custom_llm agents — the Custom LLM WebSocket reads Agent.system_prompt "
-            "directly at call time. Use a hosted-LLM agent for personalized/prospect calls "
-            "for now, or set agent.system_prompt directly instead of overriding per-call."
-        )
-
     try:
         base_url = await public_url.get_public_base_url(settings.public_base_url)
     except public_url.PublicUrlUnavailable as exc:
