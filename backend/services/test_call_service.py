@@ -139,12 +139,28 @@ async def list_platform_agents(platform: str = "retell") -> list[dict]:
         raise TestCallError(f"'{platform}' does not expose an agent list") from exc
 
 
+async def get_platform_agent_variables(
+    external_agent_id: str, platform: str = "retell"
+) -> list[str]:
+    """The `{{placeholder}}` names a platform agent's prompt declares (ADR-012).
+
+    What the operator has to fill in before this agent can be dialed — the same list
+    Retell's own dashboard shows under "Dynamic Variables", derived the same way.
+    """
+    adapter = get_adapter(platform)
+    try:
+        return await adapter.get_agent_dynamic_variables(external_agent_id)
+    except NotImplementedError:
+        return []
+
+
 async def place_platform_agent_call(
     db: AsyncSession,
     tenant_id: uuid.UUID,
     external_agent_id: str,
     to_number: str,
     platform: str = "retell",
+    dynamic_variables: dict[str, str] | None = None,
 ) -> dict:
     """Dial using an agent that already exists on the voice platform (ADR-012).
 
@@ -161,8 +177,10 @@ async def place_platform_agent_call(
         that agent in the dashboard. Without it the row sits in_progress until someone
         runs POST /api/calls/sync, which reconciles it from the platform regardless
         (ADR-007) — that path needs only external_id, not an agent.
-      - There is no system_prompt_override: the platform's agent holds the script, and
-        nothing here can personalize a single call.
+      - There is no system_prompt_override: the platform's agent holds the script, so a
+        call-scoped prompt has nowhere to go. `dynamic_variables` is the personalization
+        that IS available — it fills the `{{placeholders}}` that script already declares,
+        rather than replacing it (see get_platform_agent_variables).
     """
     if not settings.retell_from_number:
         raise TestCallError(
@@ -185,10 +203,27 @@ async def place_platform_agent_call(
             "It may have been deleted, or belong to a different account."
         )
 
+    # An unfilled placeholder is not a silent no-op: Retell leaves the literal
+    # "{{company_name}}" in the prompt, and the agent reads it out loud to a real
+    # prospect. Blocking the dial is strictly better than spending a call on that, so
+    # every name the prompt declares must arrive with a non-blank value.
+    declared = await adapter.get_agent_dynamic_variables(external_agent_id)
+    supplied = {k: v for k, v in (dynamic_variables or {}).items() if str(v).strip()}
+    missing = [name for name in declared if name not in supplied]
+    if missing:
+        raise TestCallError(
+            f"'{match['name']}' needs a value for {', '.join(missing)} — its prompt uses "
+            "{{...}} placeholders, and an empty one gets spoken to the caller verbatim."
+        )
+
     call_id = await adapter.create_outbound_call(
         from_number=settings.retell_from_number,
         to_number=to_number,
         agent_external_id=external_agent_id,
+        # Only what the prompt actually asks for. Sending extras is harmless to Retell,
+        # but it makes the CallEvent audit trail read as though the agent used data it
+        # never saw.
+        dynamic_variables={k: str(v) for k, v in supplied.items() if k in declared},
     )
 
     await call_service.create_outbound_call_record(

@@ -159,6 +159,84 @@ async def test_list_platform_agents_accepts_a_paginated_body(monkeypatch):
     ]
 
 
+# --- dynamic variables (ADR-012) ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_agent_dynamic_variables_scans_prompt_and_begin_message(monkeypatch):
+    """Retell has no endpoint reporting an agent's placeholders — its own dashboard
+    derives them by scanning the prompt, and so do we. Verified against a real agent:
+    the four names the dashboard offered are exactly what this finds."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "get-agent" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "agent_1",
+                    "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "llm_id": "llm_1",
+                "general_prompt": (
+                    "You are calling {{company_name}} about {{ current_time }}. "
+                    "Mention {{company_name}} again."
+                ),
+                "begin_message": "Hi {{contact_name}}!",
+            },
+        )
+
+    _patch_transport(monkeypatch, handler)
+    variables = await RetellAdapter().get_agent_dynamic_variables("agent_1")
+
+    # Deduped, sorted, whitespace inside the braces tolerated, and begin_message
+    # included — an opener is exactly where an unfilled placeholder is spoken first.
+    assert variables == ["company_name", "contact_name", "current_time"]
+
+
+@pytest.mark.asyncio
+async def test_get_agent_dynamic_variables_is_empty_when_there_is_no_prompt_to_scan(
+    monkeypatch,
+):
+    """A custom-llm agent keeps its prompt on whatever server answers the websocket.
+    Returning [] (not raising) keeps "we can't inspect it" from blocking a dial."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"agent_id": "agent_1", "response_engine": {"type": "custom-llm"}},
+        )
+
+    _patch_transport(monkeypatch, handler)
+    assert await RetellAdapter().get_agent_dynamic_variables("agent_1") == []
+
+
+@pytest.mark.asyncio
+async def test_create_outbound_call_omits_empty_dynamic_variables(monkeypatch):
+    """The local-agent paths never use this; an empty object would be a pointless
+    difference in their request bodies."""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(200, json={"call_id": "call_1"})
+
+    _patch_transport(monkeypatch, handler)
+
+    await RetellAdapter().create_outbound_call("+1", "+2", "agent_1")
+    assert "retell_llm_dynamic_variables" not in bodies[-1]
+
+    await RetellAdapter().create_outbound_call(
+        "+1", "+2", "agent_1", dynamic_variables={"company_name": "Acme"}
+    )
+    assert bodies[-1]["retell_llm_dynamic_variables"] == {"company_name": "Acme"}
+
+
 def _patch_transport(monkeypatch, handler) -> None:
     """Route the adapter's httpx.AsyncClient through a MockTransport.
 

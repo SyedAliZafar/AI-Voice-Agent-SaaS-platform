@@ -241,10 +241,12 @@ async def call_prospect(
     Retell provisioning path as a plain test call.
 
     With an `external_agent_id` (ADR-012): dials a platform-native agent, which holds its
-    own script in the platform's dashboard. **No personalization happens** — none of the
-    research on this page reaches the call, because there is no channel to hand a
-    dashboard-configured agent a call-scoped prompt. The outreach counter still advances,
-    since the prospect was still called.
+    own script in the platform's dashboard. The researched brief does **not** reach it —
+    there is no channel to hand a dashboard-configured agent a whole call-scoped prompt.
+    What does reach it is `dynamic_variables`, filling the `{{placeholders}}` that script
+    already declares (`{{company_name}}` and friends), so the call is personalized to the
+    extent the prompt's author made room for. The outreach counter advances either way,
+    since the prospect was called.
 
     The research-ready gate applies only to the personalized path: it exists because the
     prompt needs the [COMPANY BRIEF], so with nothing to inject there is nothing to wait
@@ -262,7 +264,11 @@ async def call_prospect(
     if payload.external_agent_id:
         try:
             result = await test_call_service.place_platform_agent_call(
-                db, tenant_id, payload.external_agent_id, to_number
+                db,
+                tenant_id,
+                payload.external_agent_id,
+                to_number,
+                dynamic_variables=payload.dynamic_variables,
             )
         except test_call_service.TestCallError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

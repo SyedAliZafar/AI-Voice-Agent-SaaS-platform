@@ -59,10 +59,30 @@ class VoicePlatformAdapter(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support import_twilio_number")
 
     async def create_outbound_call(
-        self, from_number: str, to_number: str, agent_external_id: str
+        self,
+        from_number: str,
+        to_number: str,
+        agent_external_id: str,
+        dynamic_variables: dict[str, str] | None = None,
     ) -> str:
-        """Place an outbound call. Returns the platform's call ID."""
+        """Place an outbound call. Returns the platform's call ID.
+
+        `dynamic_variables` fills placeholders in the agent's own prompt for this call
+        only — the personalization channel for an agent whose prompt we don't own
+        (ADR-012). Ignored by platforms without the concept.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not support create_outbound_call")
+
+    async def get_agent_dynamic_variables(self, agent_external_id: str) -> list[str]:
+        """Placeholder names a platform agent's prompt declares, sorted.
+
+        Best-effort by nature — it reads a template we don't own. Return [] when the
+        prompt can't be inspected rather than raising: not knowing must not block a dial
+        that may need no variables at all.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support get_agent_dynamic_variables"
+        )
 
     async def get_call(self, call_external_id: str) -> dict[str, Any]:
         """Fetch authoritative state for one call from the platform.

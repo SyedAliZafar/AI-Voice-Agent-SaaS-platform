@@ -20,6 +20,7 @@ from backend.schemas.agent import (
     PlatformAgentCallResponse,
     PlatformAgentInfo,
     PlatformAgentsResponse,
+    PlatformAgentVariablesResponse,
     SandboxChatRequest,
     SandboxChatResponse,
     TestCallRequest,
@@ -103,6 +104,30 @@ async def list_platform_agents(
     )
 
 
+@router.get(
+    "/platform/{external_agent_id}/variables",
+    response_model=PlatformAgentVariablesResponse,
+)
+async def get_platform_agent_variables(
+    external_agent_id: str,
+    platform: str = "retell",
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """Which `{{placeholders}}` this platform agent's prompt declares (ADR-012).
+
+    Lets the dial form ask for exactly what the agent needs, the same way Retell's own
+    dashboard does — and it derives the list the same way, by scanning the prompt, since
+    no endpoint reports it.
+    """
+    try:
+        variables = await test_call_service.get_platform_agent_variables(
+            external_agent_id, platform
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return PlatformAgentVariablesResponse(external_agent_id=external_agent_id, variables=variables)
+
+
 @router.post("/platform/call", response_model=PlatformAgentCallResponse)
 async def call_platform_agent(
     payload: PlatformAgentCallRequest,
@@ -123,6 +148,7 @@ async def call_platform_agent(
             payload.external_agent_id,
             payload.to_number,
             platform=payload.platform,
+            dynamic_variables=payload.dynamic_variables,
         )
     except test_call_service.TestCallError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

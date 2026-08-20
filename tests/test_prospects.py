@@ -846,8 +846,14 @@ def placed_platform_calls(monkeypatch) -> list[dict]:
 
     calls: list[dict] = []
 
-    async def fake_place(db, tenant_id, external_agent_id, to_number):
-        calls.append({"external_agent_id": external_agent_id, "to_number": to_number})
+    async def fake_place(db, tenant_id, external_agent_id, to_number, dynamic_variables=None):
+        calls.append(
+            {
+                "external_agent_id": external_agent_id,
+                "to_number": to_number,
+                "dynamic_variables": dynamic_variables,
+            }
+        )
         return {
             "call_id": f"mock_ext_call_{len(calls)}",
             "from_number": "+10000000000",
@@ -877,7 +883,11 @@ async def test_call_with_a_platform_agent_sends_no_personalized_prompt(
     assert resp.status_code == 200
     assert placed_calls == []  # the personalized path was not used
     assert placed_platform_calls == [
-        {"external_agent_id": "agent_ext_9", "to_number": prospect.phone}
+        {
+            "external_agent_id": "agent_ext_9",
+            "to_number": prospect.phone,
+            "dynamic_variables": {},
+        }
     ]
 
 
@@ -956,6 +966,30 @@ async def test_call_with_a_platform_agent_is_tenant_scoped(
 
     assert resp.status_code == 404
     assert placed_platform_calls == []
+
+
+@pytest.mark.asyncio
+async def test_call_forwards_dynamic_variables_to_the_platform_agent(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    """The only personalization channel a dashboard agent has: its prompt's own
+    {{placeholders}}, filled per call. Without this the agent greets every prospect
+    identically."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={
+            "external_agent_id": "agent_ext_9",
+            "dynamic_variables": {"company_name": "Acme HVAC", "contact_name": "Maria"},
+        },
+        headers=auth_headers,
+    )
+
+    assert placed_platform_calls[0]["dynamic_variables"] == {
+        "company_name": "Acme HVAC",
+        "contact_name": "Maria",
+    }
 
 
 # --- prospect sandbox chat ---------------------------------------------------------

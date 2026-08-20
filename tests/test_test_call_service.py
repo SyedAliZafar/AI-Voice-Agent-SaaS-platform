@@ -1031,6 +1031,7 @@ async def test_place_platform_agent_call_provisions_nothing(db_session, tenant_i
     mock_adapter.list_platform_agents.return_value = [
         {"external_id": "agent_ext_9", "name": "Roofing Agent Test Case #1"}
     ]
+    mock_adapter.get_agent_dynamic_variables.return_value = []
     mock_adapter.create_outbound_call.return_value = "call_ext_9"
 
     with (
@@ -1049,7 +1050,10 @@ async def test_place_platform_agent_call_provisions_nothing(db_session, tenant_i
         "agent_name": "Roofing Agent Test Case #1",
     }
     mock_adapter.create_outbound_call.assert_awaited_once_with(
-        from_number="+15551234567", to_number="+491701234567", agent_external_id="agent_ext_9"
+        from_number="+15551234567",
+        to_number="+491701234567",
+        agent_external_id="agent_ext_9",
+        dynamic_variables={},
     )
     # The whole point of this path: we do not touch the agent's configuration.
     mock_adapter.create_llm.assert_not_awaited()
@@ -1066,6 +1070,7 @@ async def test_place_platform_agent_call_records_call_without_local_agent(db_ses
     mock_adapter.list_platform_agents.return_value = [
         {"external_id": "agent_ext_9", "name": "Roofing"}
     ]
+    mock_adapter.get_agent_dynamic_variables.return_value = []
     mock_adapter.create_outbound_call.return_value = "call_ext_9"
 
     with (
@@ -1141,3 +1146,109 @@ async def test_create_outbound_call_record_rejects_ambiguous_agent(db_session, t
             "+491701234567",
             external_agent_id="agent_ext_9",
         )
+
+
+# --- dynamic variables: personalizing an agent whose prompt we don't own -------
+
+
+def _platform_adapter(declared: list[str]) -> AsyncMock:
+    adapter = AsyncMock()
+    adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext_9", "name": "Roofing Agent Test Case #1"}
+    ]
+    adapter.get_agent_dynamic_variables.return_value = declared
+    adapter.create_outbound_call.return_value = "call_ext_9"
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_platform_call_sends_declared_variables(db_session, tenant_id):
+    adapter = _platform_adapter(["company_name", "contact_name"])
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        await test_call_service.place_platform_agent_call(
+            db_session,
+            tenant_id,
+            "agent_ext_9",
+            "+491701234567",
+            dynamic_variables={"company_name": "Bristol Dental", "contact_name": "Maria"},
+        )
+
+    assert adapter.create_outbound_call.await_args.kwargs["dynamic_variables"] == {
+        "company_name": "Bristol Dental",
+        "contact_name": "Maria",
+    }
+
+
+@pytest.mark.asyncio
+async def test_platform_call_refuses_to_dial_with_an_unfilled_placeholder(db_session, tenant_id):
+    """Retell leaves an unsupplied {{placeholder}} literal in the prompt and the agent
+    reads it aloud. Blocking beats spending a real call on that."""
+    adapter = _platform_adapter(["company_name", "contact_name"])
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        with pytest.raises(test_call_service.TestCallError, match="contact_name"):
+            await test_call_service.place_platform_agent_call(
+                db_session,
+                tenant_id,
+                "agent_ext_9",
+                "+491701234567",
+                dynamic_variables={"company_name": "Bristol Dental"},
+            )
+
+    adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_call_treats_a_blank_value_as_missing(db_session, tenant_id):
+    """A whitespace-only box is exactly as bad as an empty one — the placeholder still
+    goes unfilled — so it must not sneak past the guard as "present"."""
+    adapter = _platform_adapter(["company_name"])
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        with pytest.raises(test_call_service.TestCallError, match="company_name"):
+            await test_call_service.place_platform_agent_call(
+                db_session,
+                tenant_id,
+                "agent_ext_9",
+                "+491701234567",
+                dynamic_variables={"company_name": "   "},
+            )
+
+    adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_call_drops_variables_the_prompt_never_asked_for(db_session, tenant_id):
+    """Harmless to Retell, but it would make the audit trail read as though the agent
+    used data it never saw."""
+    adapter = _platform_adapter(["company_name"])
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        await test_call_service.place_platform_agent_call(
+            db_session,
+            tenant_id,
+            "agent_ext_9",
+            "+491701234567",
+            dynamic_variables={"company_name": "Bristol Dental", "secret_note": "ignore me"},
+        )
+
+    assert adapter.create_outbound_call.await_args.kwargs["dynamic_variables"] == {
+        "company_name": "Bristol Dental"
+    }

@@ -167,10 +167,24 @@ class PlatformAgentsResponse(BaseModel):
     agents: list[PlatformAgentInfo]
 
 
+class PlatformAgentVariablesResponse(BaseModel):
+    """The `{{placeholder}}` names a platform agent's prompt declares (ADR-012) — what
+    must be filled in before it can be dialed. Empty for an agent whose prompt uses none,
+    and also for one whose prompt we can't read (custom-llm / conversation-flow), which
+    are deliberately indistinguishable here: both mean "nothing for you to fill in"."""
+
+    external_agent_id: str
+    variables: list[str]
+
+
 class PlatformAgentCallRequest(BaseModel):
     external_agent_id: str
     to_number: str
     platform: str = "retell"
+    # Fills the agent prompt's {{placeholders}} for this call only. Every name the prompt
+    # declares must be present and non-blank — test_call_service refuses the dial
+    # otherwise, since Retell speaks an unfilled placeholder verbatim.
+    dynamic_variables: dict[str, str] = Field(default_factory=dict)
 
     _validate_to_number = field_validator("to_number")(_validate_e164)
 

@@ -6,6 +6,7 @@ replace with real HTTP calls to Retell's API.
 """
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -21,6 +22,12 @@ BASE_URL = "https://api.retellai.com"
 # invalid value names every accepted one) rather than guessed from docs or dashboard
 # screenshots — the exact mistake that produced two prior sessions' worth of dashboard
 # settings that were never real. Labels are ours; ids must match Retell's strings exactly.
+# Retell's dynamic-variable placeholder syntax, as it appears in an agent's prompt:
+# {{company_name}}, optionally spaced. Retell's dashboard builds its "Dynamic Variables"
+# fill-in list the same way — by scanning the prompt — so this regex IS the contract;
+# there is no endpoint that reports the names.
+_DYNAMIC_VARIABLE_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+
 AMBIENT_SOUND_CATALOG: list[dict[str, str]] = [
     {"id": "coffee-shop", "label": "Coffee shop"},
     {"id": "convention-hall", "label": "Convention hall"},
@@ -322,18 +329,75 @@ class RetellAdapter(VoicePlatformAdapter):
             for item in latest.values()
         ]
 
+    async def get_agent_dynamic_variables(self, agent_external_id: str) -> list[str]:
+        """The `{{placeholder}}` names this agent's prompt declares, sorted.
+
+        These are the personalization slots for a platform-native agent (ADR-012): the
+        prompt lives in Retell's dashboard and we can't rewrite it, but we CAN fill its
+        placeholders per call via create_outbound_call(dynamic_variables=...).
+
+        There is no API that reports them — Retell's own dashboard derives the list by
+        scanning the prompt for `{{...}}`, and so do we (verified by probing a real agent:
+        the four names the dashboard offered are exactly the four this regex finds). That
+        makes this a best-effort read of someone else's template, which is why a missing
+        or unreadable prompt returns [] rather than raising: not knowing the placeholders
+        must not block a dial that may not need any.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{BASE_URL}/get-agent/{agent_external_id}", headers=self.headers
+            )
+            resp.raise_for_status()
+            agent = resp.json()
+
+            engine = agent.get("response_engine") or {}
+            llm_id = engine.get("llm_id")
+            if not llm_id:
+                # custom-llm agents keep their prompt on whatever server answers the
+                # websocket, and conversation-flow agents spread it across nodes — in
+                # neither case is there a single prompt string here to scan.
+                logger.info(
+                    "get_agent_dynamic_variables: no retell-llm prompt to scan",
+                    extra={"agent_external_id": agent_external_id, "engine": engine.get("type")},
+                )
+                return []
+
+            llm_resp = await client.get(f"{BASE_URL}/get-retell-llm/{llm_id}", headers=self.headers)
+            llm_resp.raise_for_status()
+            llm = llm_resp.json()
+
+        # begin_message is scanned too — an opener saying "Hi {{contact_name}}" is
+        # precisely where an unfilled placeholder gets read aloud first.
+        text = " ".join(
+            part for part in (llm.get("general_prompt"), llm.get("begin_message")) if part
+        )
+        return sorted(set(_DYNAMIC_VARIABLE_RE.findall(text)))
+
     async def create_outbound_call(
-        self, from_number: str, to_number: str, agent_external_id: str
+        self,
+        from_number: str,
+        to_number: str,
+        agent_external_id: str,
+        dynamic_variables: dict[str, str] | None = None,
     ) -> str:
+        """Place the call. `dynamic_variables` fills the agent prompt's `{{placeholders}}`
+        for this call only (see get_agent_dynamic_variables) — Retell's per-call
+        personalization channel for agents whose prompt we don't own.
+
+        Omitted entirely when empty rather than sent as `{}`: the local-agent paths never
+        use this, and an empty object is a needless difference in their request bodies.
+        """
+        body: dict[str, Any] = {
+            "from_number": from_number,
+            "to_number": to_number,
+            "override_agent_id": agent_external_id,
+        }
+        if dynamic_variables:
+            body["retell_llm_dynamic_variables"] = dynamic_variables
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{BASE_URL}/v2/create-phone-call",
-                headers=self.headers,
-                json={
-                    "from_number": from_number,
-                    "to_number": to_number,
-                    "override_agent_id": agent_external_id,
-                },
+                f"{BASE_URL}/v2/create-phone-call", headers=self.headers, json=body
             )
             resp.raise_for_status()
             return resp.json()["call_id"]

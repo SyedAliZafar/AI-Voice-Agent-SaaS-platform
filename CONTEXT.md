@@ -184,7 +184,8 @@ voiceagent/
 │   │   │   ├── layout/            # App chrome: AppShell, Sidebar, Topbar
 │   │   │   ├── features/
 │   │   │   │   ├── agents/       # AgentCard, AgentBuilder, Stepper, PromptEditor,
-│   │   │   │   │                 #   PlatformAgentList (Retell-dashboard agents + inline dial, ADR-012)
+│   │   │   │   │                 #   PlatformAgentList (Retell-dashboard agents + inline dial, ADR-012),
+│   │   │   │                 #   DynamicVariableFields ({{placeholder}} inputs, ADR-012a)
 │   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
 │   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
 │   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
@@ -198,7 +199,7 @@ voiceagent/
 │   │   │   ├── useCallMetrics.ts
 │   │   │   ├── useAgents.ts
 │   │   │   ├── useLlmModels.ts
-│   │   │   ├── usePlatformAgents.ts  # live Retell roster + callPlatformAgent (ADR-012)
+│   │   │   ├── usePlatformAgents.ts  # live Retell roster + per-agent {{variables}} + callPlatformAgent (ADR-012)
 │   │   │   ├── useProspects.ts    # list + stats + research-status polling
 │   │   │   ├── useCityAutocomplete.ts
 │   │   │   ├── useProspectSandbox.ts
@@ -210,6 +211,7 @@ voiceagent/
 │   │       ├── builder.ts
 │   │       ├── constants.ts
 │   │       ├── cx.ts             # className joiner, exported (was trapped, unexported, in the old ui.tsx)
+│   │       ├── dynamicVariables.ts  # prospect -> {{placeholder}} suggestion map (ADR-012a)
 │   │       └── prospectGrouping.ts  # pure country -> category -> city -> companies grouping
 │   └── tailwind.config.ts
 │
@@ -938,6 +940,7 @@ operator had to leave and dial from Retell's UI.
 | Agent record | our `Agent` row | none — only the platform's id |
 | Provisioning | we create/update it every call | none at all |
 | Prompt | ours (`Agent.system_prompt`, personalizable per call) | theirs, fixed in the dashboard |
+| Personalization | whole prompt rewritten per call (brief + notes) | values for the `{{placeholders}}` their script declares (ADR-012a) |
 | Brain | Retell's hosted LLM, or ours via `retell_ws.py` | whatever the dashboard says |
 | Tools | server-side (ADR-003) on the custom-LLM path | not ours |
 | We contribute | everything | the from-number and the dial |
@@ -968,10 +971,11 @@ prospects page.** `POST /api/prospects/{id}/call` takes exactly one of `agent_id
 `external_agent_id` (a `model_validator` on `ProspectCallRequest` — neither leaves nobody
 to dial with, both makes it ambiguous which script runs). The difference is the whole
 point of that page: a local agent gets this prospect's `[COMPANY BRIEF]` +
-`[OPERATOR NOTES]` injected for the call, and a platform-native one receives **none of
-it**. The picker groups the two under labelled `<optgroup>`s and the panel shows an
-explicit warning when a platform agent is selected, because an operator staring at a
-knowledge base will otherwise assume it was sent.
+`[OPERATOR NOTES]` injected for the call, and a platform-native one receives none of that
+— only values for the `{{placeholders}}` its own script declares (ADR-012a), prefilled
+from the prospect and editable before dialing. The picker groups the two under labelled
+`<optgroup>`s and the panel warns explicitly when a platform agent is selected, because
+an operator staring at a knowledge base will otherwise assume it was sent.
 
 The research-ready gate therefore applies only to the personalized path. It exists
 because the prompt needs the brief; with nothing to inject there is nothing to wait for.
@@ -986,8 +990,45 @@ Two consequences follow from not owning the agent, and both are real:
   the way ADR-005 describes, because we don't provision. Without it the row sits
   `in_progress` until `POST /api/calls/sync` reconciles it from the platform — that path
   needs only `external_id`, so ADR-007's self-healing covers this for free.
-- **No per-call personalization.** `system_prompt_override` has nowhere to go: the
+- **No whole-prompt personalization.** `system_prompt_override` has nowhere to go: the
   platform's agent holds the script, and neither delivery route from ADR-006 exists here.
+  Dynamic variables (below) are the narrower channel that does work.
+
+**ADR-012a, 2026-08-20 — dynamic variables are the personalization channel, and the
+paragraph above used to say there wasn't one.** That was wrong. Retell substitutes
+`{{placeholder}}` tokens in an agent's prompt from a `retell_llm_dynamic_variables` map
+passed on `create-phone-call`, so a dashboard-built agent *can* be told who it is calling
+— it just receives values for slots its author left, rather than a rewritten script.
+
+**There is no endpoint that reports an agent's placeholders.** Retell's dashboard derives
+its "Dynamic Variables" fill-in list by scanning the prompt, and
+`RetellAdapter.get_agent_dynamic_variables` does the same (`_DYNAMIC_VARIABLE_RE` over
+`general_prompt` + `begin_message`, after resolving the agent's `llm_id`). Verified by
+probing the real account: the four names the dashboard offered for "Roofing Agent Test
+Case #1" — `company_name`, `contact_name`, `current_time`, `user_number` — are exactly
+what the regex finds. `begin_message` is scanned too, since an opener is where an
+unfilled placeholder gets spoken first. An agent whose prompt we can't read (`custom-llm`,
+`conversation-flow`) returns `[]` rather than raising: not knowing must not block a dial
+that may need nothing.
+
+**An unfilled placeholder is not a no-op — Retell leaves the literal `{{company_name}}`
+in the prompt and the agent reads it aloud to a real prospect.** So
+`place_platform_agent_call` refuses to dial when any declared name is missing or blank,
+and both UIs disable the call button with the specific names listed. Blocking beats
+spending a real call on that. Values not declared by the prompt are dropped rather than
+forwarded — harmless to Retell, but they would make the audit trail read as though the
+agent used data it never saw.
+
+Suggested values on the prospects page come from `lib/dynamicVariables.ts` — a
+convention map (`company_name`/`companyName`/`business_name` → the prospect's name, and
+so on, matched case- and separator-insensitively). Since the names are whatever the
+prompt's author typed, nothing can be guaranteed: every suggestion lands in an **editable
+field the operator can read before dialing**, never straight into the request. A wrong
+guess spoken to a real prospect is worse than a blank box.
+
+This narrows but does not close the gap with a local agent. A local agent gets the whole
+researched brief; a platform agent gets values for the slots its script already has. If
+the dashboard prompt has no `{{company_name}}`, no amount of data on our side reaches it.
 
 `retell_ws.py` refuses a connection for a call with no `agent_id` explicitly. That's
 reachable — an operator can point a dashboard-built agent's custom-LLM websocket at our
@@ -1069,7 +1110,7 @@ files, stop.
 | **Add an outbound industry vertical** | one entry in `scripts/agent_templates/industries.py` (`qualifying_flow` / `vocabulary` / `extra_objection_rows` / `validated: False`) → add it to the `INDUSTRIES` dict → `uv run python scripts/build_agent_matrix.py --industry <key>`. Nothing else changes: `compose.py` picks it up for every existing style and service automatically. Keep `validated: False` until it has real-call data behind it — `compose.py` renders the unvalidated banner off that flag |
 | **Add a one-off diagnostic agent** (not a sales leaf) | its own `scripts/seed_<name>_agent.py` with the prompt inline, mirroring `seed_email_transcription_test_agent.py` — deliberately *outside* the `agent_templates` matrix, since an agent with no hook/qualifying/close would otherwise bend every style and service module around it. `use_custom_llm=True` so it runs the same `retell_ws.py` path as real agents |
 | **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
-| **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
+| **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. If the change touches `{{placeholders}}`, `_DYNAMIC_VARIABLE_RE` and the missing-value guard in `place_platform_agent_call` move together — a name the UI can't see is a name that gets spoken aloud. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
 | **Offer the platform-agent source on another dial surface** | the surface's request schema (exactly-one-of validator, mirroring `ProspectCallRequest`) → its router, branching to `place_platform_agent_call` *before* any personalization work → the UI picker, and **say in the UI what the platform agent won't receive** — silently dropping a personalized prompt is the failure mode this pattern exists to prevent → its router test, asserting the personalized path was NOT taken |
 | **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
 

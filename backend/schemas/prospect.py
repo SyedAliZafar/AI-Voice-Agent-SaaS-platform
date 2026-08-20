@@ -134,6 +134,11 @@ class ProspectCallRequest(BaseModel):
     agent_id: uuid.UUID | None = None
     external_agent_id: str | None = None
     to_number: str | None = None  # defaults to the prospect's stored phone if omitted
+    # Platform-agent path only: fills the dashboard prompt's {{placeholders}} for this
+    # call (ADR-012). This is how a platform agent gets personalized at all — it can't
+    # receive a rewritten prompt, but it can be told who it's calling. Ignored on the
+    # local-agent path, which injects the full brief instead.
+    dynamic_variables: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _exactly_one_agent(self) -> "ProspectCallRequest":

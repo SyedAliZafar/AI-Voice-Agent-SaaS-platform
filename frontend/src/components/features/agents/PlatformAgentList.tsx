@@ -2,9 +2,14 @@
 
 import { useState } from "react";
 
+import { DynamicVariableFields } from "@/components/features/agents/DynamicVariableFields";
 import { AgentsIcon, PhoneIcon, RefreshIcon } from "@/components/icons";
 import { Badge, Button, EmptyState, Field, Skeleton, TextInput } from "@/components/ui";
-import { callPlatformAgent, usePlatformAgents } from "@/hooks/usePlatformAgents";
+import {
+  callPlatformAgent,
+  usePlatformAgents,
+  usePlatformAgentVariables,
+} from "@/hooks/usePlatformAgents";
 import { PlatformAgent } from "@/lib/types";
 
 /** What each response-engine kind means for a dial from here. "custom-llm" is called out
@@ -106,6 +111,12 @@ function PlatformAgentRow({
   const [dialing, setDialing] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [varValues, setVarValues] = useState<Record<string, string>>({});
+
+  // Only fetched once the row is expanded — reading an agent's placeholders costs two
+  // Retell calls, and a collapsed row has nothing to show.
+  const { variables } = usePlatformAgentVariables(open ? agent.external_id : null);
+  const missingVars = variables.filter((v) => !varValues[v]?.trim());
 
   const engine = agent.engine ? ENGINE_META[agent.engine] : undefined;
 
@@ -114,7 +125,7 @@ function PlatformAgentRow({
     setError(null);
     setResult(null);
     try {
-      const call = await callPlatformAgent(agent.external_id, toNumber);
+      const call = await callPlatformAgent(agent.external_id, toNumber, varValues);
       setResult(`Dialing ${toNumber} as “${call.agent_name}” from ${call.from_number}.`);
       setToNumber("");
     } catch (err) {
@@ -159,9 +170,25 @@ function PlatformAgentRow({
               placeholder="+491701234567"
             />
           </Field>
-          <Button onClick={dial} disabled={dialing || !toNumber.trim()}>
+          <DynamicVariableFields
+            variables={variables}
+            values={varValues}
+            onChange={(name, value) => setVarValues((v) => ({ ...v, [name]: value }))}
+          />
+
+          <Button
+            className="mt-4"
+            onClick={dial}
+            disabled={dialing || !toNumber.trim() || missingVars.length > 0}
+          >
             {dialing ? "Dialing…" : "Place call"}
           </Button>
+          {missingVars.length > 0 && (
+            <p className="mt-2 text-xs text-amber-700">
+              Fill {missingVars.map((v) => `{{${v}}}`).join(", ")} first — Retell speaks an
+              empty placeholder out loud.
+            </p>
+          )}
           {result && <p className="mt-3 text-sm text-emerald-600">{result}</p>}
           {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
         </div>

@@ -1,10 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
+import { DynamicVariableFields } from "@/components/features/agents/DynamicVariableFields";
 import { Button, TextInput } from "@/components/ui";
-import { usePlatformAgents } from "@/hooks/usePlatformAgents";
+import { usePlatformAgents, usePlatformAgentVariables } from "@/hooks/usePlatformAgents";
 import { api, getApiErrorMessage } from "@/lib/api";
+import { suggestProspectVariables } from "@/lib/dynamicVariables";
 import { Agent, Prospect } from "@/lib/types";
 
 /** The picker holds two kinds of agent that are NOT interchangeable, so the value
@@ -53,6 +55,21 @@ export function ProspectDetailPanel({
   // including a CSV import, which never reaches "ready" at all (ADR-006).
   const researchReady = prospect.research_status === "ready";
 
+  // The platform agent's prompt placeholders, prefilled from this prospect. Suggestions
+  // are seeded into editable state (not merged at submit) so what the operator reads is
+  // exactly what gets sent — and so their edits survive a re-render.
+  const selectedExternalId = usingPlatformAgent
+    ? callAgentId.slice(PLATFORM_PREFIX.length)
+    : null;
+  const { variables } = usePlatformAgentVariables(selectedExternalId);
+  const [varValues, setVarValues] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setVarValues(variables.length ? suggestProspectVariables(variables, prospect) : {});
+  }, [variables, prospect]);
+
+  const missingVars = variables.filter((v) => !varValues[v]?.trim());
+
   async function saveNotes() {
     setSavingNotes(true);
     try {
@@ -72,7 +89,7 @@ export function ProspectDetailPanel({
     try {
       const res = await api.post(`/prospects/${prospect.id}/call`, {
         ...(usingPlatformAgent
-          ? { external_agent_id: callAgentId.slice(PLATFORM_PREFIX.length) }
+          ? { external_agent_id: selectedExternalId, dynamic_variables: varValues }
           : { agent_id: callAgentId }),
         to_number: callNumber,
       });
@@ -188,17 +205,32 @@ export function ProspectDetailPanel({
             placeholder="+491701234567"
           />
         </div>
-        <Button onClick={placeCall} disabled={calling || !callAgentId || !callNumber}>
+        <Button
+          onClick={placeCall}
+          disabled={calling || !callAgentId || !callNumber || missingVars.length > 0}
+        >
           {calling ? "Calling…" : "Place call"}
         </Button>
       </div>
 
       {usingPlatformAgent && (
-        <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          This agent lives in your Retell dashboard and runs the script configured there.
-          The knowledge base and notes above will <strong>not</strong> be sent — pick one
-          of your own agents for a personalized call.
-        </p>
+        <>
+          <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            This agent runs the script in your Retell dashboard. The knowledge base and
+            notes above are <strong>not</strong> sent — only the variables below, which its
+            script has room for. Pick one of your own agents for a fully personalized call.
+          </p>
+          <DynamicVariableFields
+            variables={variables}
+            values={varValues}
+            onChange={(name, value) => setVarValues((v) => ({ ...v, [name]: value }))}
+          />
+          {missingVars.length > 0 && (
+            <p className="mt-2 text-xs text-amber-700">
+              Fill {missingVars.map((v) => `{{${v}}}`).join(", ")} before calling.
+            </p>
+          )}
+        </>
       )}
 
       {feedback && <p className="mt-2 text-xs text-slate-500">{feedback}</p>}
