@@ -38,7 +38,9 @@ function enrichCompany(target: CampaignIntake["target"]): {
     (target.hypothesizedPain
       ? `Likely feeling pressure around: ${target.hypothesizedPain}.`
       : "Add a suspected pain point to sharpen the pitch.") +
-    " (Placeholder enrichment — connect a data source in enrichCompany() for real research.)";
+    // Deliberately describes the limitation in the operator's terms rather than naming
+    // the function to go edit — this string is rendered in the builder UI, not a log.
+    " Based on what you've entered so far — the more detail you give, the sharper the script.";
 
   const suggestedPain = [
     target.hypothesizedPain,

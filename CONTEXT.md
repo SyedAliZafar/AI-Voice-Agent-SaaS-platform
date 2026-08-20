@@ -149,9 +149,13 @@ voiceagent/
 │   ├── package.json
 │   ├── src/
 │   │   ├── app/
-│   │   │   ├── layout.tsx
-│   │   │   ├── dashboard/
-│   │   │   │   └── page.tsx      # Main dashboard (metrics + recent calls)
+│   │   │   ├── layout.tsx        # Document + font only — no app chrome (see FRONTEND.md)
+│   │   │   ├── page.tsx          # Public landing page at / — no sidebar, static
+│   │   │   ├── (app)/            # Route group: everything behind the app chrome.
+│   │   │   │   │                 #   Parens don't change URLs — /dashboard is still /dashboard
+│   │   │   │   └── layout.tsx    #   Wraps children in AppShell
+│   │   │   ├── dashboard/        # (under (app)/ — as are agents, calls, prospects, leads, settings)
+│   │   │   │   └── page.tsx      # Main dashboard (setup checklist, Retell status, metrics, recent calls)
 │   │   │   ├── agents/
 │   │   │   │   ├── page.tsx      # Agent list — ?source=platform switches to the live Retell roster (ADR-012)
 │   │   │   │   ├── [id]/
@@ -191,8 +195,12 @@ voiceagent/
 │   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
 │   │   │   │                     #   ProspectDetailPanel, CsvImportButton, SandboxChat,
 │   │   │   │                     #   SandboxContextPanel, prospectStatus.ts (status meta/labels)
-│   │   │   │   └── leads/        # LeadCreateForm, LeadRow, LeadDetailPanel, LeadStatsStrip,
-│   │   │   │                     #   leadStatus.ts (retry_state/status meta, ADR-011)
+│   │   │   │   ├── leads/        # LeadCreateForm, LeadRow, LeadDetailPanel, LeadStatsStrip,
+│   │   │   │   │                 #   leadStatus.ts (retry_state/status meta, ADR-011)
+│   │   │   │   ├── dashboard/    # SetupChecklist (first-run steps, derived from live data),
+│   │   │   │   │                 #   RetellStatus, SyncNotice (the de-jargoned stuck-call row)
+│   │   │   │   └── marketing/    # Landing-page sections: MarketingNav, Hero, HowItWorks,
+│   │   │   │                     #   FeatureGrid, Pricing, MarketingFooter
 │   │   │   └── icons.tsx
 │   │   ├── hooks/                 # all data fetching lives here (FRONTEND.md)
 │   │   │   ├── useWebSocket.ts
@@ -211,6 +219,8 @@ voiceagent/
 │   │       ├── builder.ts
 │   │       ├── constants.ts
 │   │       ├── cx.ts             # className joiner, exported (was trapped, unexported, in the old ui.tsx)
+│   │       ├── workspace.ts      # The ONE place the signed-in workspace/user is mocked until
+│   │       │                     #   real auth lands — see FRONTEND.md
 │   │       ├── dynamicVariables.ts  # prospect -> {{placeholder}} suggestion map (ADR-012a)
 │   │       └── prospectGrouping.ts  # pure country -> category -> city -> companies grouping
 │   └── tailwind.config.ts

@@ -2,8 +2,12 @@
 
 import { useState } from "react";
 
-import { CreditCardIcon, HashIcon, PlugIcon, PlusIcon } from "@/components/icons";
-import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import Link from "next/link";
+
+import { CreditCardIcon, HashIcon, MicIcon, PlugIcon, PlusIcon } from "@/components/icons";
+import { Badge, Button, Card, PageHeader, Skeleton } from "@/components/ui";
+import { usePlatformAgents } from "@/hooks/usePlatformAgents";
+import { workspace } from "@/lib/workspace";
 
 type Integration = { key: string; name: string; desc: string; connected: boolean };
 
@@ -21,6 +25,16 @@ const PHONE_NUMBERS = [
 export default function SettingsPage() {
   const [integrations, setIntegrations] = useState(INITIAL_INTEGRATIONS);
 
+  // The same live probe the dashboard's RetellStatus uses. This card used to hardcode a
+  // green "Connected" badge, which meant a dead Retell account showed red on /dashboard
+  // and green here — and this page is where you'd come to check.
+  const {
+    agents: platformAgents,
+    loading: platformLoading,
+    error: platformError,
+  } = usePlatformAgents();
+  const retellOk = !platformError;
+
   const toggle = (key: string) =>
     setIntegrations((prev) =>
       prev.map((i) => (i.key === key ? { ...i, connected: !i.connected } : i)),
@@ -28,11 +42,55 @@ export default function SettingsPage() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Settings" subtitle="Manage integrations, phone numbers, and billing." />
+      <PageHeader
+        title="Settings"
+        subtitle="Manage your voice platform, integrations, phone numbers, and billing."
+      />
 
-      <p className="mb-6 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-        These sections are UI placeholders — wire them to the backend when the endpoints are ready.
-      </p>
+      {/* Voice platform — the connection everything else depends on, so it leads. */}
+      <section className="mb-8">
+        <div className="mb-3 flex items-center gap-2">
+          <MicIcon width={18} height={18} className="text-slate-400" />
+          <h2 className="text-sm font-semibold text-slate-900">Voice platform</h2>
+        </div>
+        <Card className="flex flex-col items-start justify-between gap-4 p-5 sm:flex-row sm:items-center">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="font-medium text-slate-900">Retell AI</p>
+              {platformLoading ? (
+                <Skeleton className="h-5 w-20 rounded-full" />
+              ) : (
+                <Badge tone={retellOk ? "success" : "danger"}>
+                  {retellOk ? "Connected" : "Unreachable"}
+                </Badge>
+              )}
+            </div>
+            <p className="mt-1 text-sm text-slate-500">
+              {platformLoading
+                ? "Checking the connection…"
+                : retellOk
+                  ? `Agents are provisioned and calls placed through this account. ${platformAgents.length} agent${platformAgents.length === 1 ? "" : "s"} on it right now.`
+                  : platformError}
+            </p>
+            <p className="mt-1 text-sm text-slate-500">
+              {/* Stated plainly because there is no "connect" flow to send anyone to:
+                  the key is one server-side env var, not a per-tenant credential yet
+                  (CONTEXT.md ADR-012's known gap). Saying where it lives is more useful
+                  than a button that can't do anything. */}
+              The API key is read from <code className="text-slate-600">RETELL_API_KEY</code>{" "}
+              on the server — it never reaches the browser. Changing it means editing{" "}
+              <code className="text-slate-600">.env</code> and restarting the API.
+            </p>
+          </div>
+          {retellOk && !platformLoading && (
+            <Link href="/agents?source=platform" className="shrink-0">
+              <Button variant="secondary" size="sm">
+                View agents
+              </Button>
+            </Link>
+          )}
+        </Card>
+      </section>
 
       {/* Integrations */}
       <section className="mb-8">
@@ -105,14 +163,15 @@ export default function SettingsPage() {
         <Card className="flex flex-col items-start justify-between gap-4 p-5 sm:flex-row sm:items-center">
           <div>
             <div className="flex items-center gap-2">
-              <p className="font-medium text-slate-900">Free plan</p>
+              <p className="font-medium text-slate-900">{workspace.plan}</p>
               <Badge tone="brand">Current</Badge>
             </div>
             <p className="mt-1 text-sm text-slate-500">
-              1 agent · 100 calls / month. Upgrade for more agents and concurrent calls.
+              10 agents · 2,500 calls / month. Telephony minutes are billed by Retell
+              directly.
             </p>
           </div>
-          <Button>Upgrade plan</Button>
+          <Button variant="secondary">Change plan</Button>
         </Card>
       </section>
     </div>
