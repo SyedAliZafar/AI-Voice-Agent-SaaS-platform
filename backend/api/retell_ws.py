@@ -831,6 +831,19 @@ async def llm_websocket(websocket: WebSocket, call_id: str) -> None:
             await websocket.close(code=1008)
             return
 
+        # A call placed through a platform-native agent (ADR-012) has no local Agent row
+        # — no prompt, no llm_model, no ToolConfigs — so there is nothing here to answer
+        # with. Reachable if an operator points a dashboard-built agent's custom-LLM
+        # websocket at us; refuse explicitly rather than let it fall through to the
+        # generic "no resolvable agent" close, which reads like data corruption.
+        if call.agent_id is None:
+            logger.warning(
+                "llm_websocket: call belongs to a platform-native agent, closing",
+                extra={"call_id": call_id, "external_agent_id": call.external_agent_id},
+            )
+            await websocket.close(code=1008)
+            return
+
         # call.agent_id/tenant_id are real uuid.UUID at runtime; the type: ignore is for
         # a pre-existing annotation gap (Mapped[UUID] instead of Mapped[uuid.UUID]) that
         # spans models/call.py and models/agent.py, not something specific to this line.

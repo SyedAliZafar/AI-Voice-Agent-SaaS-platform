@@ -13,6 +13,23 @@ export interface Agent {
   created_at: string;
 }
 
+/** An agent that lives on the voice platform itself — built in Retell's own dashboard,
+ * never provisioned by this backend. Read-only and fetched live from
+ * GET /agents/platform, so there's no local `id`: `external_id` is the platform's own
+ * id and the only handle a dial needs. Dialing one of these runs the platform's own
+ * LLM, prompt and voice — our conversation engine and server-side tools are not
+ * involved. */
+export interface PlatformAgent {
+  external_id: string;
+  name: string;
+  voice_id: string | null;
+  /** Platform response-engine kind — "retell-llm" means the platform's own brain
+   * answers; "custom-llm" means it calls out to a websocket (possibly not ours). */
+  engine: string | null;
+  version: number | null;
+  last_modified_ms: number | null;
+}
+
 export interface LlmModel {
   id: string;
   label: string;
@@ -69,7 +86,11 @@ export interface SandboxChatResponse {
 
 export interface Call {
   id: string;
-  agent_id: string;
+  // Null when the call was placed through a platform-native agent (see PlatformAgent) —
+  // those have no local Agent row and carry external_agent_id instead. Exactly one of
+  // the two is set on any given call.
+  agent_id: string | null;
+  external_agent_id: string | null;
   caller_number: string;
   status: "in_progress" | "resolved" | "escalated" | "failed";
   duration_sec: number;

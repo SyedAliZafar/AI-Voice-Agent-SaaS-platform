@@ -5,6 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { AgentCard } from "@/components/features/agents/AgentCard";
 import { AgentCategoryTiles } from "@/components/features/agents/AgentCategoryTiles";
+import { PlatformAgentList } from "@/components/features/agents/PlatformAgentList";
 import { ArrowLeftIcon, AgentsIcon, PlusIcon } from "@/components/icons";
 import { Button, EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { parseAgentName, sortLabels } from "@/lib/agentGrouping";
@@ -31,16 +32,22 @@ function AgentsPageInner() {
   const searchParams = useSearchParams();
 
   const industryFilter = searchParams.get("industry") || "";
+  // Which agents the page is showing: the ones this backend owns and configures, or the
+  // ones that exist on Retell itself. Lives in the URL like `industry` above, so the tab
+  // survives a refresh and can be linked to.
+  const source = searchParams.get("source") === "platform" ? "platform" : "internal";
 
   // Reflects the selected category into the URL (shareable, survives refresh) —
   // same pattern as ProspectsPage's setParam.
-  function selectIndustry(value: string) {
+  function setParam(key: string, value: string) {
     const params = new URLSearchParams(searchParams.toString());
-    if (value) params.set("industry", value);
-    else params.delete("industry");
+    if (value) params.set(key, value);
+    else params.delete(key);
     const query = params.toString();
     router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
   }
+
+  const selectIndustry = (value: string) => setParam("industry", value);
 
   useEffect(() => {
     api
@@ -78,7 +85,30 @@ function AgentsPageInner() {
         }
       />
 
-      {loading ? (
+      <div className="mb-5 inline-flex rounded-xl bg-slate-100 p-1">
+        {(
+          [
+            ["internal", "Your agents"],
+            ["platform", "Retell agents"],
+          ] as const
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            onClick={() => setParam("source", value === "internal" ? "" : value)}
+            className={
+              source === value
+                ? "rounded-lg bg-white px-4 py-1.5 text-sm font-medium text-slate-900 shadow-sm"
+                : "rounded-lg px-4 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-700"
+            }
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {source === "platform" ? (
+        <PlatformAgentList />
+      ) : loading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {Array.from({ length: 4 }).map((_, i) => (
             <div key={i} className="card p-5">

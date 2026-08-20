@@ -1018,3 +1018,126 @@ async def test_place_test_call_hosted_llm_ignores_tunnel_reachability(db_session
 
     assert result["status"] == "dialing"
     unreachable.assert_not_awaited()
+
+
+# --- Platform-native agents (ADR-012) -----------------------------------------
+# The path that dials an agent built in Retell's own dashboard: no provisioning, no
+# prompt push, no tunnel. What these assert is mostly what does NOT happen.
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_call_provisions_nothing(db_session, tenant_id):
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext_9", "name": "Roofing Agent Test Case #1"}
+    ]
+    mock_adapter.create_outbound_call.return_value = "call_ext_9"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        result = await test_call_service.place_platform_agent_call(
+            db_session, tenant_id, "agent_ext_9", "+491701234567"
+        )
+
+    assert result == {
+        "call_id": "call_ext_9",
+        "from_number": "+15551234567",
+        "status": "dialing",
+        "agent_name": "Roofing Agent Test Case #1",
+    }
+    mock_adapter.create_outbound_call.assert_awaited_once_with(
+        from_number="+15551234567", to_number="+491701234567", agent_external_id="agent_ext_9"
+    )
+    # The whole point of this path: we do not touch the agent's configuration.
+    mock_adapter.create_llm.assert_not_awaited()
+    mock_adapter.create_agent_with_llm.assert_not_awaited()
+    mock_adapter.create_agent_with_custom_llm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_call_records_call_without_local_agent(db_session, tenant_id):
+    """External calls must still land in call history — otherwise half the operator's
+    calls are invisible to their own dashboard.
+    """
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext_9", "name": "Roofing"}
+    ]
+    mock_adapter.create_outbound_call.return_value = "call_ext_9"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        await test_call_service.place_platform_agent_call(
+            db_session, tenant_id, "agent_ext_9", "+491701234567"
+        )
+
+    call = await call_service.get_call_by_external_id(db_session, "call_ext_9")
+    assert call is not None
+    assert call.tenant_id == tenant_id
+    assert call.agent_id is None
+    assert call.external_agent_id == "agent_ext_9"
+    assert call.status == "in_progress"
+    # Nothing here can personalize a single call — the platform's agent holds the script.
+    assert call.system_prompt_override is None
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_call_rejects_unknown_agent(db_session, tenant_id):
+    """A typo'd or deleted id must fail before spending a dial, not surface as an opaque
+    Retell 4xx — and it's the guard stopping a raw client-supplied id reaching the API.
+    """
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext_9", "name": "Roofing"}
+    ]
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        with pytest.raises(test_call_service.TestCallError, match="No agent 'agent_nope'"):
+            await test_call_service.place_platform_agent_call(
+                db_session, tenant_id, "agent_nope", "+491701234567"
+            )
+
+    mock_adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_call_requires_from_number(db_session, tenant_id):
+    with patch("backend.services.test_call_service.settings") as mock_settings:
+        mock_settings.retell_from_number = ""
+        with pytest.raises(test_call_service.TestCallError, match="RETELL_FROM_NUMBER"):
+            await test_call_service.place_platform_agent_call(
+                db_session, tenant_id, "agent_ext_9", "+491701234567"
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_outbound_call_record_rejects_ambiguous_agent(db_session, tenant_id):
+    """Neither agent id makes the row unattributable; both makes "which agent ran this"
+    ambiguous for every reader downstream. Both are programming errors, not user input.
+    """
+    with pytest.raises(ValueError, match="exactly one of"):
+        await call_service.create_outbound_call_record(
+            db_session, tenant_id, None, "call_x", "+491701234567"
+        )
+
+    import uuid as _uuid
+
+    with pytest.raises(ValueError, match="exactly one of"):
+        await call_service.create_outbound_call_record(
+            db_session,
+            tenant_id,
+            _uuid.uuid4(),
+            "call_y",
+            "+491701234567",
+            external_agent_id="agent_ext_9",
+        )

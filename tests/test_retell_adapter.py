@@ -86,6 +86,79 @@ async def test_list_live_calls_accepts_a_paginated_body(monkeypatch):
     assert [c["call_id"] for c in calls] == ["call_2"]
 
 
+# --- Platform agent roster (ADR-012) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_platform_agents_keeps_only_the_latest_version(monkeypatch):
+    """Retell's list-agents returns one entry per agent VERSION. Showing every one would
+    fill the dial picker with duplicates, and dialing a non-latest version isn't even
+    what override_agent_id does — it dials the latest."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "agent_id": "agent_1",
+                    "agent_name": "Roofing v1",
+                    "version": 1,
+                    "voice_id": "11labs-Marissa",
+                    "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
+                },
+                {
+                    "agent_id": "agent_1",
+                    "agent_name": "Roofing v3",
+                    "version": 3,
+                    "voice_id": "11labs-Marissa",
+                    "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
+                },
+                {
+                    "agent_id": "agent_2",
+                    "agent_name": "HVAC",
+                    "version": 0,
+                    "response_engine": {"type": "custom-llm"},
+                },
+            ],
+        )
+
+    _patch_transport(monkeypatch, handler)
+    agents = await RetellAdapter().list_platform_agents()
+
+    by_id = {a["external_id"]: a for a in agents}
+    assert set(by_id) == {"agent_1", "agent_2"}
+    assert by_id["agent_1"]["name"] == "Roofing v3"
+    assert by_id["agent_1"]["engine"] == "retell-llm"
+    # version 0 is a real version, not "unset" — it must not be dropped as falsy.
+    assert by_id["agent_2"]["engine"] == "custom-llm"
+    assert by_id["agent_2"]["voice_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_platform_agents_accepts_a_paginated_body(monkeypatch):
+    """Same defensive shape as list_live_calls: a Retell-side pagination rollout must not
+    silently empty the dial picker."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"agent_id": "agent_1"}], "has_more": False})
+
+    _patch_transport(monkeypatch, handler)
+    agents = await RetellAdapter().list_platform_agents()
+
+    # An unnamed agent falls back to its id — a blank row is indistinguishable from the
+    # next blank row in a picker.
+    assert agents == [
+        {
+            "external_id": "agent_1",
+            "name": "agent_1",
+            "voice_id": None,
+            "engine": None,
+            "version": None,
+            "last_modified_ms": None,
+        }
+    ]
+
+
 def _patch_transport(monkeypatch, handler) -> None:
     """Route the adapter's httpx.AsyncClient through a MockTransport.
 

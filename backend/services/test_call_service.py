@@ -15,6 +15,11 @@ Two provisioning paths, chosen by `agent.use_custom_llm`:
   called before dialing so a dead tunnel fails fast instead of spending a real call
   on dead air.
 
+A third path, `place_platform_agent_call`, sits alongside both: it dials an agent that
+already exists on the platform (built in Retell's own dashboard) and provisions nothing
+at all. See ADR-012 — the split is "do we own this agent's configuration", and the two
+functions above answer yes while that one answers no.
+
 ADR-002: all Retell HTTP stays behind the adapter; this service only orchestrates.
 """
 
@@ -26,6 +31,7 @@ from backend.config import get_settings
 from backend.models.agent import Agent
 from backend.services import agent_service, call_service, public_url, tunnel_check
 from backend.services.retell_adapter import RetellAdapter
+from backend.services.voice_platform import get_adapter
 
 settings = get_settings()
 
@@ -116,6 +122,89 @@ async def place_test_call(
         "call_id": call_id,
         "from_number": settings.retell_from_number,
         "status": "dialing",
+    }
+
+
+async def list_platform_agents(platform: str = "retell") -> list[dict]:
+    """The voice platform's own agent roster (ADR-012) — read-only, live, unprovisioned.
+
+    Deliberately takes no db/tenant: there is nothing tenant-scoped to read. The account
+    behind RETELL_API_KEY is currently shared by every tenant, so this returns the same
+    list to all of them — see ADR-012 for why that's a known gap rather than a design.
+    """
+    adapter = get_adapter(platform)
+    try:
+        return await adapter.list_platform_agents()
+    except NotImplementedError as exc:
+        raise TestCallError(f"'{platform}' does not expose an agent list") from exc
+
+
+async def place_platform_agent_call(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    external_agent_id: str,
+    to_number: str,
+    platform: str = "retell",
+) -> dict:
+    """Dial using an agent that already exists on the voice platform (ADR-012).
+
+    The whole point is what this function *doesn't* do: no provisioning, no prompt push,
+    no webhook_url stamping, no tunnel preflight, no Custom LLM websocket. The agent was
+    configured in the platform's dashboard and answers with whatever brain, voice and
+    prompt it was given there — we contribute the from-number and the dial, nothing else.
+    Contrast place_test_call above, which owns the agent it calls with.
+
+    A Call row is still written, so external calls appear in the same history, analytics
+    and reconcile paths as local ones. Two consequences follow from us not owning the
+    agent, and both are real:
+      - Lifecycle webhooks only arrive if the operator set our /webhooks/retell URL on
+        that agent in the dashboard. Without it the row sits in_progress until someone
+        runs POST /api/calls/sync, which reconciles it from the platform regardless
+        (ADR-007) — that path needs only external_id, not an agent.
+      - There is no system_prompt_override: the platform's agent holds the script, and
+        nothing here can personalize a single call.
+    """
+    if not settings.retell_from_number:
+        raise TestCallError(
+            "RETELL_FROM_NUMBER is not set. Buy a number in the Retell dashboard "
+            "(Phone Numbers -> Buy a number), then set RETELL_FROM_NUMBER in .env and "
+            "restart the API."
+        )
+
+    adapter = get_adapter(platform)
+
+    # Confirm the id is really on the account before spending a dial on it. A typo'd or
+    # deleted agent otherwise surfaces as an opaque Retell 4xx, and — worse — a raw id
+    # accepted unchecked from the client is the one place this endpoint could be pointed
+    # at an agent outside the operator's own account.
+    roster = await adapter.list_platform_agents()
+    match = next((a for a in roster if a["external_id"] == external_agent_id), None)
+    if not match:
+        raise TestCallError(
+            f"No agent '{external_agent_id}' on the connected {platform} account. "
+            "It may have been deleted, or belong to a different account."
+        )
+
+    call_id = await adapter.create_outbound_call(
+        from_number=settings.retell_from_number,
+        to_number=to_number,
+        agent_external_id=external_agent_id,
+    )
+
+    await call_service.create_outbound_call_record(
+        db,
+        tenant_id,
+        None,
+        call_id,
+        to_number,
+        external_agent_id=external_agent_id,
+    )
+
+    return {
+        "call_id": call_id,
+        "from_number": settings.retell_from_number,
+        "status": "dialing",
+        "agent_name": match["name"],
     }
 
 

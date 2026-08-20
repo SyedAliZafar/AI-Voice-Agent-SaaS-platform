@@ -265,6 +265,63 @@ class RetellAdapter(VoicePlatformAdapter):
             return list(body.get("items") or [])
         return list(body)
 
+    async def list_platform_agents(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Every agent on the Retell account, including ones created by hand in their
+        dashboard that this backend has never provisioned (ADR-012).
+
+        Fetched live on each request rather than mirrored into our database: an agent
+        renamed, re-voiced or deleted in Retell's dashboard must not still be offered by
+        our dial picker, and there is no webhook telling us when that happens.
+
+        Two normalizations worth knowing about:
+          - `list-agents` returns one entry *per agent version*, so an agent edited five
+            times appears five times. We keep the highest `version` per agent_id —
+            that's the one Retell dials when `override_agent_id` names it without a
+            version, so showing any other would misrepresent what the call will do.
+          - `response_engine` is flattened to a bare `engine` string ("retell-llm",
+            "custom-llm", "conversation-flow"). It's surfaced because it's the one field
+            that tells an operator whether the agent runs on Retell's own brain or points
+            back at a websocket — and an agent pointing at *someone else's* websocket is
+            the case where "just dial it" does something we can't explain.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{BASE_URL}/list-agents", headers=self.headers, params={"limit": limit}
+            )
+            resp.raise_for_status()
+            body = resp.json()
+
+        # Bare array today; accept a paginated {items: [...]} too, same defensive shape as
+        # list_live_calls — a Retell-side pagination rollout would otherwise silently
+        # empty the picker.
+        raw = list(body.get("items") or []) if isinstance(body, dict) else list(body)
+
+        latest: dict[str, dict[str, Any]] = {}
+        for item in raw:
+            external_id = item.get("agent_id")
+            if not external_id:
+                continue
+            previous = latest.get(external_id)
+            if previous is not None and (item.get("version") or 0) <= (
+                previous.get("version") or 0
+            ):
+                continue
+            latest[external_id] = item
+
+        return [
+            {
+                "external_id": item["agent_id"],
+                # Retell allows an unnamed agent; the id is a poor label but beats a blank
+                # row the operator can't tell apart from the next one.
+                "name": item.get("agent_name") or item["agent_id"],
+                "voice_id": item.get("voice_id"),
+                "engine": (item.get("response_engine") or {}).get("type"),
+                "version": item.get("version"),
+                "last_modified_ms": item.get("last_modification_timestamp"),
+            }
+            for item in latest.values()
+        ]
+
     async def create_outbound_call(
         self, from_number: str, to_number: str, agent_external_id: str
     ) -> str:

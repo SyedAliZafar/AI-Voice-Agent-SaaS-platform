@@ -28,6 +28,8 @@ PROTECTED_ROUTES = [
     ("delete", f"/api/agents/{uuid.uuid4()}"),
     ("post", f"/api/agents/{uuid.uuid4()}/test-call"),
     ("post", f"/api/agents/{uuid.uuid4()}/sandbox-chat"),
+    ("get", "/api/agents/platform"),
+    ("post", "/api/agents/platform/call"),
     ("get", "/api/calls"),
     ("get", f"/api/calls/{uuid.uuid4()}"),
     ("get", f"/api/calls/{uuid.uuid4()}/transcript"),

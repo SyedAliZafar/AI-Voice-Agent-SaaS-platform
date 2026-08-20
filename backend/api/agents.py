@@ -16,6 +16,10 @@ from backend.schemas.agent import (
     AmbientSoundsResponse,
     LlmModelInfo,
     LlmModelsResponse,
+    PlatformAgentCallRequest,
+    PlatformAgentCallResponse,
+    PlatformAgentInfo,
+    PlatformAgentsResponse,
     SandboxChatRequest,
     SandboxChatResponse,
     TestCallRequest,
@@ -69,6 +73,62 @@ async def list_ambient_sounds(
         options=[AmbientSoundInfo(**o) for o in AMBIENT_SOUND_CATALOG],
         default=settings.retell_ambient_sound,
     )
+
+
+@router.get("/platform", response_model=PlatformAgentsResponse)
+async def list_platform_agents(
+    platform: str = "retell",
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """Agents that live on the voice platform itself — including ones built by hand in
+    its dashboard that this backend never provisioned (ADR-012).
+
+    Fetched live on every request, not mirrored into our database, so the picker can
+    never offer an agent that was renamed or deleted upstream.
+
+    Declared BEFORE /{agent_id} for the same routing reason as /models above.
+
+    Tenant note: `tenant_id` is required for auth but doesn't scope the result — one
+    RETELL_API_KEY serves the whole deployment today, so every tenant sees the same
+    roster. See ADR-012.
+    """
+    try:
+        agents = await test_call_service.list_platform_agents(platform)
+    except test_call_service.TestCallError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:  # get_adapter on an unknown platform name
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return PlatformAgentsResponse(
+        platform=platform, agents=[PlatformAgentInfo(**a) for a in agents]
+    )
+
+
+@router.post("/platform/call", response_model=PlatformAgentCallResponse)
+async def call_platform_agent(
+    payload: PlatformAgentCallRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dial a number using a platform-native agent (ADR-012).
+
+    Not `/{agent_id}/test-call`: there is no local agent id to put in the path, and the
+    two paths differ in more than their argument — this one provisions nothing and our
+    conversation engine never runs. Same routing-order reason for living above
+    /{agent_id}.
+    """
+    try:
+        result = await test_call_service.place_platform_agent_call(
+            db,
+            tenant_id,
+            payload.external_agent_id,
+            payload.to_number,
+            platform=payload.platform,
+        )
+    except test_call_service.TestCallError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
 
 
 @router.get("", response_model=list[AgentResponse])

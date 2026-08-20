@@ -12,6 +12,14 @@ from backend.services import llm_service
 E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
+def _validate_e164(value: str) -> str:
+    """Shared by every schema that carries a number we will actually dial, so the two
+    dial paths (local agent, platform-native agent) can't drift on what they accept."""
+    if not E164_RE.match(value):
+        raise ValueError("to_number must be in E.164 format, e.g. +491701234567")
+    return value
+
+
 def _validate_llm_model(value: str) -> str:
     """ "" is valid (means "use settings.default_llm_model"). Otherwise the model's
     *provider* must be resolvable — deliberately not "must have a configured key",
@@ -126,15 +134,52 @@ class SandboxChatResponse(BaseModel):
 class TestCallRequest(BaseModel):
     to_number: str
 
-    @field_validator("to_number")
-    @classmethod
-    def validate_e164(cls, value: str) -> str:
-        if not E164_RE.match(value):
-            raise ValueError("to_number must be in E.164 format, e.g. +491701234567")
-        return value
+    _validate_to_number = field_validator("to_number")(_validate_e164)
 
 
 class TestCallResponse(BaseModel):
     call_id: str
     from_number: str
     status: str
+
+
+class PlatformAgentInfo(BaseModel):
+    """One agent as it exists on the voice platform itself (ADR-012).
+
+    Read-only and not persisted — this mirrors whatever the platform reports right now,
+    which is why there's no local `id` here. `external_id` is the platform's own id and
+    the only handle a dial request needs.
+    """
+
+    external_id: str
+    name: str
+    voice_id: str | None = None
+    # Platform response-engine kind ("retell-llm", "custom-llm", "conversation-flow").
+    # Surfaced so an operator can see whether an agent runs on the platform's own brain
+    # before dialing it.
+    engine: str | None = None
+    version: int | None = None
+    last_modified_ms: int | None = None
+
+
+class PlatformAgentsResponse(BaseModel):
+    platform: str
+    agents: list[PlatformAgentInfo]
+
+
+class PlatformAgentCallRequest(BaseModel):
+    external_agent_id: str
+    to_number: str
+    platform: str = "retell"
+
+    _validate_to_number = field_validator("to_number")(_validate_e164)
+
+
+class PlatformAgentCallResponse(BaseModel):
+    call_id: str
+    from_number: str
+    status: str
+    # Echoed back from the platform's roster so the UI can confirm *which* agent it
+    # actually reached — the request carries an opaque id, and confirming by name is how
+    # an operator catches having picked the wrong one.
+    agent_name: str

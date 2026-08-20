@@ -84,7 +84,7 @@ voiceagent/
 │   ├── api/                      # FastAPI routers
 │   │   ├── __init__.py
 │   │   ├── deps.py               # get_current_tenant — the tenant-scoping dependency (ADR-001)
-│   │   ├── agents.py             # CRUD for agents + prompt config
+│   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012)
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
 │   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete
@@ -98,7 +98,7 @@ voiceagent/
 │   │   ├── __init__.py
 │   │   ├── agent_service.py      # Agent CRUD, prompt management
 │   │   ├── call_service.py       # Call lifecycle, state machine
-│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phases/completed/phase0.md)
+│   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phases/completed/phase0.md); also place_platform_agent_call/list_platform_agents, the dial-a-dashboard-built-agent path (ADR-012)
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
 │   │   ├── retell_adapter.py     # Retell AI specific implementation
 │   │   ├── vapi_adapter.py       # Vapi AI specific implementation
@@ -153,7 +153,7 @@ voiceagent/
 │   │   │   ├── dashboard/
 │   │   │   │   └── page.tsx      # Main dashboard (metrics + recent calls)
 │   │   │   ├── agents/
-│   │   │   │   ├── page.tsx      # Agent list
+│   │   │   │   ├── page.tsx      # Agent list — ?source=platform switches to the live Retell roster (ADR-012)
 │   │   │   │   ├── [id]/
 │   │   │   │   │   ├── page.tsx  # Agent detail + prompt editor
 │   │   │   │   │   └── sandbox/
@@ -183,7 +183,8 @@ voiceagent/
 │   │   │   │   └── index.ts      # re-export barrel, so imports stay `@/components/ui`
 │   │   │   ├── layout/            # App chrome: AppShell, Sidebar, Topbar
 │   │   │   ├── features/
-│   │   │   │   ├── agents/       # AgentCard, AgentBuilder, Stepper, PromptEditor
+│   │   │   │   ├── agents/       # AgentCard, AgentBuilder, Stepper, PromptEditor,
+│   │   │   │   │                 #   PlatformAgentList (Retell-dashboard agents + inline dial, ADR-012)
 │   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
 │   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
 │   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
@@ -197,6 +198,7 @@ voiceagent/
 │   │   │   ├── useCallMetrics.ts
 │   │   │   ├── useAgents.ts
 │   │   │   ├── useLlmModels.ts
+│   │   │   ├── usePlatformAgents.ts  # live Retell roster + callPlatformAgent (ADR-012)
 │   │   │   ├── useProspects.ts    # list + stats + research-status polling
 │   │   │   ├── useCityAutocomplete.ts
 │   │   │   ├── useProspectSandbox.ts
@@ -920,6 +922,67 @@ it runs more than once per call* — `call_ended`, `call_analyzed` and a later r
 all reach a terminal status, so each consumer needs its own idempotency guard the way
 `evaluate_call_outcome` has its `in_flight` check.
 
+### ADR-012: Dialing a platform-native agent (one we didn't build)
+
+Every outbound path above shares an assumption: the agent being dialed is an `Agent` row
+*we* own and provision. `place_test_call` always creates or updates the Retell agent
+before dialing it, caching the platform ids on `Agent.voice_config`. An agent built by
+hand in Retell's own dashboard was therefore unreachable from this dashboard — the
+operator had to leave and dial from Retell's UI.
+
+`place_platform_agent_call` is the second source. The split is exactly one question:
+**do we own this agent's configuration?**
+
+| | Local agent (`place_test_call`) | Platform-native (`place_platform_agent_call`) |
+|---|---|---|
+| Agent record | our `Agent` row | none — only the platform's id |
+| Provisioning | we create/update it every call | none at all |
+| Prompt | ours (`Agent.system_prompt`, personalizable per call) | theirs, fixed in the dashboard |
+| Brain | Retell's hosted LLM, or ours via `retell_ws.py` | whatever the dashboard says |
+| Tools | server-side (ADR-003) on the custom-LLM path | not ours |
+| We contribute | everything | the from-number and the dial |
+
+**The roster is fetched live, never mirrored.** `GET /api/agents/platform` proxies
+`RetellAdapter.list_platform_agents` on every request. An import step would let the
+picker offer an agent that was since renamed, re-voiced or deleted upstream — and there
+is no webhook telling us when that happens, so a mirror could only ever be stale in a way
+that costs a wasted call. Two normalizations happen in the adapter, both from the real
+API's shape: `list-agents` returns one entry *per agent version* (we keep the highest per
+id, since that's what `override_agent_id` dials), and `response_engine` is flattened to a
+bare `engine` string so the UI can show whether an agent runs on Retell's own brain.
+
+**The id is validated against that roster before dialing.** A typo'd or deleted id would
+otherwise surface as an opaque Retell 4xx after the request was already spent — and it's
+the one guard stopping a raw client-supplied id from reaching the platform API unchecked.
+
+**`Call.agent_id` is now nullable, with `external_agent_id` alongside it.** The
+alternative — not recording these calls at all — would make half an operator's calls
+invisible to their own dashboard, which defeats the point of dialing from it.
+`create_outbound_call_record` enforces that exactly one of the two is set: neither makes
+the row unattributable, both makes "which agent ran this call" ambiguous for every reader
+downstream. Enforced in the service rather than the database because it's a programming
+error, not user input, and should fail at the call site.
+
+Two consequences follow from not owning the agent, and both are real:
+- **Lifecycle webhooks only arrive if the operator sets our `/webhooks/retell` URL on
+  that agent in Retell's dashboard.** We can't stamp `webhook_url` at provisioning time
+  the way ADR-005 describes, because we don't provision. Without it the row sits
+  `in_progress` until `POST /api/calls/sync` reconciles it from the platform — that path
+  needs only `external_id`, so ADR-007's self-healing covers this for free.
+- **No per-call personalization.** `system_prompt_override` has nowhere to go: the
+  platform's agent holds the script, and neither delivery route from ADR-006 exists here.
+
+`retell_ws.py` refuses a connection for a call with no `agent_id` explicitly. That's
+reachable — an operator can point a dashboard-built agent's custom-LLM websocket at our
+tunnel — and it has no prompt, model or `ToolConfig` rows to answer with.
+
+**Known gap: `RETELL_API_KEY` is one global env var, not per-tenant**, so the roster and
+the account it dials from are shared by every tenant. `list_platform_agents` takes no
+tenant for that reason rather than pretending to scope. This is the first surface where
+that bites visibly (tenant A sees tenant B's agent names), and it needs to move into
+`Integration` (per-tenant credential storage already exists, phase5 S1) before a second
+customer exists.
+
 ## Coding conventions
 
 ### Python
@@ -989,6 +1052,7 @@ files, stop.
 | **Add an outbound industry vertical** | one entry in `scripts/agent_templates/industries.py` (`qualifying_flow` / `vocabulary` / `extra_objection_rows` / `validated: False`) → add it to the `INDUSTRIES` dict → `uv run python scripts/build_agent_matrix.py --industry <key>`. Nothing else changes: `compose.py` picks it up for every existing style and service automatically. Keep `validated: False` until it has real-call data behind it — `compose.py` renders the unvalidated banner off that flag |
 | **Add a one-off diagnostic agent** (not a sales leaf) | its own `scripts/seed_<name>_agent.py` with the prompt inline, mirroring `seed_email_transcription_test_agent.py` — deliberately *outside* the `agent_templates` matrix, since an agent with no hook/qualifying/close would otherwise bend every style and service module around it. `use_custom_llm=True` so it runs the same `retell_ws.py` path as real agents |
 | **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
+| **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
 | **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
@@ -1027,6 +1091,17 @@ for how to move through these efficiently.
 4. Each caller utterance → `response_required` → streamed turn, server-side tools, ledger
    checks (ADR-009/ADR-003); `reminder_required` covers caller silence
 5. Every completed turn is persisted/broadcast via `_persist_and_publish_turn`
+
+### Outbound call (platform-native agent, ADR-012)
+1. Operator opens `/agents?source=platform` → `GET /api/agents/platform` proxies Retell's
+   live agent roster (no local rows, nothing cached)
+2. Operator picks one, enters a number → `POST /api/agents/platform/call`
+3. `place_platform_agent_call` re-checks the id against the roster, then dials —
+   **no provisioning, no prompt push, no tunnel, no websocket**
+4. A `Call` row is written with `external_agent_id` and a null `agent_id`
+5. Retell's own agent runs the conversation. Lifecycle events reach us only if the
+   operator set our `/webhooks/retell` URL on that agent in Retell's dashboard;
+   otherwise `POST /api/calls/sync` settles the row (ADR-007)
 
 ### Post-call processing (Celery)
 1. Call ends → Retell POSTs `call_ended` to the per-agent `webhook_url`

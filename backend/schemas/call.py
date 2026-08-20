@@ -16,7 +16,11 @@ CallStatus = Literal["in_progress", "resolved", "escalated", "failed"]
 
 class CallResponse(BaseModel):
     id: uuid.UUID
-    agent_id: uuid.UUID
+    # Null when the call was placed through a platform-native agent (ADR-012) — those
+    # have no local Agent row, and carry external_agent_id instead. Exactly one of the
+    # two is set on any given call.
+    agent_id: uuid.UUID | None
+    external_agent_id: str | None = None
     caller_number: str
     status: CallStatus
     duration_sec: int

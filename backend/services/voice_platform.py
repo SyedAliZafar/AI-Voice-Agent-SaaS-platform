@@ -90,6 +90,18 @@ class VoicePlatformAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support list_live_calls")
 
+    async def list_platform_agents(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Agents that exist on the platform itself, including ones built by hand in its
+        dashboard and never seen by this backend (ADR-012).
+
+        Read-only and live: the roster is fetched on demand rather than mirrored into our
+        database, so the picker can't show an agent that was renamed or deleted upstream.
+        Each entry is normalized to {external_id, name, voice_id, engine, updated_at} —
+        `engine` being the platform's own response-engine kind, which is what tells an
+        operator whether an agent runs on the platform's LLM or points back at us.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support list_platform_agents")
+
     def verify_webhook_signature(self, raw_body: str, signature: str | None) -> bool:
         """Verify a platform webhook's signature over the raw request body.
 

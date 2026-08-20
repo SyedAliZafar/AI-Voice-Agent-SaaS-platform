@@ -12,7 +12,17 @@ from backend.models.base import Base, TenantMixin, TimestampMixin, UUIDMixin
 class Call(Base, UUIDMixin, TimestampMixin, TenantMixin):
     __tablename__ = "calls"
 
-    agent_id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"))
+    # Nullable because not every call is placed by an Agent row we own: a call dialed
+    # through an agent built in the voice platform's own dashboard (ADR-012) has no
+    # local Agent to point at, and carries external_agent_id instead. Exactly one of
+    # the two is set — see call_service.create_outbound_call_record.
+    agent_id: Mapped[UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True
+    )
+    # The voice platform's own agent id (e.g. Retell's "agent_xxx") when this call was
+    # placed through a platform-native agent we don't manage (ADR-012). Null for every
+    # call originated from a local Agent row, which is the normal path.
+    external_agent_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     caller_number: Mapped[str] = mapped_column(String(20))
     status: Mapped[str] = mapped_column(String(50), default="in_progress")
     # in_progress | resolved | escalated | failed

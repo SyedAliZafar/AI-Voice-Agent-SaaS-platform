@@ -125,11 +125,12 @@ async def get_call_by_external_id(db: AsyncSession, external_call_id: str) -> Ca
 async def create_outbound_call_record(
     db: AsyncSession,
     tenant_id: uuid.UUID,
-    agent_id: uuid.UUID,
+    agent_id: uuid.UUID | None,
     external_id: str,
     caller_number: str,
     lead_id: uuid.UUID | None = None,
     system_prompt_override: str | None = None,
+    external_agent_id: str | None = None,
 ) -> Call:
     """Called by test_call_service right after the voice platform confirms an
     outbound call was placed — see module docstring for why creation happens here
@@ -138,10 +139,20 @@ async def create_outbound_call_record(
     `system_prompt_override` is only meaningful for use_custom_llm agents: it's how a
     personalized, call-scoped prompt reaches backend/api/retell_ws.py, which resolves it
     off this row rather than from Agent.system_prompt. See Call.system_prompt_override.
+
+    `agent_id` and `external_agent_id` are the two ways a call names its agent, and
+    exactly one must be given: a local Agent row we provisioned, or a platform-native
+    agent built in the platform's own dashboard (ADR-012). Enforced here rather than left
+    to the database, because a row with neither is unattributable and a row with both
+    would make "which agent ran this call" ambiguous for every reader downstream.
     """
+    if (agent_id is None) == (external_agent_id is None):
+        raise ValueError("exactly one of agent_id / external_agent_id must be set")
+
     call = Call(
         tenant_id=tenant_id,
         agent_id=agent_id,
+        external_agent_id=external_agent_id,
         caller_number=caller_number,
         status="in_progress",
         started_at=datetime.now(UTC),
@@ -268,9 +279,7 @@ async def record_llm_events(db: AsyncSession, call: Call, llm_events: list[dict]
         db.add(CallEvent(call_id=call.id, event_type="llm_timing", payload=event, ts=now))
 
 
-async def record_call_event(
-    db: AsyncSession, call: Call, event_type: str, payload: dict
-) -> None:
+async def record_call_event(db: AsyncSession, call: Call, event_type: str, payload: dict) -> None:
     """One CallEvent of an arbitrary type — the general form of the typed writers above.
 
     Exists for events that are neither tool calls nor LLM timings, the first being
