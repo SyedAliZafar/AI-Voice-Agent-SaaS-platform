@@ -233,23 +233,48 @@ async def call_prospect(
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
-    """Personalizes the given agent's campaign script with this prospect's research and
-    operator notes ([COMPANY BRIEF] + [OPERATOR NOTES] injection —
-    script_service.build_prospect_prompt) and places the call via the same Retell
-    provisioning path as a plain test call.
+    """Dial this prospect. Two agent sources, and they behave differently on purpose.
+
+    With a local `agent_id` (the normal path): personalizes that agent's campaign script
+    with this prospect's research and operator notes ([COMPANY BRIEF] + [OPERATOR NOTES]
+    injection — script_service.build_prospect_prompt) and places the call via the same
+    Retell provisioning path as a plain test call.
+
+    With an `external_agent_id` (ADR-012): dials a platform-native agent, which holds its
+    own script in the platform's dashboard. **No personalization happens** — none of the
+    research on this page reaches the call, because there is no channel to hand a
+    dashboard-configured agent a call-scoped prompt. The outreach counter still advances,
+    since the prospect was still called.
+
+    The research-ready gate applies only to the personalized path: it exists because the
+    prompt needs the [COMPANY BRIEF], so with nothing to inject there is nothing to wait
+    for. That also makes a CSV-imported prospect (which never reaches research_status
+    "ready" — see ADR-006) dialable through a platform agent.
     """
     prospect = await prospect_service.get_prospect(db, prospect_id, tenant_id)
     if not prospect:
         raise HTTPException(status_code=404, detail="Prospect not found")
+
+    to_number = payload.to_number or prospect.phone
+    if not to_number:
+        raise HTTPException(status_code=422, detail="No phone number on file for this prospect")
+
+    if payload.external_agent_id:
+        try:
+            result = await test_call_service.place_platform_agent_call(
+                db, tenant_id, payload.external_agent_id, to_number
+            )
+        except test_call_service.TestCallError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        await prospect_service.record_call(db, prospect_id, tenant_id)
+        return result
+
     if prospect.research_status != "ready":
         raise HTTPException(
             status_code=422,
             detail=f"Prospect research is '{prospect.research_status}', not ready yet",
         )
-
-    to_number = payload.to_number or prospect.phone
-    if not to_number:
-        raise HTTPException(status_code=422, detail="No phone number on file for this prospect")
 
     agent = await agent_service.get_agent(db, payload.agent_id, tenant_id)
     if not agent:
@@ -260,7 +285,7 @@ async def call_prospect(
     try:
         result = await test_call_service.place_test_call(
             db,
-            payload.agent_id,
+            agent.id,
             tenant_id,
             to_number,
             system_prompt_override=personalized_prompt,

@@ -91,12 +91,11 @@ export function ProspectRow({
             Sandbox chat
           </Button>
 
-          <Button
-            variant={expanded ? "secondary" : "primary"}
-            size="sm"
-            onClick={onToggleExpand}
-            disabled={!ready}
-          >
+          {/* Not gated on research, unlike Sandbox chat: the panel also offers Retell
+              dashboard agents (ADR-012), which carry their own script and need no
+              [COMPANY BRIEF] — so an un-researched prospect is still callable, just not
+              with a personalized agent. The panel enforces that distinction itself. */}
+          <Button variant={expanded ? "secondary" : "primary"} size="sm" onClick={onToggleExpand}>
             Call
           </Button>
         </div>

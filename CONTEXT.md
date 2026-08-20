@@ -87,7 +87,7 @@ voiceagent/
 │   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012)
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
-│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete
+│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete. /call takes agent_id OR external_agent_id — only the former personalizes (ADR-012)
 │   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
 │   │   ├── integrations.py       # Connect a tenant's CRM: GET/PUT/DELETE /{kind} + POST /{kind}/test — the repo's first credential CRUD surface
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
@@ -963,6 +963,23 @@ the row unattributable, both makes "which agent ran this call" ambiguous for eve
 downstream. Enforced in the service rather than the database because it's a programming
 error, not user input, and should fail at the call site.
 
+**Both dial surfaces offer both sources, but they are not interchangeable on the
+prospects page.** `POST /api/prospects/{id}/call` takes exactly one of `agent_id` /
+`external_agent_id` (a `model_validator` on `ProspectCallRequest` — neither leaves nobody
+to dial with, both makes it ambiguous which script runs). The difference is the whole
+point of that page: a local agent gets this prospect's `[COMPANY BRIEF]` +
+`[OPERATOR NOTES]` injected for the call, and a platform-native one receives **none of
+it**. The picker groups the two under labelled `<optgroup>`s and the panel shows an
+explicit warning when a platform agent is selected, because an operator staring at a
+knowledge base will otherwise assume it was sent.
+
+The research-ready gate therefore applies only to the personalized path. It exists
+because the prompt needs the brief; with nothing to inject there is nothing to wait for.
+A useful side effect: a CSV-imported prospect — which never reaches `research_status
+"ready"` (see ADR-006) — is now dialable through a platform agent, closing half of that
+open follow-up. The `Call` button on `ProspectRow` is no longer gated on research for the
+same reason; `Sandbox chat` still is, since it has nothing to show without a brief.
+
 Two consequences follow from not owning the agent, and both are real:
 - **Lifecycle webhooks only arrive if the operator sets our `/webhooks/retell` URL on
   that agent in Retell's dashboard.** We can't stamp `webhook_url` at provisioning time
@@ -1053,6 +1070,7 @@ files, stop.
 | **Add a one-off diagnostic agent** (not a sales leaf) | its own `scripts/seed_<name>_agent.py` with the prompt inline, mirroring `seed_email_transcription_test_agent.py` — deliberately *outside* the `agent_templates` matrix, since an agent with no hook/qualifying/close would otherwise bend every style and service module around it. `use_custom_llm=True` so it runs the same `retell_ws.py` path as real agents |
 | **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
 | **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
+| **Offer the platform-agent source on another dial surface** | the surface's request schema (exactly-one-of validator, mirroring `ProspectCallRequest`) → its router, branching to `place_platform_agent_call` *before* any personalization work → the UI picker, and **say in the UI what the platform agent won't receive** — silently dropping a personalized prompt is the failure mode this pattern exists to prevent → its router test, asserting the personalized path was NOT taken |
 | **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never

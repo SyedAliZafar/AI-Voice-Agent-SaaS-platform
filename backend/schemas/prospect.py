@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.schemas.agent import SandboxMessage, _validate_llm_model
 
@@ -121,8 +121,25 @@ class CityAutocompleteResponse(BaseModel):
 
 
 class ProspectCallRequest(BaseModel):
-    agent_id: uuid.UUID
+    """Exactly one of agent_id / external_agent_id names who makes the call.
+
+    They are not interchangeable, and the difference is the whole point of this page:
+    a local agent gets this prospect's researched [COMPANY BRIEF] + [OPERATOR NOTES]
+    injected into its script for this one call, while a platform-native agent (ADR-012)
+    holds its own script in the platform's dashboard and cannot receive any of it. The
+    knowledge base above the call form applies to the first and is silently irrelevant
+    to the second — which is why the UI labels the choice rather than blending them.
+    """
+
+    agent_id: uuid.UUID | None = None
+    external_agent_id: str | None = None
     to_number: str | None = None  # defaults to the prospect's stored phone if omitted
+
+    @model_validator(mode="after")
+    def _exactly_one_agent(self) -> "ProspectCallRequest":
+        if (self.agent_id is None) == (self.external_agent_id is None):
+            raise ValueError("provide exactly one of agent_id or external_agent_id")
+        return self
 
 
 class ProspectSandboxChatRequest(BaseModel):

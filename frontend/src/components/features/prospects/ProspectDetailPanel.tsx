@@ -3,8 +3,16 @@
 import { useState } from "react";
 
 import { Button, TextInput } from "@/components/ui";
+import { usePlatformAgents } from "@/hooks/usePlatformAgents";
 import { api, getApiErrorMessage } from "@/lib/api";
 import { Agent, Prospect } from "@/lib/types";
+
+/** The picker holds two kinds of agent that are NOT interchangeable, so the value
+ * carries which kind it is rather than the caller guessing from the id's shape. A local
+ * agent gets this prospect's brief and notes injected for the call; a platform-native
+ * one (ADR-012) runs the script it was given in Retell's dashboard and receives none of
+ * it. Prefixing is what lets one <select> hold both without an ambiguous id. */
+const PLATFORM_PREFIX = "platform:";
 
 /** The expanded per-prospect panel: knowledge base summary, the operator's own
  * notes (wired into both the sandbox and the real call context — script_service
@@ -24,11 +32,26 @@ export function ProspectDetailPanel({
   const [notesDraft, setNotesDraft] = useState(prospect.prospect_notes || "");
   const [savingNotes, setSavingNotes] = useState(false);
 
-  const [callAgentId, setCallAgentId] = useState(agents[0]?.id || "");
+  // Default to a local agent only when it can actually be used; otherwise leave the
+  // picker empty rather than preselecting an option that would 422 on submit.
+  const [callAgentId, setCallAgentId] = useState(
+    prospect.research_status === "ready" ? agents[0]?.id || "" : "",
+  );
   const [callNumber, setCallNumber] = useState(prospect.phone || "");
   const [calling, setCalling] = useState(false);
 
   const [feedback, setFeedback] = useState("");
+
+  // Live Retell roster (ADR-012). Its own loading/error state is deliberately not
+  // blocking this panel: the personalized path is the primary one here and must stay
+  // usable when the platform is unreachable.
+  const { agents: platformAgents } = usePlatformAgents();
+  const usingPlatformAgent = callAgentId.startsWith(PLATFORM_PREFIX);
+
+  // Only the personalized path needs the [COMPANY BRIEF], so only it waits for research.
+  // A platform agent brings its own script and can dial an un-researched prospect —
+  // including a CSV import, which never reaches "ready" at all (ADR-006).
+  const researchReady = prospect.research_status === "ready";
 
   async function saveNotes() {
     setSavingNotes(true);
@@ -48,7 +71,9 @@ export function ProspectDetailPanel({
     setCalling(true);
     try {
       const res = await api.post(`/prospects/${prospect.id}/call`, {
-        agent_id: callAgentId,
+        ...(usingPlatformAgent
+          ? { external_agent_id: callAgentId.slice(PLATFORM_PREFIX.length) }
+          : { agent_id: callAgentId }),
         to_number: callNumber,
       });
       setFeedback(`Dialing from ${res.data.from_number} · call ${res.data.call_id.slice(0, 12)}…`);
@@ -121,12 +146,38 @@ export function ProspectDetailPanel({
             onChange={(e) => setCallAgentId(e.target.value)}
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-brand-300 focus:outline-none"
           >
-            {agents.length === 0 && <option value="">No Retell agents yet</option>}
-            {agents.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name}
-              </option>
-            ))}
+            <option value="" disabled>
+              {agents.length === 0 && platformAgents.length === 0
+                ? "No agents yet"
+                : "Choose an agent…"}
+            </option>
+            {agents.length > 0 && (
+              <optgroup
+                label={
+                  researchReady
+                    ? "Your agents — personalized with this prospect"
+                    : `Your agents — unavailable, research is ${prospect.research_status}`
+                }
+              >
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id} disabled={!researchReady}>
+                    {a.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {platformAgents.length > 0 && (
+              <optgroup label="Retell dashboard agents — generic script">
+                {platformAgents.map((a) => (
+                  <option
+                    key={a.external_id}
+                    value={`${PLATFORM_PREFIX}${a.external_id}`}
+                  >
+                    {a.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </div>
         <div className="flex-1">
@@ -141,6 +192,14 @@ export function ProspectDetailPanel({
           {calling ? "Calling…" : "Place call"}
         </Button>
       </div>
+
+      {usingPlatformAgent && (
+        <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          This agent lives in your Retell dashboard and runs the script configured there.
+          The knowledge base and notes above will <strong>not</strong> be sent — pick one
+          of your own agents for a personalized call.
+        </p>
+      )}
 
       {feedback && <p className="mt-2 text-xs text-slate-500">{feedback}</p>}
 

@@ -836,6 +836,128 @@ async def test_call_is_tenant_scoped(
     assert placed_calls == []
 
 
+# --- calling a prospect with a platform-native agent (ADR-012) ----------------------
+
+
+@pytest.fixture
+def placed_platform_calls(monkeypatch) -> list[dict]:
+    """Same capture idea as placed_calls, for the other dial source."""
+    from backend.api import prospects as prospects_api
+
+    calls: list[dict] = []
+
+    async def fake_place(db, tenant_id, external_agent_id, to_number):
+        calls.append({"external_agent_id": external_agent_id, "to_number": to_number})
+        return {
+            "call_id": f"mock_ext_call_{len(calls)}",
+            "from_number": "+10000000000",
+            "status": "dialing",
+            "agent_name": "Roofing Agent Test Case #1",
+        }
+
+    monkeypatch.setattr(prospects_api.test_call_service, "place_platform_agent_call", fake_place)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_call_with_a_platform_agent_sends_no_personalized_prompt(
+    client, db_session, tenant_id, auth_headers, placed_calls, placed_platform_calls
+):
+    """The whole distinction: a dashboard-built agent holds its own script and there is
+    no channel to hand it this prospect's brief. It must not silently take the
+    personalized path instead."""
+    prospect = await _researched_prospect(db_session, tenant_id, notes="Owner is Maria.")
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"external_agent_id": "agent_ext_9"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert placed_calls == []  # the personalized path was not used
+    assert placed_platform_calls == [
+        {"external_agent_id": "agent_ext_9", "to_number": prospect.phone}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_call_with_a_platform_agent_still_advances_outreach(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    """The prospect was still called, whichever agent did it."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"external_agent_id": "agent_ext_9"},
+        headers=auth_headers,
+    )
+
+    refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert refreshed.call_count == 1
+    assert refreshed.outreach_status == "reached"
+
+
+@pytest.mark.asyncio
+async def test_call_with_a_platform_agent_does_not_wait_for_research(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    """The ready-gate exists because the personalized prompt needs the [COMPANY BRIEF].
+    With nothing to inject there is nothing to wait for — which is also what makes a
+    CSV-imported prospect (never reaches "ready", ADR-006) callable at all."""
+    prospect = await _make_prospect(db_session, tenant_id)  # research_status "pending"
+    prospect.phone = "+491701111111"
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"external_agent_id": "agent_ext_9"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert len(placed_platform_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_rejects_naming_both_or_neither_agent(
+    client, db_session, tenant_id, auth_headers, placed_calls, placed_platform_calls
+):
+    """Neither leaves nobody to dial with; both makes it ambiguous which script runs —
+    and the two differ in exactly the way this page is about."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    for body in (
+        {},
+        {"agent_id": str(agent.id), "external_agent_id": "agent_ext_9"},
+    ):
+        resp = await client.post(
+            f"/api/prospects/{prospect.id}/call", json=body, headers=auth_headers
+        )
+        assert resp.status_code == 422, body
+
+    assert placed_calls == []
+    assert placed_platform_calls == []
+
+
+@pytest.mark.asyncio
+async def test_call_with_a_platform_agent_is_tenant_scoped(
+    client, db_session, tenant_id, other_auth_headers, placed_platform_calls
+):
+    prospect = await _researched_prospect(db_session, tenant_id)
+
+    resp = await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"external_agent_id": "agent_ext_9"},
+        headers=other_auth_headers,
+    )
+
+    assert resp.status_code == 404
+    assert placed_platform_calls == []
+
+
 # --- prospect sandbox chat ---------------------------------------------------------
 
 
