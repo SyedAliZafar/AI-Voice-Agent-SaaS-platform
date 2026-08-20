@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { DynamicVariableFields } from "@/components/features/agents/DynamicVariableFields";
 import { Button, TextInput } from "@/components/ui";
@@ -57,16 +57,31 @@ export function ProspectDetailPanel({
 
   // The platform agent's prompt placeholders, prefilled from this prospect. Suggestions
   // are seeded into editable state (not merged at submit) so what the operator reads is
-  // exactly what gets sent — and so their edits survive a re-render.
+  // exactly what gets sent.
   const selectedExternalId = usingPlatformAgent
     ? callAgentId.slice(PLATFORM_PREFIX.length)
     : null;
   const { variables } = usePlatformAgentVariables(selectedExternalId);
   const [varValues, setVarValues] = useState<Record<string, string>>({});
 
+  // Seed once per (agent, prospect, placeholder-set) — keyed on stable STRINGS, never on
+  // the `prospect` object's identity.
+  //
+  // This effect used to depend on `prospect` directly, which silently made the form
+  // unusable: useProspects refetches the whole list every 4s while any row is still
+  // researching (and a CSV-imported row never leaves "pending" at all, ADR-006), so the
+  // parent handed this component a brand-new prospect object on every poll. The effect
+  // re-ran and overwrote whatever the operator was halfway through typing — you could
+  // not enter a contact name at all. The other fields here escaped it only because
+  // useState(initial) ignores later prop changes.
+  const seedKey = `${selectedExternalId ?? ""}|${prospect.id}|${variables.join(",")}`;
+  const seededFor = useRef<string | null>(null);
+
   useEffect(() => {
+    if (seededFor.current === seedKey) return;
+    seededFor.current = seedKey;
     setVarValues(variables.length ? suggestProspectVariables(variables, prospect) : {});
-  }, [variables, prospect]);
+  }, [seedKey, variables, prospect]);
 
   const missingVars = variables.filter((v) => !varValues[v]?.trim());
 

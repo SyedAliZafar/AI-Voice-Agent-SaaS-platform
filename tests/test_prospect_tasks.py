@@ -8,8 +8,11 @@ research_prospect's own path is covered in tests/test_prospects.py
 (test_imported_prospect_reaches_research_ready_via_the_pipeline).
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
+from backend.models.prospect import Prospect
 from backend.schemas.prospect import CompanyResearch
 from backend.services import places_service, prospect_service
 from backend.workers import prospect_tasks
@@ -150,3 +153,125 @@ async def test_discovery_enqueues_research_only_for_new_rows(
 
     await prospect_tasks._discover(str(tenant_id), "solar", "Bristol, UK", 20_000, 20)
     assert len(queued_research) == 1  # unchanged — the row is no longer "pending"
+
+
+# --- sweep_stale_prospects (the backstop for a lost .delay() enqueue) --------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_reenqueues_a_prospect_stuck_pending(
+    db_session, tenant_id, stub_places, monkeypatch, queued_research
+):
+    """The exact real-world shape: research_prospect.delay() was called at import/
+    discovery time, but nothing ever consumed it (no worker, or Redis lost the message
+    on a restart) — the row never left "pending". The sweep is the only code path left
+    that can recover it.
+    """
+    prospect = Prospect(
+        tenant_id=tenant_id,
+        google_place_id="place_stuck_1",
+        name="Stuck Roofing Ltd",
+        research_status="pending",
+        source_query="csv-import",
+        priority_score=1.0,
+    )
+    db_session.add(prospect)
+    await db_session.commit()
+    await db_session.refresh(prospect)
+
+    # Backdate updated_at past the staleness cutoff without waiting real time —
+    # server_default/onupdate only fire on insert/update through the ORM, so this is a
+    # direct write to simulate "created 30 minutes ago".
+    prospect.updated_at = datetime.now(UTC) - timedelta(minutes=30)
+    await db_session.commit()
+
+    monkeypatch.setattr(prospect_tasks, "AsyncSessionLocal", _session_factory(db_session))
+
+    await prospect_tasks._sweep_stale_prospects()
+
+    assert queued_research == [str(prospect.id)]
+
+
+@pytest.mark.asyncio
+async def test_sweep_reenqueues_a_prospect_stuck_running(
+    db_session, tenant_id, monkeypatch, queued_research
+):
+    """"running" means mark_research_running() fired and then nothing else did — a
+    worker that picked up the task and crashed mid-call. Re-running _research() from
+    scratch is safe: it only reads name/website/address off the row."""
+    prospect = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [
+            {
+                "google_place_id": "place_stuck_2",
+                "name": "Crashed Mid-Research Ltd",
+                "address": "1 Test St",
+            }
+        ],
+        source_query="test",
+    )
+    await prospect_service.mark_research_running(db_session, prospect[0].id)
+    p = await prospect_service.get_prospect_unscoped(db_session, prospect[0].id)
+    p.updated_at = datetime.now(UTC) - timedelta(minutes=30)
+    await db_session.commit()
+
+    queued_research.clear()
+    monkeypatch.setattr(prospect_tasks, "AsyncSessionLocal", _session_factory(db_session))
+
+    await prospect_tasks._sweep_stale_prospects()
+
+    assert queued_research == [str(prospect[0].id)]
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_a_recently_queued_prospect_alone(
+    db_session, tenant_id, stub_places, monkeypatch, queued_research
+):
+    """A row that went "pending" 30 seconds ago is very likely mid-flight to a worker
+    right now — sweeping it too would double-dispatch a real scrape + LLM call for
+    nothing broken."""
+    # Patch BEFORE the first call: _discover opens its own session via
+    # prospect_tasks.AsyncSessionLocal, and unpatched that's the real one — which
+    # nearly wrote this test's random tenant_id into the actual Neon database.
+    monkeypatch.setattr(prospect_tasks, "AsyncSessionLocal", _session_factory(db_session))
+
+    await prospect_tasks._discover(str(tenant_id), "solar", "Bristol, UK", 20_000, 20)
+    assert len(queued_research) == 1
+
+    queued_research.clear()
+    await prospect_tasks._sweep_stale_prospects()
+
+    assert queued_research == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_ready_and_failed_prospects_alone(
+    db_session, tenant_id, monkeypatch, queued_research
+):
+    prospects = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [
+            {"google_place_id": "place_ready", "name": "Ready Co", "address": "1 St"},
+            {"google_place_id": "place_failed", "name": "Failed Co", "address": "2 St"},
+        ],
+        source_query="test",
+    )
+    ready, failed = prospects
+    await prospect_service.mark_research_ready(db_session, ready.id, CompanyResearch())
+    await prospect_service.mark_research_failed(db_session, failed.id, "boom")
+
+    old = datetime.now(UTC) - timedelta(minutes=30)
+    r = await prospect_service.get_prospect_unscoped(db_session, ready.id)
+    r.updated_at = old
+    f = await prospect_service.get_prospect_unscoped(db_session, failed.id)
+    f.updated_at = old
+    await db_session.commit()
+
+    queued_research.clear()
+    monkeypatch.setattr(prospect_tasks, "AsyncSessionLocal", _session_factory(db_session))
+
+    await prospect_tasks._sweep_stale_prospects()
+
+    assert queued_research == []

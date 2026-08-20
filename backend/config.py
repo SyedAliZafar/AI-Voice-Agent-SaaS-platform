@@ -171,6 +171,12 @@ class Settings(BaseSettings):
     # as stale and reconciled via the platform (ADR-007), not left to retry forever.
     lead_stale_in_flight_minutes: int = 20
 
+    # A prospect stuck "pending"/"running" longer than this (research_prospect.delay()
+    # enqueued into a queue with no worker consuming it, or a worker that crashed
+    # mid-task) is re-enqueued rather than left to sit forever — see
+    # prospect_tasks.sweep_stale_prospects.
+    prospect_stale_research_minutes: int = 20
+
     # Storage
     s3_bucket: str = "voiceagent-recordings"
     s3_access_key: str = ""

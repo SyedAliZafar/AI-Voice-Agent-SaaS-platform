@@ -40,5 +40,12 @@ celery_app.conf.update(
             "task": "sweep_stale_leads",
             "schedule": 300.0,
         },
+        # Backstop for research_prospect.delay() calls that were enqueued into a queue
+        # nothing consumed (no worker running, or Redis restarted before one picked the
+        # message up) — see prospect_tasks module docstring.
+        "sweep-stale-prospects": {
+            "task": "sweep_stale_prospects",
+            "schedule": 300.0,
+        },
     },
 )

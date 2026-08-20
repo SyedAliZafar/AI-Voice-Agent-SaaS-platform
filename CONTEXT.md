@@ -129,10 +129,10 @@ voiceagent/
 │   │
 │   ├── workers/                  # Celery tasks
 │   │   ├── __init__.py
-│   │   ├── celery_app.py         # Celery config + beat_schedule (dispatch_due_leads/sweep_stale_leads, ADR-011)
+│   │   ├── celery_app.py         # Celery config + beat_schedule (dispatch_due_leads/sweep_stale_leads ADR-011, sweep_stale_prospects ADR-006)
 │   │   ├── transcript_tasks.py   # Post-call transcript processing
 │   │   ├── analytics_tasks.py    # Periodic metric rollups
-│   │   ├── prospect_tasks.py     # discover_prospects / research_prospect (ADR-006)
+│   │   ├── prospect_tasks.py     # discover_prospects / research_prospect / sweep_stale_prospects (ADR-006, 2026-08-21 correction)
 │   │   └── lead_tasks.py         # dispatch_due_leads / sweep_stale_leads — the lead retry scheduler (ADR-011)
 │   │
 │   ├── middleware/
@@ -238,7 +238,7 @@ voiceagent/
     ├── test_sandbox_service.py
     ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import, sandbox-chat, city-autocomplete
     ├── test_prospect_service.py
-    ├── test_prospect_tasks.py    # discover_prospects task: arguments reach places_service, source_location/city/country persist
+    ├── test_prospect_tasks.py    # discover_prospects task: arguments reach places_service, source_location/city/country persist; sweep_stale_prospects re-enqueue logic
     ├── test_places_service.py    # addressComponents extraction, autocomplete normalization
     ├── test_research_service.py
     ├── test_script_service.py
@@ -790,10 +790,39 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
    debounce is bypassed. Global for now, not narrowed by country — see `region_code`'s
    unused-but-plumbed-through param if that's ever needed.
 
-   CSV-imported prospects land with `research_status="pending"` and nothing chained to
-   advance them, so they never reach `ready` — which is what the UI's "Call" button
-   gates on. Calling an imported prospect from the dashboard therefore doesn't work yet;
-   wiring import into `research_prospect` (or relaxing the gate) is an open follow-up.
+   **2026-08-21 correction — the paragraph that used to be here was wrong.**
+   `POST /import-csv` chains `research_prospect.delay()` per imported row (same as
+   discovery) and has since the endpoint was added; a CSV import does reach `ready`.
+   That stale claim survived two full sessions of work in this file before being
+   caught, including misleading a fix attempt into thinking a chain needed adding when
+   the actual bug was elsewhere (below) — a reminder to verify a doc's claim against
+   the code before building on it, not just when something looks surprising.
+
+   **What was actually true**, diagnosed the same day from 14 real stuck prospects: a
+   `.delay()` call only enqueues a message onto Redis. With no worker running to
+   consume it — or one that was running and got restarted, or a non-persistent dev
+   Redis that lost the message on its own restart — the row is stuck `pending` forever
+   with no code path left that will ever revisit it. `research_prospect` itself can't
+   self-heal this: it only runs once dispatched, and dispatch is exactly what didn't
+   happen. `prospect_tasks.sweep_stale_prospects` (mirroring `sweep_stale_leads`,
+   ADR-011) is the backstop — a Celery Beat tick every 5 minutes re-dispatches any
+   prospect whose `research_status` is `pending`/`running` and whose `updated_at` is
+   older than `settings.prospect_stale_research_minutes` (20). Re-running is safe for
+   both states: `_research()` only reads `name`/`website`/`address` off the row, so a
+   second attempt is exactly as safe as the first, just later. Needs
+   `celery -A backend.workers.celery_app beat` actually running alongside the worker —
+   see CLAUDE.md's Commands section — or the sweep itself never fires either.
+
+   The frontend has its own half of this: `useProspects`' 4s poll (while any row is
+   `pending`/`running`) used to run forever if research never resolved, hitting the
+   shared database from an open tab nobody was watching. It now gives up after
+   `POLL_TIMEOUT_MS` (25 minutes — a slight cushion past the backend's own 20-minute
+   cutoff, so a row about to be swept isn't given up on client-side first). This is a
+   backstop for the browser, not a fix for the underlying stall; the sweep above is.
+
+   The UI's "Call" button was never actually gated on `research_status` for every
+   agent — see ADR-012's dial-a-platform-agent path, added the day before this
+   correction, which doesn't need `ready` at all since it injects no research.
 
 **Two overlapping outreach axes — a deliberate deferral, not an oversight.**
 `Prospect` now also carries `status` (`not_called | called | booked | flagged |

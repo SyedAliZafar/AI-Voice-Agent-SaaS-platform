@@ -89,6 +89,27 @@ Still mocked on that page, and *not* covered by the rule above yet: the integrat
 and phone numbers are hardcoded arrays with local-only toggles, even though
 `/api/integrations` is real. Wiring them is its own pass.
 
+## Never key a state reset on a polled object's identity
+
+`useProspects` refetches the whole list every 4s while any row is still researching, and
+`setProspects(res.data)` builds **new objects from JSON** each time. Anything holding a
+`prospect` prop therefore gets a new object identity every 4 seconds, even when nothing
+about that prospect changed.
+
+`ProspectDetailPanel` seeded its dynamic-variable inputs from
+`useEffect(..., [variables, prospect])`. That re-ran on every poll and overwrote whatever
+the operator was typing — the contact-name field could not be filled in at all. Sibling
+fields escaped only because `useState(initial)` ignores later prop changes.
+
+**Rule: an effect that resets user-editable state must depend on stable values
+(`prospect.id`, a joined string), not on an object.** Guard with a "seeded for this key"
+ref so a re-render can't clobber input. If a form lives inside a row of a polling list,
+assume its props are replaced on a timer.
+
+Related, still open: those 14 `pending` rows never advance (nothing chains CSV imports
+into research — CONTEXT.md ADR-006), so that 4s poll runs *forever* while /prospects is
+open. The poll should be bounded, or the gap closed.
+
 ## The signed-in identity is mocked in exactly one place
 
 Real auth isn't built (see the auth note at the bottom of this file). Until it is,

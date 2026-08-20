@@ -314,6 +314,27 @@ async def count_by_status(db: AsyncSession, tenant_id: uuid.UUID) -> dict[str, i
     return counts
 
 
+async def stale_research_prospects(db: AsyncSession, cutoff: datetime) -> list[Prospect]:
+    """Prospects whose research has sat "pending" or "running" since before `cutoff` —
+    the backstop for prospect_tasks.sweep_stale_prospects.
+
+    `updated_at` is the right column for both states: for "pending" it's still the
+    insertion time (nothing has touched the row since), and for "running" it's when
+    mark_research_running() flipped it — so one comparison covers "never started" and
+    "started but never finished" alike.
+
+    Unscoped like get_prospect_unscoped: a Celery Beat sweep has no tenant to filter by
+    and is meant to catch every stuck row across every tenant.
+    """
+    result = await db.execute(
+        select(Prospect).where(
+            Prospect.research_status.in_(["pending", "running"]),
+            Prospect.updated_at < cutoff,
+        )
+    )
+    return list(result.scalars().all())
+
+
 async def get_prospect_unscoped(db: AsyncSession, prospect_id: uuid.UUID) -> Prospect | None:
     """Tenant-blind lookup — ONLY for trusted internal callers (Celery tasks acting on a
     prospect_id the system itself produced, and the mark_* helpers below).
