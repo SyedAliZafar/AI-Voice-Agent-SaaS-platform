@@ -40,6 +40,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from backend.api import retell_ws
 from backend.api.retell_ws import (
+    _BEGIN_MESSAGE_INSTRUCTION,
     _duplicate_tool_result,
     _find_duplicate_ledger_entry,
     _ledger_entry,
@@ -158,6 +159,33 @@ def test_system_prompt_with_context_forbids_speaking_placeholders():
     # The other half of the same failure: with no name given, the model either invented
     # a human one or spoke the placeholder — both wrong, so it's told what to say instead.
     assert "do not have a personal first name" in prompt
+
+
+def test_system_prompt_with_context_forbids_inventing_a_human_life():
+    """Regression for call 7c4d2307: pressed by an impatient prospect, the model
+    improvised "it's been a long day—I'm on my way home", then said "I'm an AI
+    assistant" one turn later. Nothing in the campaign prompt mentioned tiredness or a
+    commute — it invented a human predicament to buy sympathy, and contradicted the one
+    claim the whole call is a demo of. Faking a personal life is now forbidden outright,
+    with the honest alternative spelled out so the model has somewhere to go under
+    pressure."""
+    prompt = _system_prompt_with_context("You are Ali.", "+15551234567", "UTC")
+
+    assert "You are an AI" in prompt
+    assert "no commute" in prompt
+    # The specific improvisations that actually happened, plus the sanctioned way out.
+    assert "long day" in prompt
+    assert "on my way home" in prompt
+    assert "offer to let them" in prompt
+
+
+def test_begin_message_instruction_asks_for_a_positive_time_check():
+    """Also from 7c4d2307: the opener came out as "Have I caught you at a bad time?",
+    which makes the caller parse a double negative to say yes, and opens by inviting
+    them to agree they're busy. The instruction said "now is an okay time" but never
+    ruled the negative phrasing out."""
+    assert "is now a good time" in _BEGIN_MESSAGE_INSTRUCTION
+    assert "bad time" in _BEGIN_MESSAGE_INSTRUCTION
 
 
 def test_llm_websocket_closes_unknown_call(tmp_path):
@@ -1361,7 +1389,21 @@ def test_llm_websocket_duplicate_request_skips_real_dispatch_and_reaches_check_d
 
 @pytest.mark.parametrize(
     "utterance",
-    ["Yo.", "What?", "yeah", "Mhm.", "uh huh", "OK okay", "  Hello?  ", "Right, yeah, ok"],
+    [
+        "Yo.",
+        "What?",
+        "yeah",
+        "Mhm.",
+        # Regression for call 041746ed: "Mhmm." (double-m variant) fell through the
+        # filler check — "mhm"/"mm"/"mmhmm"/"mmm" were all covered, "mhmm" was not —
+        # and cancelled the greeting mid-sentence, forcing the agent into an audible
+        # "Sorry, let me start over" self-restart.
+        "Mhmm.",
+        "uh huh",
+        "OK okay",
+        "  Hello?  ",
+        "Right, yeah, ok",
+    ],
 )
 def test_filler_utterances_never_cancel_a_turn(utterance):
     assert retell_ws._is_filler(utterance) is True

@@ -180,6 +180,15 @@ def compute_next_attempt(attempt_count: int, now: datetime, tz_name: str) -> dat
 
 
 def within_business_hours(lead: Lead, now: datetime) -> bool:
+    # Every real caller passes a freshly-built datetime.now(UTC), which is always aware —
+    # but a value round-tripped through SQLite (used only in tests; production runs
+    # Postgres, which preserves tzinfo on a DateTime(timezone=True) column) comes back
+    # naive. .astimezone() on a naive datetime silently assumes the *system's* local
+    # timezone rather than UTC, which would misjudge the window on any host that isn't
+    # already UTC. Treating a naive input as UTC matches how the rest of this module
+    # produces timestamps and removes that footgun for any future caller too.
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
     local_now = now.astimezone(_resolve_tz(lead))
     return (
         local_now.weekday() < 5

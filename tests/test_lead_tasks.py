@@ -61,10 +61,25 @@ async def test_dispatch_due_leads_dials_a_due_lead(
         {"phone": "+491701111111", "agent_id": agent.id, "timezone": "UTC"},
     )
     lead.retry_state = "scheduled"
-    lead.next_attempt_at = datetime.now(UTC) - timedelta(minutes=1)
+
+    # Fixed, always-business-hours instant (Thursday, noon UTC) rather than the real wall
+    # clock: _dispatch_due_leads computes `now = datetime.now(UTC)` itself and this test's
+    # UTC-timezoned lead has no other way to stay inside within_business_hours' 9-18
+    # window — this test previously failed whenever it happened to run outside that
+    # window (e.g. ~20:00 UTC), which had nothing to do with the dispatch logic under
+    # test.
+    frozen_now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now if tz else frozen_now.replace(tzinfo=None)
+
+    lead.next_attempt_at = frozen_now - timedelta(minutes=1)
     await db_session.commit()
 
     monkeypatch.setattr(lead_tasks, "AsyncSessionLocal", _session_factory(db_session))
+    monkeypatch.setattr(lead_tasks, "datetime", _FrozenDatetime)
     await lead_tasks._dispatch_due_leads()
 
     assert len(placed_calls) == 1
