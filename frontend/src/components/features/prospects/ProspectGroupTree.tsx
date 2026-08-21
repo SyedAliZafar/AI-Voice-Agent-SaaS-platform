@@ -2,23 +2,26 @@
 
 import { ProspectRow } from "@/components/features/prospects/ProspectRow";
 import { CountryGroup } from "@/lib/prospectGrouping";
-import { Agent } from "@/lib/types";
 
 /** Renders the four-level hierarchy country -> category -> city -> companies. All
  * current data is UK-only, but nothing here assumes a single country — the tree
  * shape is entirely driven by groupProspects().
+ *
+ * Deliberately does NOT render the call form (see ProspectCallDrawer): a prospect's
+ * position in this tree can change out from under an open form the moment research
+ * fills in its city, and a form living inside the row that just moved loses focus and
+ * scroll position with it. openId/onOpenCall only track *which* row's drawer button
+ * should show pressed — the drawer itself is a page-level sibling of this tree.
  */
 export function ProspectGroupTree({
   groups,
-  retellAgents,
-  expandedId,
-  onToggleExpand,
+  openId,
+  onOpenCall,
   onChanged,
 }: {
   groups: CountryGroup[];
-  retellAgents: Agent[];
-  expandedId: string | null;
-  onToggleExpand: (id: string) => void;
+  openId: string | null;
+  onOpenCall: (id: string) => void;
   onChanged: () => void;
 }) {
   return (
@@ -51,9 +54,8 @@ export function ProspectGroupTree({
                           <ProspectRow
                             key={prospect.id}
                             prospect={prospect}
-                            retellAgents={retellAgents}
-                            expanded={expandedId === prospect.id}
-                            onToggleExpand={() => onToggleExpand(prospect.id)}
+                            isOpen={openId === prospect.id}
+                            onOpenCall={() => onOpenCall(prospect.id)}
                             onChanged={onChanged}
                           />
                         ))}

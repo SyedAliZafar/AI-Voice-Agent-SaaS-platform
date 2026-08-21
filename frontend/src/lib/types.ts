@@ -30,6 +30,26 @@ export interface PlatformAgent {
   last_modified_ms: number | null;
 }
 
+/** One (style, service, industry) leaf from scripts/agent_templates — a ready-to-use
+ * outbound campaign script. Not yet an Agent row; POST /agents/from-template creates
+ * one from the (style, service, industry) key triple. */
+export interface AgentTemplate {
+  style: string;
+  service: string;
+  industry: string;
+  style_label: string;
+  service_label: string;
+  industry_label: string;
+  name: string;
+  // Backed by a real call transcript vs. a written-but-untested hypothesis — surface
+  // this distinction rather than presenting every template as equally proven.
+  validated: boolean;
+}
+
+export interface AgentTemplatesResponse {
+  templates: AgentTemplate[];
+}
+
 export interface LlmModel {
   id: string;
   label: string;

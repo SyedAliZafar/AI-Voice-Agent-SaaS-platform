@@ -2,24 +2,24 @@
 
 import { useRouter } from "next/navigation";
 
-import { ProspectDetailPanel } from "@/components/features/prospects/ProspectDetailPanel";
 import { OUTREACH_META, RESEARCH_META, STATUS_LABELS, STATUS_ORDER } from "@/components/features/prospects/prospectStatus";
 import { RefreshIcon } from "@/components/icons";
 import { Badge, Button, Card } from "@/components/ui";
 import { api } from "@/lib/api";
-import { Agent, Prospect, ProspectStatus } from "@/lib/types";
+import { Prospect, ProspectStatus } from "@/lib/types";
 
 export function ProspectRow({
   prospect,
-  retellAgents,
-  expanded,
-  onToggleExpand,
+  isOpen,
+  onOpenCall,
   onChanged,
 }: {
   prospect: Prospect;
-  retellAgents: Agent[];
-  expanded: boolean;
-  onToggleExpand: () => void;
+  /** Whether this row's call drawer (ProspectCallDrawer, rendered by the page) is the
+   * one currently open — purely for the button's pressed styling, the drawer itself
+   * lives outside this row so re-grouping the list can't carry it away mid-form. */
+  isOpen: boolean;
+  onOpenCall: () => void;
   onChanged: () => void;
 }) {
   const router = useRouter();
@@ -91,19 +91,15 @@ export function ProspectRow({
             Sandbox chat
           </Button>
 
-          {/* Not gated on research, unlike Sandbox chat: the panel also offers Retell
+          {/* Not gated on research, unlike Sandbox chat: the drawer also offers Retell
               dashboard agents (ADR-012), which carry their own script and need no
               [COMPANY BRIEF] — so an un-researched prospect is still callable, just not
-              with a personalized agent. The panel enforces that distinction itself. */}
-          <Button variant={expanded ? "secondary" : "primary"} size="sm" onClick={onToggleExpand}>
+              with a personalized agent. The drawer enforces that distinction itself. */}
+          <Button variant={isOpen ? "secondary" : "primary"} size="sm" onClick={onOpenCall}>
             Call
           </Button>
         </div>
       </div>
-
-      {expanded && (
-        <ProspectDetailPanel prospect={prospect} agents={retellAgents} onChanged={onChanged} />
-      )}
     </Card>
   );
 }

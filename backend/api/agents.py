@@ -10,7 +10,10 @@ from backend.config import get_settings
 from backend.database import get_db
 from backend.schemas.agent import (
     AgentCreate,
+    AgentFromTemplateRequest,
     AgentResponse,
+    AgentTemplateInfo,
+    AgentTemplatesResponse,
     AgentUpdate,
     AmbientSoundInfo,
     AmbientSoundsResponse,
@@ -26,7 +29,13 @@ from backend.schemas.agent import (
     TestCallRequest,
     TestCallResponse,
 )
-from backend.services import agent_service, llm_service, sandbox_service, test_call_service
+from backend.services import (
+    agent_service,
+    agent_templates_service,
+    llm_service,
+    sandbox_service,
+    test_call_service,
+)
 from backend.services.retell_adapter import AMBIENT_SOUND_CATALOG
 
 router = APIRouter()
@@ -155,6 +164,51 @@ async def call_platform_agent(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return result
+
+
+@router.get("/templates", response_model=AgentTemplatesResponse)
+async def list_agent_templates(
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """Pre-written outbound campaign scripts (scripts/agent_templates) — pick one and
+    create it directly instead of writing a prompt from scratch.
+
+    Declared BEFORE /{agent_id} for the same routing-order reason as /models above.
+    """
+    return AgentTemplatesResponse(
+        templates=[AgentTemplateInfo(**t) for t in agent_templates_service.list_templates()]
+    )
+
+
+@router.post("/from-template", response_model=AgentResponse, status_code=201)
+async def create_agent_from_template(
+    payload: AgentFromTemplateRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an Agent row from one scripts/agent_templates leaf — composes the full
+    system_prompt server-side so the template content lives in exactly one place.
+
+    use_custom_llm=True always: tool execution (book_appointment, create_lead, etc)
+    only runs on the custom-LLM path per ADR-003 — Retell's hosted LLM never calls our
+    tools, so a template agent on the hosted path could compose a prompt that promises
+    capabilities it can't use. Same reasoning as build_agent_matrix.py.
+
+    Declared BEFORE /{agent_id} for the same routing-order reason as /models above.
+    """
+    try:
+        name, system_prompt = agent_templates_service.compose_prompt(
+            payload.style, payload.service, payload.industry
+        )
+    except agent_templates_service.UnknownTemplateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    create = AgentCreate(
+        name=payload.name or name,
+        system_prompt=system_prompt,
+        use_custom_llm=True,
+    )
+    return await agent_service.create_agent(db, tenant_id, create)
 
 
 @router.get("", response_model=list[AgentResponse])

@@ -112,6 +112,14 @@ export function PhoneIcon(props: IconProps) {
   return <CallsIcon {...props} />;
 }
 
+export function CloseIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="M18 6 6 18M6 6l12 12" />
+    </Base>
+  );
+}
+
 export function CheckIcon(props: IconProps) {
   return (
     <Base {...props}>

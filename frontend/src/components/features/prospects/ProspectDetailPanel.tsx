@@ -26,10 +26,14 @@ export function ProspectDetailPanel({
   prospect,
   agents,
   onChanged,
+  bare = false,
 }: {
   prospect: Prospect;
   agents: Agent[];
   onChanged: () => void;
+  /** Drops the top border/margin used when this rendered inline below a row (see
+   * ProspectCallDrawer, which supplies its own header/border as drawer chrome). */
+  bare?: boolean;
 }) {
   const [notesDraft, setNotesDraft] = useState(prospect.prospect_notes || "");
   const [savingNotes, setSavingNotes] = useState(false);
@@ -123,7 +127,7 @@ export function ProspectDetailPanel({
   }
 
   return (
-    <div className="mt-4 border-t border-slate-100 pt-4">
+    <div className={bare ? "" : "mt-4 border-t border-slate-100 pt-4"}>
       {prospect.research.summary && (
         <div className="mb-4 rounded-lg bg-slate-50/70 p-3">
           <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">

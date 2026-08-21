@@ -84,7 +84,7 @@ voiceagent/
 │   ├── api/                      # FastAPI routers
 │   │   ├── __init__.py
 │   │   ├── deps.py               # get_current_tenant — the tenant-scoping dependency (ADR-001)
-│   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012)
+│   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012); GET /templates + POST /from-template for the scripts/agent_templates gallery
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
 │   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete. /call takes agent_id OR external_agent_id — only the former personalizes (ADR-012)
@@ -97,6 +97,9 @@ voiceagent/
 │   ├── services/                 # Business logic (no HTTP concerns)
 │   │   ├── __init__.py
 │   │   ├── agent_service.py      # Agent CRUD, prompt management
+│   │   ├── agent_templates_service.py  # Runtime bridge to scripts/agent_templates
+│   │   │                         #   (compose.py) — read-only, powers GET /agents/templates
+│   │   │                         #   + POST /agents/from-template, the in-app template gallery
 │   │   ├── call_service.py       # Call lifecycle, state machine
 │   │   ├── test_call_service.py  # Places a call via the voice platform's hosted LLM (smoke test only — no configured model/tools, see phases/completed/phase0.md); also place_platform_agent_call/list_platform_agents, the dial-a-dashboard-built-agent path (ADR-012)
 │   │   ├── voice_platform.py     # Abstract base for Retell/Vapi adapters
@@ -189,11 +192,15 @@ voiceagent/
 │   │   │   ├── features/
 │   │   │   │   ├── agents/       # AgentCard, AgentBuilder, Stepper, PromptEditor,
 │   │   │   │   │                 #   PlatformAgentList (Retell-dashboard agents + inline dial, ADR-012),
-│   │   │   │                 #   DynamicVariableFields ({{placeholder}} inputs, ADR-012a)
+│   │   │   │                 #   DynamicVariableFields ({{placeholder}} inputs, ADR-012a),
+│   │   │   │                 #   TemplateGallery (industry/service/style picker over
+│   │   │   │                 #   scripts/agent_templates — /agents/new's "Use a template" tab)
 │   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
 │   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
 │   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
-│   │   │   │                     #   ProspectDetailPanel, CsvImportButton, SandboxChat,
+│   │   │   │                     #   ProspectDetailPanel, ProspectCallDrawer (fixed right-side
+│   │   │   │                     #   panel — the call form; NOT rendered inside the tree, see
+│   │   │   │                     #   its docstring), CsvImportButton, SandboxChat,
 │   │   │   │                     #   SandboxContextPanel, prospectStatus.ts (status meta/labels)
 │   │   │   │   ├── leads/        # LeadCreateForm, LeadRow, LeadDetailPanel, LeadStatsStrip,
 │   │   │   │   │                 #   leadStatus.ts (retry_state/status meta, ADR-011)
@@ -208,6 +215,7 @@ voiceagent/
 │   │   │   ├── useAgents.ts
 │   │   │   ├── useLlmModels.ts
 │   │   │   ├── usePlatformAgents.ts  # live Retell roster + per-agent {{variables}} + callPlatformAgent (ADR-012)
+│   │   │   ├── useAgentTemplates.ts  # scripts/agent_templates gallery: list + createAgentFromTemplate
 │   │   │   ├── useProspects.ts    # list + stats + research-status polling
 │   │   │   ├── useCityAutocomplete.ts
 │   │   │   ├── useProspectSandbox.ts
@@ -1146,7 +1154,7 @@ files, stop.
 | **Change voice-platform behavior** | the relevant `*_adapter.py` only. If you find yourself importing the Retell or Vapi SDK anywhere else, stop — that's the ADR-002 violation. |
 | **Change the lead retry scheduler** (backoff timing, business hours, success criteria) | `lead_service.py` (`compute_next_attempt`/`within_business_hours`/`evaluate_call_outcome`) → `config.py` if a threshold moves → `tests/test_lead_service.py` → `CONTEXT.md` ADR-011 if the policy itself changes, not just a number |
 | **Add an integration provider or config key** | `integration_config_service.py`'s `SUPPORTED` / `ALLOWED_CONFIG_KEYS` (one line each — no migration; `config` is JSONB) → a `verify_*_credentials` function in `integration_service.py` and a branch in `integration_config_service.verify` → `schemas/integration.py`'s `SECRET_CONFIG_KEYS` if it brings a new secret name → `tests/test_integrations.py`. Do **not** add credentials to `ToolConfig` — see `models/integration.py` for why |
-| **Add an outbound industry vertical** | one entry in `scripts/agent_templates/industries.py` (`qualifying_flow` / `vocabulary` / `extra_objection_rows` / `validated: False`) → add it to the `INDUSTRIES` dict → `uv run python scripts/build_agent_matrix.py --industry <key>`. Nothing else changes: `compose.py` picks it up for every existing style and service automatically. Keep `validated: False` until it has real-call data behind it — `compose.py` renders the unvalidated banner off that flag |
+| **Add an outbound industry vertical** | one entry in `scripts/agent_templates/industries.py` (`qualifying_flow` / `vocabulary` / `extra_objection_rows` / `validated: False`) → add it to the `INDUSTRIES` dict → `uv run python scripts/build_agent_matrix.py --industry <key>`. Nothing else changes: `compose.py` picks it up for every existing style and service automatically, **including the in-app template gallery** (`agent_templates_service.list_templates()` reads `INDUSTRIES` directly, no separate registration). Keep `validated: False` until it has real-call data behind it — `compose.py` renders the unvalidated banner off that flag, and the gallery shows an "Unvalidated" badge off the same one. As of 2026-08-21, `INDUSTRIES` holds only `hvac_solar` (the validated leaf) and `roofing` — `dentist`/`car_rentals` were dropped as redundant cold-call verticals nobody was using; re-add by restoring their dict entries from git history if needed |
 | **Add a one-off diagnostic agent** (not a sales leaf) | its own `scripts/seed_<name>_agent.py` with the prompt inline, mirroring `seed_email_transcription_test_agent.py` — deliberately *outside* the `agent_templates` matrix, since an agent with no hook/qualifying/close would otherwise bend every style and service module around it. `use_custom_llm=True` so it runs the same `retell_ws.py` path as real agents |
 | **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
 | **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. If the change touches `{{placeholders}}`, `_DYNAMIC_VARIABLE_RE` and the missing-value guard in `place_platform_agent_call` move together — a name the UI can't see is a name that gets spoken aloud. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |

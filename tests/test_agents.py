@@ -5,7 +5,7 @@ import uuid
 import pytest
 
 from backend.schemas.agent import AgentCreate
-from backend.services import agent_service
+from backend.services import agent_service, agent_templates_service
 
 
 @pytest.mark.asyncio
@@ -95,6 +95,90 @@ async def test_update_agent_partial(db_session, tenant_id):
 
     assert updated.name == "Renamed"
     assert updated.platform == "retell"  # unchanged fields preserved
+
+
+# --- Agent templates (scripts/agent_templates gallery) ------------------------
+
+
+def test_list_templates_matches_pruned_industries():
+    """hvac_solar + roofing only (dentist/car_rentals were dropped as redundant cold-
+    call verticals) — 2 industries x 3 services x 2 styles = 12 leaves. A regression
+    here usually means industries.py grew or shrank without this test being updated."""
+    templates = agent_templates_service.list_templates()
+
+    assert len(templates) == 12
+    assert {t["industry"] for t in templates} == {"hvac_solar", "roofing"}
+
+
+def test_list_templates_flags_validated_industry():
+    templates = agent_templates_service.list_templates()
+
+    validated = {t["validated"] for t in templates if t["industry"] == "hvac_solar"}
+    unvalidated = {t["validated"] for t in templates if t["industry"] == "roofing"}
+
+    assert validated == {True}
+    assert unvalidated == {False}
+
+
+def test_compose_prompt_rejects_unknown_template():
+    with pytest.raises(agent_templates_service.UnknownTemplateError):
+        agent_templates_service.compose_prompt("short_quick", "ai_automation", "dentist")
+
+
+@pytest.mark.asyncio
+async def test_create_agent_from_template_route(client, db_session, tenant_id, auth_headers):
+    resp = await client.post(
+        "/api/agents/from-template",
+        json={"style": "short_quick", "service": "ai_automation", "industry": "roofing"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert "Roofing" in body["name"]
+    assert body["use_custom_llm"] is True
+    assert "Roofing outbound knowledge base" in body["system_prompt"]
+
+    agents = await agent_service.list_agents(db_session, tenant_id)
+    assert len(agents) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_agent_from_template_honors_name_override(client, auth_headers):
+    resp = await client.post(
+        "/api/agents/from-template",
+        json={
+            "style": "short_quick",
+            "service": "ai_automation",
+            "industry": "roofing",
+            "name": "My Roofing Demo",
+        },
+        headers=auth_headers,
+    )
+
+    assert resp.json()["name"] == "My Roofing Demo"
+
+
+@pytest.mark.asyncio
+async def test_create_agent_from_template_rejects_unknown_industry(client, auth_headers):
+    resp = await client.post(
+        "/api/agents/from-template",
+        json={"style": "short_quick", "service": "ai_automation", "industry": "dentist"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_templates_route_is_not_captured_by_the_uuid_path(client, auth_headers):
+    """GET /api/agents/templates must reach its own handler, not /{agent_id}'s uuid
+    param — same route-ordering trap as /platform above. A 422 from uuid parsing is
+    what regression looks like here."""
+    resp = await client.get("/api/agents/templates", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert len(resp.json()["templates"]) == 12
 
 
 # --- Platform-native agent routes (ADR-012) -----------------------------------

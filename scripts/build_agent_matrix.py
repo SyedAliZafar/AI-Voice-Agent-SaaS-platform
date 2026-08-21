@@ -10,7 +10,7 @@ tools at all.
 Usage:
     uv run python scripts/build_agent_matrix.py                 # every combination
     uv run python scripts/build_agent_matrix.py --style short_quick --service ai_automation
-    uv run python scripts/build_agent_matrix.py --industry dentist --industry car_rentals
+    uv run python scripts/build_agent_matrix.py --industry roofing
 """
 
 import argparse

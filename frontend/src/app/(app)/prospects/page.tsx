@@ -4,6 +4,7 @@ import { Suspense, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { CsvImportButton } from "@/components/features/prospects/CsvImportButton";
+import { ProspectCallDrawer } from "@/components/features/prospects/ProspectCallDrawer";
 import { ProspectFilters } from "@/components/features/prospects/ProspectFilters";
 import { ProspectGroupTree } from "@/components/features/prospects/ProspectGroupTree";
 import { ProspectSearchForm } from "@/components/features/prospects/ProspectSearchForm";
@@ -63,7 +64,11 @@ function ProspectsPageInner() {
   const [query, setQuery] = useState(searchParams.get("q") || "");
   const [location, setLocation] = useState(searchParams.get("where") || "");
 
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  // Which prospect's call drawer is open — looked up against the full `prospects` list
+  // (not `filteredProspects`) so it stays resolvable even if a filter change would have
+  // dropped its row from view while the drawer is up.
+  const [openId, setOpenId] = useState<string | null>(null);
+  const openProspect = prospects.find((p) => p.id === openId) || null;
 
   function persistSearchTerms() {
     setParam("q", query);
@@ -162,12 +167,18 @@ function ProspectsPageInner() {
       ) : (
         <ProspectGroupTree
           groups={grouped}
-          retellAgents={retellAgents}
-          expandedId={expandedId}
-          onToggleExpand={(id) => setExpandedId(expandedId === id ? null : id)}
+          openId={openId}
+          onOpenCall={(id) => setOpenId(openId === id ? null : id)}
           onChanged={() => refetch().catch(() => {})}
         />
       )}
+
+      <ProspectCallDrawer
+        prospect={openProspect}
+        agents={retellAgents}
+        onClose={() => setOpenId(null)}
+        onChanged={() => refetch().catch(() => {})}
+      />
     </div>
   );
 }

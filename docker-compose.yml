@@ -62,6 +62,7 @@ services:
         condition: service_started
     volumes:
       - ./backend:/app/backend
+      - ./scripts:/app/scripts
     # --proxy-headers/--forwarded-allow-ips matter once the tunnel below is running:
     # without them uvicorn sees the tunnel as the client and builds http:// URLs for
     # what is really an https:// request.
@@ -166,6 +167,7 @@ services:
         condition: service_started
     volumes:
       - ./backend:/app/backend
+      - ./scripts:/app/scripts
     command: celery -A backend.workers.celery_app worker --loglevel=info
 
   # Fires the lead retry scheduler (ADR-011: dispatch_due_leads/sweep_stale_leads) on
@@ -184,6 +186,7 @@ services:
         condition: service_started
     volumes:
       - ./backend:/app/backend
+      - ./scripts:/app/scripts
     command: celery -A backend.workers.celery_app beat --loglevel=info
 
 volumes:

@@ -189,6 +189,36 @@ class PlatformAgentCallRequest(BaseModel):
     _validate_to_number = field_validator("to_number")(_validate_e164)
 
 
+class AgentTemplateInfo(BaseModel):
+    """One (style, service, industry) leaf from scripts/agent_templates — a
+    ready-to-use outbound campaign script, not yet an Agent row."""
+
+    style: str
+    service: str
+    industry: str
+    style_label: str
+    service_label: str
+    industry_label: str
+    name: str
+    # Backed by a real call transcript vs. a written-but-untested hypothesis — see
+    # agent_templates_service.list_templates for what this drives in compose.py.
+    validated: bool
+
+
+class AgentTemplatesResponse(BaseModel):
+    templates: list[AgentTemplateInfo]
+
+
+class AgentFromTemplateRequest(BaseModel):
+    style: str
+    service: str
+    industry: str
+    # Overrides the template's generated name (e.g. "Roofing Outbound — AI Automation —
+    # Short Quick v1") — optional because most operators won't bother renaming a demo
+    # agent, but a second agent from the same template needs a distinct name.
+    name: str | None = None
+
+
 class PlatformAgentCallResponse(BaseModel):
     call_id: str
     from_number: str

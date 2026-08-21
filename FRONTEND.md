@@ -110,6 +110,36 @@ Related, still open: those 14 `pending` rows never advance (nothing chains CSV i
 into research — CONTEXT.md ADR-006), so that 4s poll runs *forever* while /prospects is
 open. The poll should be bounded, or the gap closed.
 
+**A second, structural symptom of the same polling had no per-field fix: the call form
+used to live inside the row, and `groupProspects` re-buckets by country/category/city on
+every refetch.** The moment research fills in a prospect's city, its row moves to a
+*different* branch of the tree — a different parent, not a reorder within one — which
+React unmounts and remounts rather than patching. An operator mid-form lost focus and
+scroll position while typing, with no error and no obvious cause. Field-level seeding
+guards (above) can't fix this: the whole subtree is gone, not just re-seeded.
+
+**Rule: a form whose data can outlive its trigger's position in a re-sorting list must
+not be rendered inside that list.** `ProspectCallDrawer` fixes this by rendering as a
+page-level sibling of `ProspectGroupTree`, positioned with `fixed`, driven by a lifted
+`openId` — the background tree can re-group itself freely because the drawer was never
+part of it. `ProspectRow`'s "Call" button only sets `openId` now; it no longer renders
+`ProspectDetailPanel` inline. Reach for this pattern before a field-level effect-guard
+whenever the surrounding list can restructure, not just re-order.
+
+## /agents/new has two creation paths, picked by a URL param
+
+`?mode=custom` (or its absence, `template` is the default) switches between
+`TemplateGallery` — pick an industry/service/style from `scripts/agent_templates`, get an
+Agent immediately, no prompt-writing — and `AgentBuilder`, the freeform Strategist-backed
+wizard. Same pattern as `/agents?source=platform`: state lives in the URL so a tab choice
+survives a refresh and can be linked to, not `useState`.
+
+The gallery composes nothing client-side — it only ever sends the three template keys
+(`style`/`service`/`industry`) to `POST /agents/from-template`; `agent_templates_service`
+on the backend is what reads `scripts/agent_templates` and assembles the full
+`system_prompt`. Keep it that way: mirroring `compose.py`'s logic into the frontend would
+create exactly the drift `lib/types.ts`'s hand-sync note warns about, just one file over.
+
 ## The signed-in identity is mocked in exactly one place
 
 Real auth isn't built (see the auth note at the bottom of this file). Until it is,
