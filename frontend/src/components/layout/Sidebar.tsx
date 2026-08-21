@@ -11,6 +11,7 @@ import {
   ChevronRightIcon,
   DashboardIcon,
   LiveIcon,
+  MicIcon,
   PhoneIcon,
   SettingsIcon,
   TargetIcon,
@@ -32,7 +33,10 @@ const NAV: NavSection[] = [
   { heading: null, items: [{ href: "/dashboard", label: "Dashboard", icon: DashboardIcon }] },
   {
     heading: "Build",
-    items: [{ href: "/agents", label: "Agents", icon: AgentsIcon }],
+    items: [
+      { href: "/agents", label: "Agents", icon: AgentsIcon },
+      { href: "/demo", label: "Demo", icon: MicIcon },
+    ],
   },
   {
     heading: "Who to call",

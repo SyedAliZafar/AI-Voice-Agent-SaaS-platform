@@ -159,14 +159,31 @@ class RetellAdapter(VoicePlatformAdapter):
             resp.raise_for_status()
             return resp.json()["llm_id"]
 
-    async def update_llm(self, llm_external_id: str, system_prompt: str) -> None:
+    async def update_llm(self, llm_external_id: str, system_prompt: str) -> bool:
+        """Push a new prompt to an existing Retell LLM. False when it no longer exists.
+
+        A 404 here is not an error but a cache-invalidation signal: the id came from our
+        own voice_config, and an LLM deleted in Retell's dashboard (or belonging to a
+        rotated API key) leaves that id pointing at nothing, permanently. Raising would
+        brick the agent — every future call 500s on the same dead id with no way back
+        short of hand-editing the database. Returning False lets the caller re-provision,
+        which is the same self-healing move _provision_hosted_llm_agent already makes for
+        a changed webhook_url. Every other status is a real failure and still raises.
+        """
         async with httpx.AsyncClient() as client:
             resp = await client.patch(
                 f"{BASE_URL}/update-retell-llm/{llm_external_id}",
                 headers=self.headers,
                 json={"general_prompt": system_prompt},
             )
+            if resp.status_code == 404:
+                logger.info(
+                    "update_llm: LLM no longer exists on Retell, caller should re-provision",
+                    extra={"llm_external_id": llm_external_id},
+                )
+                return False
             resp.raise_for_status()
+            return True
 
     async def import_twilio_number(
         self,
@@ -329,6 +346,54 @@ class RetellAdapter(VoicePlatformAdapter):
             for item in latest.values()
         ]
 
+    async def get_agent_prompt(self, agent_external_id: str) -> dict[str, Any]:
+        """The script a platform-native agent actually runs on (ADR-012).
+
+        Returns {engine, general_prompt, begin_message, model, knowledge_base_ids}, with
+        the prompt fields empty when there is nothing single-stringed to read: custom-llm
+        agents keep their prompt on whatever server answers the websocket, and
+        conversation-flow agents spread it across nodes. `engine` says which case you got,
+        so a caller can explain the emptiness rather than showing a blank box.
+
+        Never raises for an unreadable prompt, for the same reason
+        get_agent_dynamic_variables doesn't — this reads someone else's template, and not
+        knowing must degrade rather than break the caller.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{BASE_URL}/get-agent/{agent_external_id}", headers=self.headers
+            )
+            resp.raise_for_status()
+            agent = resp.json()
+
+            engine = agent.get("response_engine") or {}
+            engine_type = engine.get("type")
+            llm_id = engine.get("llm_id")
+            if not llm_id:
+                logger.info(
+                    "get_agent_prompt: no retell-llm prompt to read",
+                    extra={"agent_external_id": agent_external_id, "engine": engine_type},
+                )
+                return {
+                    "engine": engine_type,
+                    "general_prompt": "",
+                    "begin_message": "",
+                    "model": None,
+                    "knowledge_base_ids": [],
+                }
+
+            llm_resp = await client.get(f"{BASE_URL}/get-retell-llm/{llm_id}", headers=self.headers)
+            llm_resp.raise_for_status()
+            llm = llm_resp.json()
+
+        return {
+            "engine": engine_type,
+            "general_prompt": llm.get("general_prompt") or "",
+            "begin_message": llm.get("begin_message") or "",
+            "model": llm.get("model"),
+            "knowledge_base_ids": list(llm.get("knowledge_base_ids") or []),
+        }
+
     async def get_agent_dynamic_variables(self, agent_external_id: str) -> list[str]:
         """The `{{placeholder}}` names this agent's prompt declares, sorted.
 
@@ -343,33 +408,11 @@ class RetellAdapter(VoicePlatformAdapter):
         or unreadable prompt returns [] rather than raising: not knowing the placeholders
         must not block a dial that may not need any.
         """
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{BASE_URL}/get-agent/{agent_external_id}", headers=self.headers
-            )
-            resp.raise_for_status()
-            agent = resp.json()
-
-            engine = agent.get("response_engine") or {}
-            llm_id = engine.get("llm_id")
-            if not llm_id:
-                # custom-llm agents keep their prompt on whatever server answers the
-                # websocket, and conversation-flow agents spread it across nodes — in
-                # neither case is there a single prompt string here to scan.
-                logger.info(
-                    "get_agent_dynamic_variables: no retell-llm prompt to scan",
-                    extra={"agent_external_id": agent_external_id, "engine": engine.get("type")},
-                )
-                return []
-
-            llm_resp = await client.get(f"{BASE_URL}/get-retell-llm/{llm_id}", headers=self.headers)
-            llm_resp.raise_for_status()
-            llm = llm_resp.json()
-
+        prompt = await self.get_agent_prompt(agent_external_id)
         # begin_message is scanned too — an opener saying "Hi {{contact_name}}" is
         # precisely where an unfilled placeholder gets read aloud first.
         text = " ".join(
-            part for part in (llm.get("general_prompt"), llm.get("begin_message")) if part
+            part for part in (prompt["general_prompt"], prompt["begin_message"]) if part
         )
         return sorted(set(_DYNAMIC_VARIABLE_RE.findall(text)))
 
@@ -401,6 +444,37 @@ class RetellAdapter(VoicePlatformAdapter):
             )
             resp.raise_for_status()
             return resp.json()["call_id"]
+
+    async def create_web_call(
+        self,
+        agent_external_id: str,
+        dynamic_variables: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Browser-based call — the demo path (no phone number, no Twilio, no tunnel).
+
+        Retell returns a short-lived `access_token` scoped to this one call, which the
+        browser SDK trades for a live mic session directly against Retell. It is not an
+        account credential, which is why it can safely reach the client at all; the
+        Retell API key never leaves this process.
+
+        Deliberately the counterpart to create_outbound_call rather than a flag on it:
+        the two differ in what they need (a from-number vs. nothing), what they cost
+        (telephony minutes vs. nothing), and what they return (an id vs. an id plus a
+        token the caller must hand onward). Folding them together would make every
+        caller re-derive which half applies.
+        """
+        body: dict[str, Any] = {"agent_id": agent_external_id}
+        if dynamic_variables:
+            body["retell_llm_dynamic_variables"] = dynamic_variables
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}/v2/create-web-call", headers=self.headers, json=body
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        return {"call_id": data["call_id"], "access_token": data["access_token"]}
 
     async def assign_phone_number(self, agent_external_id: str, number: str) -> None:
         async with httpx.AsyncClient() as client:

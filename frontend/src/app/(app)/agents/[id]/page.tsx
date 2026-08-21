@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { PromptEditor } from "@/components/features/agents/PromptEditor";
+import { WebCallPanel } from "@/components/features/agents/WebCallPanel";
 import { ArrowLeftIcon, PhoneIcon, SparkleIcon } from "@/components/icons";
 import { Badge, Button, Card, Skeleton, TextInput } from "@/components/ui";
 import { api, getApiErrorMessage } from "@/lib/api";
@@ -250,6 +251,8 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
         </div>
 
         <div className="space-y-6">
+          <WebCallPanel target={{ kind: "local", agentId: agent.id }} agentName={agent.name} />
+
           <Card className="p-5">
             <div className="mb-3 flex items-center gap-2">
               <PhoneIcon width={16} height={16} className="text-brand-600" />

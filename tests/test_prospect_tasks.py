@@ -196,7 +196,7 @@ async def test_sweep_reenqueues_a_prospect_stuck_pending(
 async def test_sweep_reenqueues_a_prospect_stuck_running(
     db_session, tenant_id, monkeypatch, queued_research
 ):
-    """"running" means mark_research_running() fired and then nothing else did — a
+    """ "running" means mark_research_running() fired and then nothing else did — a
     worker that picked up the task and crashed mid-call. Re-running _research() from
     scratch is safe: it only reads name/website/address off the row."""
     prospect = await prospect_service.upsert_from_places(

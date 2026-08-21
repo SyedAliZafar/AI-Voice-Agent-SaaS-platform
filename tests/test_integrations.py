@@ -203,7 +203,7 @@ async def test_test_endpoint_records_success(client, auth_headers):
 
 @pytest.mark.asyncio
 async def test_bad_credentials_are_a_200_with_ok_false(client, auth_headers):
-    """"Your key is wrong" is a successful answer to "is my key right?". Only a missing
+    """ "Your key is wrong" is a successful answer to "is my key right?". Only a missing
     integration is a 4xx."""
     from backend.services.integration_service import IntegrationError
 

@@ -50,6 +50,36 @@ export interface AgentTemplatesResponse {
   templates: AgentTemplate[];
 }
 
+/** A browser call session. `access_token` is call-scoped and short-lived — it is what
+ * the Retell browser SDK trades for a live mic session, NOT the account API key, which
+ * never leaves the backend. There's no from_number: nothing is dialed. */
+export interface WebCallResponse {
+  call_id: string;
+  access_token: string;
+  status: string;
+}
+
+/** One turn as Retell's browser SDK reports it on its `update` event. Note that event
+ * carries the entire conversation each time, not a delta — see useWebCall. */
+export interface WebCallTurn {
+  role: "agent" | "user";
+  content: string;
+}
+
+/** The live script behind a platform-native agent, read from Retell (ADR-012).
+ *
+ * `general_prompt`/`begin_message` are empty when there is no single prompt string to
+ * read — a custom-llm agent keeps it on its own websocket server, a conversation-flow
+ * agent spreads it across nodes. Check `engine` before treating empty as "no prompt". */
+export interface PlatformAgentPrompt {
+  external_agent_id: string;
+  engine: string | null;
+  general_prompt: string;
+  begin_message: string;
+  model: string | null;
+  knowledge_base_ids: string[];
+}
+
 export interface LlmModel {
   id: string;
   label: string;

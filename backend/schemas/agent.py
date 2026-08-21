@@ -143,6 +143,49 @@ class TestCallResponse(BaseModel):
     status: str
 
 
+class WebCallResponse(BaseModel):
+    """A browser call session (no phone number involved).
+
+    `access_token` is a short-lived, call-scoped credential the browser SDK trades for a
+    live mic session against the voice platform — deliberately not the account API key,
+    which never leaves the backend. There is no `from_number` counterpart to
+    TestCallResponse because nothing is dialed.
+    """
+
+    call_id: str
+    access_token: str
+    status: str
+
+
+class PlatformAgentWebCallRequest(BaseModel):
+    """No to_number counterpart to PlatformAgentCallRequest — nothing is dialed."""
+
+    external_agent_id: str
+    platform: str = "retell"
+    dynamic_variables: dict[str, str] | None = None
+
+
+class PlatformAgentWebCallResponse(WebCallResponse):
+    agent_name: str
+
+
+class PlatformAgentPromptResponse(BaseModel):
+    """The live script behind a platform-native agent (ADR-012).
+
+    `general_prompt`/`begin_message` are empty when the agent has no single prompt string
+    to read — a custom-llm agent keeps it on its own websocket server, a conversation-flow
+    agent spreads it across nodes. `engine` names which case, so the UI can say why it's
+    empty instead of showing a blank panel.
+    """
+
+    external_agent_id: str
+    engine: str | None = None
+    general_prompt: str = ""
+    begin_message: str = ""
+    model: str | None = None
+    knowledge_base_ids: list[str] = []
+
+
 class PlatformAgentInfo(BaseModel):
     """One agent as it exists on the voice platform itself (ADR-012).
 

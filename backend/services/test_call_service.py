@@ -125,6 +125,67 @@ async def place_test_call(
     }
 
 
+async def place_web_call(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    system_prompt_override: str | None = None,
+) -> dict:
+    """Open a browser call to `agent` — the demo path, heard through the operator's own
+    speakers instead of a phone.
+
+    Same provisioning as place_test_call (the Retell agent is identical either way); what
+    differs is the dial. No RETELL_FROM_NUMBER is required and no telephony minutes are
+    spent, because the audio runs browser<->Retell directly.
+
+    That makes this the right channel for showing a client their agent: the two ways a
+    demo breaks in the room — no from-number configured, and a quick tunnel that died
+    while still reporting Up — are both absent from this path *provided* the agent uses
+    Retell's hosted LLM. A use_custom_llm agent still routes through our websocket and so
+    still needs a live tunnel; the branch below is inherited from place_test_call rather
+    than special-cased, so that requirement fails fast and loudly here too.
+
+    Returns the `access_token` the browser SDK needs. It is call-scoped and short-lived
+    (not an account credential), which is what makes handing it to the client safe.
+    """
+    agent = await agent_service.get_agent(db, agent_id, tenant_id)
+    if not agent:
+        raise TestCallError("Agent not found")
+
+    if agent.platform != "retell":
+        raise TestCallError(
+            f"Web calls currently support Retell agents only (this agent is '{agent.platform}')"
+        )
+
+    adapter = RetellAdapter()
+
+    if agent.use_custom_llm:
+        agent_external_id = await _provision_custom_llm_agent(db, adapter, agent)
+    else:
+        prompt = system_prompt_override or agent.system_prompt
+        agent_external_id = await _provision_hosted_llm_agent(db, adapter, agent, prompt)
+
+    result = await adapter.create_web_call(agent_external_id=agent_external_id)
+
+    # "web" rather than a number: caller_number is non-nullable and there is no phone
+    # number in this flow. A sentinel keeps the column honest without a migration on the
+    # shared database, and reads unambiguously in the call history next to real numbers.
+    await call_service.create_outbound_call_record(
+        db,
+        agent.tenant_id,
+        agent.id,
+        result["call_id"],
+        "web",
+        system_prompt_override=system_prompt_override if agent.use_custom_llm else None,
+    )
+
+    return {
+        "call_id": result["call_id"],
+        "access_token": result["access_token"],
+        "status": "connecting",
+    }
+
+
 async def list_platform_agents(platform: str = "retell") -> list[dict]:
     """The voice platform's own agent roster (ADR-012) — read-only, live, unprovisioned.
 
@@ -243,6 +304,80 @@ async def place_platform_agent_call(
     }
 
 
+async def get_platform_agent_prompt(external_agent_id: str, platform: str = "retell") -> dict:
+    """The live script behind a platform-native agent (ADR-012), for reading.
+
+    Answers "what does this agent actually say?" for agents built in the platform's own
+    dashboard — the one thing the roster couldn't tell you. Read live rather than cached
+    for the same reason list_platform_agents is: an edit in Retell's dashboard must not
+    leave us showing a stale script before a demo.
+    """
+    adapter = get_adapter(platform)
+    try:
+        return await adapter.get_agent_prompt(external_agent_id)
+    except NotImplementedError as exc:
+        raise TestCallError(f"'{platform}' does not expose agent prompts") from exc
+
+
+async def place_platform_agent_web_call(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    external_agent_id: str,
+    platform: str = "retell",
+    dynamic_variables: dict[str, str] | None = None,
+) -> dict:
+    """Browser call to a platform-native agent (ADR-012 + the web-call path).
+
+    The demo counterpart to place_platform_agent_call: same agent, same roster check and
+    same placeholder enforcement, but heard through the browser instead of dialed. This
+    is what makes a Retell-dashboard agent demoable on a shared screen without opening
+    Retell — and, unlike the phone path, it needs no RETELL_FROM_NUMBER.
+
+    The placeholder check matters more here than anywhere else: an unfilled `{{...}}` is
+    read out loud verbatim, and doing that in front of the client the demo is for is the
+    single worst failure this flow has.
+    """
+    adapter = get_adapter(platform)
+
+    roster = await adapter.list_platform_agents()
+    match = next((a for a in roster if a["external_id"] == external_agent_id), None)
+    if not match:
+        raise TestCallError(
+            f"No agent '{external_agent_id}' on the connected {platform} account. "
+            "It may have been deleted, or belong to a different account."
+        )
+
+    declared = await adapter.get_agent_dynamic_variables(external_agent_id)
+    supplied = {k: v for k, v in (dynamic_variables or {}).items() if str(v).strip()}
+    missing = [name for name in declared if name not in supplied]
+    if missing:
+        raise TestCallError(
+            f"'{match['name']}' needs a value for {', '.join(missing)} — its prompt uses "
+            "{{...}} placeholders, and an empty one gets spoken to the caller verbatim."
+        )
+
+    result = await adapter.create_web_call(
+        agent_external_id=external_agent_id,
+        dynamic_variables={k: str(v) for k, v in supplied.items() if k in declared},
+    )
+
+    await call_service.create_outbound_call_record(
+        db,
+        tenant_id,
+        None,
+        result["call_id"],
+        "web",
+        external_agent_id=external_agent_id,
+    )
+
+    return {
+        "call_id": result["call_id"],
+        "access_token": result["access_token"],
+        "status": "connecting",
+        "agent_name": match["name"],
+    }
+
+
 async def _webhook_url() -> str | None:
     """Where Retell should POST call_started/call_ended/call_analyzed for agents we
     provision. None when there's no public URL — the hosted-LLM path is meant to work
@@ -278,12 +413,22 @@ async def _provision_hosted_llm_agent(
     since-restarted tunnel) would otherwise keep pointing at a dead/absent webhook
     forever and its calls would never leave in_progress. Detecting the mismatch and
     recreating mirrors what _provision_custom_llm_agent does for ws_url.
+
+    The cached ids can also stop existing upstream — an LLM or agent deleted in Retell's
+    dashboard, or left behind by a rotated API key. That used to be fatal and permanent:
+    update_llm raised 404 on the dead id, every call 500'd, and nothing in the flow could
+    ever replace it. Now a missing LLM re-provisions instead (see adapter.update_llm),
+    which also forces a new agent, since a Retell agent's response_engine points at the
+    llm_id it was created with and would otherwise still reference the deleted one.
     """
     retell_ids: dict = dict((agent.voice_config or {}).get("retell") or {})
     webhook_url = await _webhook_url()
 
     if retell_ids.get("llm_id"):
-        await adapter.update_llm(retell_ids["llm_id"], prompt)
+        if not await adapter.update_llm(retell_ids["llm_id"], prompt):
+            retell_ids["llm_id"] = await adapter.create_llm(prompt)
+            # The old agent still names the deleted LLM, so it cannot be reused.
+            retell_ids.pop("agent_id", None)
     else:
         retell_ids["llm_id"] = await adapter.create_llm(prompt)
 

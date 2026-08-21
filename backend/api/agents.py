@@ -22,12 +22,16 @@ from backend.schemas.agent import (
     PlatformAgentCallRequest,
     PlatformAgentCallResponse,
     PlatformAgentInfo,
+    PlatformAgentPromptResponse,
     PlatformAgentsResponse,
     PlatformAgentVariablesResponse,
+    PlatformAgentWebCallRequest,
+    PlatformAgentWebCallResponse,
     SandboxChatRequest,
     SandboxChatResponse,
     TestCallRequest,
     TestCallResponse,
+    WebCallResponse,
 )
 from backend.services import (
     agent_service,
@@ -166,6 +170,53 @@ async def call_platform_agent(
     return result
 
 
+@router.get("/platform/{external_agent_id}/prompt", response_model=PlatformAgentPromptResponse)
+async def get_platform_agent_prompt(
+    external_agent_id: str,
+    platform: str = "retell",
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
+    """What this platform agent actually says (ADR-012).
+
+    The roster shows a name, voice and engine but never the script — so an agent built
+    in Retell's dashboard was previously a black box from here. Read live, so an edit
+    made in Retell is reflected immediately rather than served from a stale copy.
+    """
+    try:
+        prompt = await test_call_service.get_platform_agent_prompt(external_agent_id, platform)
+    except test_call_service.TestCallError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return PlatformAgentPromptResponse(external_agent_id=external_agent_id, **prompt)
+
+
+@router.post("/platform/web-call", response_model=PlatformAgentWebCallResponse)
+async def web_call_platform_agent(
+    payload: PlatformAgentWebCallRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Talk to a platform-native agent in the browser (ADR-012 + the web-call path).
+
+    The demo path for agents built in Retell's own dashboard: no number dialed, no
+    telephony spend, and no RETELL_FROM_NUMBER needed.
+    """
+    try:
+        result = await test_call_service.place_platform_agent_web_call(
+            db,
+            tenant_id,
+            payload.external_agent_id,
+            platform=payload.platform,
+            dynamic_variables=payload.dynamic_variables,
+        )
+    except test_call_service.TestCallError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
+
+
 @router.get("/templates", response_model=AgentTemplatesResponse)
 async def list_agent_templates(
     tenant_id: uuid.UUID = Depends(get_current_tenant),
@@ -275,6 +326,25 @@ async def test_call(
     """
     try:
         result = await test_call_service.place_test_call(db, agent_id, tenant_id, payload.to_number)
+    except test_call_service.TestCallError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
+
+
+@router.post("/{agent_id}/web-call", response_model=WebCallResponse)
+async def web_call(
+    agent_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Talk to the agent through the browser — the demo path.
+
+    No request body, because unlike /test-call there is nothing to dial. Spends no
+    telephony minutes and needs no RETELL_FROM_NUMBER, which is what makes it the
+    channel for showing a client their own agent live.
+    """
+    try:
+        result = await test_call_service.place_web_call(db, agent_id, tenant_id)
     except test_call_service.TestCallError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return result

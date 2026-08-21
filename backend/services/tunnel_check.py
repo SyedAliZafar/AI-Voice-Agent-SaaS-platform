@@ -24,9 +24,7 @@ import httpx
 DEFAULT_TIMEOUT = 5.0
 
 
-async def check_public_url_reachable(
-    base_url: str, timeout: float = DEFAULT_TIMEOUT
-) -> str | None:
+async def check_public_url_reachable(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> str | None:
     """GET {base_url}/health.
 
     Returns None when reachable, else a short human-readable reason suitable for

@@ -44,8 +44,12 @@ class VoicePlatformAdapter(ABC):
         """Provision a platform-hosted LLM from a system prompt. Returns its external ID."""
         raise NotImplementedError(f"{type(self).__name__} does not support create_llm")
 
-    async def update_llm(self, llm_external_id: str, system_prompt: str) -> None:
-        """Push an updated system prompt to an already-provisioned platform LLM."""
+    async def update_llm(self, llm_external_id: str, system_prompt: str) -> bool:
+        """Push an updated system prompt to an already-provisioned platform LLM.
+
+        Returns False when the platform no longer has that LLM, so the caller can
+        re-provision rather than stay pinned to a dead id — see RetellAdapter.update_llm.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not support update_llm")
 
     async def import_twilio_number(
@@ -72,6 +76,30 @@ class VoicePlatformAdapter(ABC):
         (ADR-012). Ignored by platforms without the concept.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support create_outbound_call")
+
+    async def create_web_call(
+        self,
+        agent_external_id: str,
+        dynamic_variables: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Open a browser-based call session. Returns at least {call_id, access_token}.
+
+        The demo channel: audio runs between the viewer's browser and the platform, so
+        there is no phone number, no telephony cost, and — unlike the custom-LLM path —
+        nothing has to be publicly reachable on our side. The access token is a
+        short-lived, call-scoped credential the browser SDK trades for a live mic
+        session; it is not an account key.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support create_web_call")
+
+    async def get_agent_prompt(self, agent_external_id: str) -> dict[str, Any]:
+        """The script a platform-native agent runs on, for inspection (ADR-012).
+
+        Expected keys: engine, general_prompt, begin_message. Prompt fields may be empty
+        when the platform has no single prompt string to report — `engine` tells the
+        caller which case that is.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support get_agent_prompt")
 
     async def get_agent_dynamic_variables(self, agent_external_id: str) -> list[str]:
         """Placeholder names a platform agent's prompt declares, sorted.

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { api } from "@/lib/api";
-import { PlatformAgent } from "@/lib/types";
+import { api, getApiErrorMessage } from "@/lib/api";
+import { PlatformAgent, PlatformAgentPrompt } from "@/lib/types";
 
 interface PlatformAgentsResponse {
   platform: string;
@@ -83,6 +83,45 @@ export function usePlatformAgentVariables(externalAgentId: string | null) {
   }, [externalAgentId]);
 
   return { variables, loading };
+}
+
+/**
+ * The live script behind one platform agent — what it actually says, read straight from
+ * Retell rather than from anything we store.
+ *
+ * Fetched per selected agent for the same reason the variables are: it costs two API
+ * calls, and only the agent being looked at needs them. `general_prompt` comes back empty
+ * for custom-llm and conversation-flow agents, which have no single prompt string to
+ * read; `engine` is returned alongside so the UI can say which case it's in.
+ */
+export function usePlatformAgentPrompt(externalAgentId: string | null) {
+  const [prompt, setPrompt] = useState<PlatformAgentPrompt | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!externalAgentId) {
+      setPrompt(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api
+      .get<PlatformAgentPrompt>(`/agents/platform/${encodeURIComponent(externalAgentId)}/prompt`)
+      .then((res) => !cancelled && setPrompt(res.data))
+      .catch((err) => {
+        if (cancelled) return;
+        setPrompt(null);
+        setError(getApiErrorMessage(err, "Could not read this agent's prompt from Retell."));
+      })
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [externalAgentId]);
+
+  return { prompt, loading, error };
 }
 
 /**

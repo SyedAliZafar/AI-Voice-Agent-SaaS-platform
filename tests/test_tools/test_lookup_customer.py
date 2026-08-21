@@ -8,9 +8,7 @@ from backend.tools.lookup_customer import LookupCustomerTool
 @pytest.mark.asyncio
 async def test_lookup_customer_not_found_by_default():
     tool = LookupCustomerTool()
-    result = await tool.handler(
-        input={"phone_number": "+15551234567"}, caller_context={}
-    )
+    result = await tool.handler(input={"phone_number": "+15551234567"}, caller_context={})
     assert result == {"found": False, "customer": None}
 
 

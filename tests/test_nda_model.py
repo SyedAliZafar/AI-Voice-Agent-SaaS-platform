@@ -108,7 +108,7 @@ async def test_a_later_call_to_the_same_lead_can_get_its_own_nda(db_session, ten
 
 @pytest.mark.asyncio
 async def test_blocked_state_records_agreement_without_an_email(db_session, tenant_id):
-    """"They said yes but we couldn't get an address" has to be visible and fixable, not
+    """ "They said yes but we couldn't get an address" has to be visible and fixable, not
     dropped — Lead.email is nullable and Bark doesn't always supply one."""
     lead, call = await _lead_and_call(db_session, tenant_id)
     dispatch = _dispatch(

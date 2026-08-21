@@ -164,6 +164,172 @@ async def test_place_test_call_reprovisions_when_webhook_url_changes(db_session,
 
 
 @pytest.mark.asyncio
+async def test_place_test_call_reprovisions_when_cached_llm_was_deleted(db_session, tenant_id):
+    """An LLM deleted in Retell's dashboard leaves our cached llm_id pointing at nothing.
+
+    Before update_llm reported that (rather than raising on the 404) this was permanent:
+    every subsequent call 500'd on the same dead id and no code path could replace it.
+    The agent must be recreated too — its response_engine still names the deleted LLM.
+    """
+    agent = await agent_service.create_agent(
+        db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Pitch")
+    )
+    agent.voice_config = {
+        "retell": {
+            "llm_id": "llm_deleted_upstream",
+            "agent_id": "agent_pointing_at_it",
+            "webhook_url": None,
+        }
+    }
+    await db_session.commit()
+
+    mock_adapter = AsyncMock()
+    mock_adapter.update_llm.return_value = False  # Retell 404 — it's gone
+    mock_adapter.create_llm.return_value = "llm_fresh"
+    mock_adapter.create_agent_with_llm.return_value = "agent_fresh"
+    mock_adapter.create_outbound_call.return_value = "call_1"
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = ""
+
+        await test_call_service.place_test_call(db_session, agent.id, tenant_id, "+491701234567")
+
+    mock_adapter.create_llm.assert_awaited_once_with("Pitch")
+    mock_adapter.create_agent_with_llm.assert_awaited_once_with(
+        name="SDR",
+        llm_id="llm_fresh",
+        voice_id="11labs-Adrian",
+        webhook_url=None,
+    )
+    mock_adapter.create_outbound_call.assert_awaited_once_with(
+        from_number="+15551234567", to_number="+491701234567", agent_external_id="agent_fresh"
+    )
+
+    await db_session.refresh(agent)
+    assert agent.voice_config["retell"]["llm_id"] == "llm_fresh"
+    assert agent.voice_config["retell"]["agent_id"] == "agent_fresh"
+
+
+@pytest.mark.asyncio
+async def test_place_web_call_needs_no_from_number(db_session, tenant_id):
+    """The demo path: no phone number is dialed, so RETELL_FROM_NUMBER is irrelevant.
+
+    place_test_call raises without it; this must not, or a demo would depend on
+    telephony config it never uses.
+    """
+    agent = await agent_service.create_agent(
+        db_session,
+        tenant_id,
+        AgentCreate(name="Receptionist", platform="retell", system_prompt="Hi"),
+    )
+
+    mock_adapter = AsyncMock()
+    mock_adapter.create_llm.return_value = "llm_1"
+    mock_adapter.create_agent_with_llm.return_value = "agent_1"
+    mock_adapter.create_web_call.return_value = {
+        "call_id": "call_web_1",
+        "access_token": "tok_abc",
+    }
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.RetellAdapter", return_value=mock_adapter),
+    ):
+        mock_settings.retell_from_number = ""  # deliberately unset
+        mock_settings.retell_default_voice_id = "11labs-Adrian"
+        mock_settings.public_base_url = ""
+
+        result = await test_call_service.place_web_call(db_session, agent.id, tenant_id)
+
+    assert result["access_token"] == "tok_abc"
+    assert result["call_id"] == "call_web_1"
+    mock_adapter.create_web_call.assert_awaited_once_with(agent_external_id="agent_1")
+    # No phone call was placed on the web path.
+    mock_adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_web_call_blocks_unfilled_placeholders(db_session, tenant_id):
+    """An unfilled {{placeholder}} is read out loud verbatim. On the demo path that means
+    saying it to the client the demo is for, so the call must be refused, not attempted.
+    """
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext", "name": "Marissa"}
+    ]
+    mock_adapter.get_agent_dynamic_variables.return_value = ["company_name", "contact_name"]
+
+    with patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter):
+        with pytest.raises(test_call_service.TestCallError, match="contact_name"):
+            await test_call_service.place_platform_agent_web_call(
+                db_session,
+                tenant_id,
+                "agent_ext",
+                dynamic_variables={"company_name": "Acme"},
+            )
+
+    mock_adapter.create_web_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_web_call_sends_only_declared_variables(db_session, tenant_id):
+    """Extras are harmless to Retell but make the audit trail read as though the agent
+    used data it never saw — so only what the prompt declares is sent.
+    """
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_ext", "name": "Marissa"}
+    ]
+    mock_adapter.get_agent_dynamic_variables.return_value = ["company_name"]
+    mock_adapter.create_web_call.return_value = {
+        "call_id": "call_web_9",
+        "access_token": "tok_xyz",
+    }
+
+    with patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter):
+        result = await test_call_service.place_platform_agent_web_call(
+            db_session,
+            tenant_id,
+            "agent_ext",
+            dynamic_variables={"company_name": "Acme", "not_in_prompt": "ignored"},
+        )
+
+    assert result["agent_name"] == "Marissa"
+    assert result["access_token"] == "tok_xyz"
+    mock_adapter.create_web_call.assert_awaited_once_with(
+        agent_external_id="agent_ext",
+        dynamic_variables={"company_name": "Acme"},
+    )
+
+    # Recorded against the platform agent, with no local agent_id (ADR-012).
+    calls = await call_service.list_calls(db_session, tenant_id, None, None, 50, 0)
+    assert calls[0].external_agent_id == "agent_ext"
+    assert calls[0].agent_id is None
+    assert calls[0].caller_number == "web"
+
+
+@pytest.mark.asyncio
+async def test_place_platform_agent_web_call_rejects_unknown_agent(db_session, tenant_id):
+    mock_adapter = AsyncMock()
+    mock_adapter.list_platform_agents.return_value = [
+        {"external_id": "agent_other", "name": "Someone else"}
+    ]
+
+    with patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter):
+        with pytest.raises(test_call_service.TestCallError, match="No agent 'agent_ext'"):
+            await test_call_service.place_platform_agent_web_call(
+                db_session, tenant_id, "agent_ext"
+            )
+
+    mock_adapter.create_web_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_place_test_call_reuses_cached_ids_and_updates_prompt(db_session, tenant_id):
     agent = await agent_service.create_agent(
         db_session, tenant_id, AgentCreate(name="SDR", platform="retell", system_prompt="Pitch v2")
