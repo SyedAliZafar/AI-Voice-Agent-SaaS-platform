@@ -35,6 +35,16 @@ function canonicalKey(name: string): string | null {
 }
 
 /**
+ * Variables the operator may leave blank without blocking the call. The owner/contact
+ * name is usually unknown at dial time, and the platform script asks for it live anyway
+ * (ADR-012) — forcing a value here just means a junk name gets spoken. Everything else
+ * a prompt declares stays required.
+ */
+export function isOptionalProspectVariable(name: string): boolean {
+  return canonicalKey(name) === "contactname";
+}
+
+/**
  * Fill what we can for a prospect call. `current_time` is included because Retell's own
  * dashboard lists it as operator-supplied rather than auto-injecting it, and an agent
  * that asks the time should not be told "{{current_time}}".

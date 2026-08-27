@@ -1,33 +1,20 @@
 """Lead retry scheduler (ADR-011) — a Celery Beat task, not event-driven, since a
 retry fires on a clock (backoff/business-hours), not in response to anything.
 
-Follows the sync-entry-point/async-impl + _run_sync split established in
-prospect_tasks.py — see that module's docstring for why _run_sync exists.
+Sync entry point / async impl split: the task body just hands its coroutine to
+async_bridge.run_sync — see that module for why a shared per-process loop is required.
 """
 
-import asyncio
-from collections.abc import Coroutine
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal
 from backend.services import call_service, lead_service
 from backend.services.retell_adapter import RetellAdapter
+from backend.workers.async_bridge import run_sync as _run_sync
 from backend.workers.celery_app import celery_app
 
 settings = get_settings()
-
-
-def _run_sync(coro: Coroutine[Any, Any, None]) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(coro)
-        return
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(asyncio.run, coro).result()
 
 
 @celery_app.task(name="dispatch_due_leads")

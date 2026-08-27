@@ -93,8 +93,13 @@ export function useWebCall(target: WebCallTarget | null) {
     setStatus("connecting");
     setError(null);
     setTurns([]);
+
+    // Split so a backend failure (DB down, agent not found, ...) and a rejected mic
+    // permission — which surfaces from client.startCall's rejection, not an SDK "error"
+    // event — get distinct messages instead of both falling back to the mic-permission text.
+    let res: { data: WebCallResponse };
     try {
-      const res =
+      res =
         target.kind === "local"
           ? await api.post<WebCallResponse>(`/agents/${target.agentId}/web-call`)
           : await api.post<WebCallResponse>("/agents/platform/web-call", {
@@ -102,10 +107,16 @@ export function useWebCall(target: WebCallTarget | null) {
               platform: target.platform ?? "retell",
               dynamic_variables: target.dynamicVariables,
             });
-      setCallId(res.data.call_id);
+    } catch (err) {
+      setError(getApiErrorMessage(err, "Could not reach the server. Try again in a moment."));
+      setStatus("error");
+      return;
+    }
+
+    setCallId(res.data.call_id);
+    try {
       await client.startCall({ accessToken: res.data.access_token });
     } catch (err) {
-      // A rejected mic permission surfaces here too, not as an SDK "error" event.
       setError(
         getApiErrorMessage(err, "Could not start the call. Allow microphone access and retry."),
       );

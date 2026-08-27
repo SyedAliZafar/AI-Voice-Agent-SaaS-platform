@@ -6,7 +6,7 @@ import { DynamicVariableFields } from "@/components/features/agents/DynamicVaria
 import { Button, TextInput } from "@/components/ui";
 import { usePlatformAgents, usePlatformAgentVariables } from "@/hooks/usePlatformAgents";
 import { api, getApiErrorMessage } from "@/lib/api";
-import { suggestProspectVariables } from "@/lib/dynamicVariables";
+import { isOptionalProspectVariable, suggestProspectVariables } from "@/lib/dynamicVariables";
 import { Agent, Prospect } from "@/lib/types";
 
 /** The picker holds two kinds of agent that are NOT interchangeable, so the value
@@ -87,7 +87,11 @@ export function ProspectDetailPanel({
     setVarValues(variables.length ? suggestProspectVariables(variables, prospect) : {});
   }, [seedKey, variables, prospect]);
 
-  const missingVars = variables.filter((v) => !varValues[v]?.trim());
+  // Optional placeholders (the contact name — see dynamicVariables) never block the call.
+  const optionalVars = variables.filter(isOptionalProspectVariable);
+  const missingVars = variables.filter(
+    (v) => !varValues[v]?.trim() && !isOptionalProspectVariable(v),
+  );
 
   async function saveNotes() {
     setSavingNotes(true);
@@ -242,6 +246,7 @@ export function ProspectDetailPanel({
           <DynamicVariableFields
             variables={variables}
             values={varValues}
+            optionalVariables={optionalVars}
             onChange={(name, value) => setVarValues((v) => ({ ...v, [name]: value }))}
           />
           {missingVars.length > 0 && (

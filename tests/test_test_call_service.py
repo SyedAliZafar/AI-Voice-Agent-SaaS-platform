@@ -262,10 +262,10 @@ async def test_place_platform_agent_web_call_blocks_unfilled_placeholders(db_ses
     mock_adapter.list_platform_agents.return_value = [
         {"external_id": "agent_ext", "name": "Marissa"}
     ]
-    mock_adapter.get_agent_dynamic_variables.return_value = ["company_name", "contact_name"]
+    mock_adapter.get_agent_dynamic_variables.return_value = ["company_name", "service_area"]
 
     with patch("backend.services.test_call_service.get_adapter", return_value=mock_adapter):
-        with pytest.raises(test_call_service.TestCallError, match="contact_name"):
+        with pytest.raises(test_call_service.TestCallError, match="service_area"):
             await test_call_service.place_platform_agent_web_call(
                 db_session,
                 tenant_id,
@@ -1354,14 +1354,14 @@ async def test_platform_call_sends_declared_variables(db_session, tenant_id):
 async def test_platform_call_refuses_to_dial_with_an_unfilled_placeholder(db_session, tenant_id):
     """Retell leaves an unsupplied {{placeholder}} literal in the prompt and the agent
     reads it aloud. Blocking beats spending a real call on that."""
-    adapter = _platform_adapter(["company_name", "contact_name"])
+    adapter = _platform_adapter(["company_name", "service_area"])
 
     with (
         patch("backend.services.test_call_service.settings") as mock_settings,
         patch("backend.services.test_call_service.get_adapter", return_value=adapter),
     ):
         mock_settings.retell_from_number = "+15551234567"
-        with pytest.raises(test_call_service.TestCallError, match="contact_name"):
+        with pytest.raises(test_call_service.TestCallError, match="service_area"):
             await test_call_service.place_platform_agent_call(
                 db_session,
                 tenant_id,
@@ -1371,6 +1371,32 @@ async def test_platform_call_refuses_to_dial_with_an_unfilled_placeholder(db_ses
             )
 
     adapter.create_outbound_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_call_treats_the_contact_name_as_optional(db_session, tenant_id):
+    """The contact/owner name is usually unknown at dial time and the script asks for it
+    live, so a blank one must not block the call. It's still sent, as "", so Retell
+    substitutes nothing rather than leaving the literal {{contact_name}}."""
+    adapter = _platform_adapter(["company_name", "contact_name"])
+
+    with (
+        patch("backend.services.test_call_service.settings") as mock_settings,
+        patch("backend.services.test_call_service.get_adapter", return_value=adapter),
+    ):
+        mock_settings.retell_from_number = "+15551234567"
+        await test_call_service.place_platform_agent_call(
+            db_session,
+            tenant_id,
+            "agent_ext_9",
+            "+491701234567",
+            dynamic_variables={"company_name": "Bristol Dental"},
+        )
+
+    assert adapter.create_outbound_call.await_args.kwargs["dynamic_variables"] == {
+        "company_name": "Bristol Dental",
+        "contact_name": "",
+    }
 
 
 @pytest.mark.asyncio

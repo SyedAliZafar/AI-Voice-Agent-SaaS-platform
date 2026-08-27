@@ -14,10 +14,13 @@ import { TextInput } from "@/components/ui";
 export function DynamicVariableFields({
   variables,
   values,
+  optionalVariables = [],
   onChange,
 }: {
   variables: string[];
   values: Record<string, string>;
+  /** Placeholders the operator may leave blank — shown without the amber "required" cue. */
+  optionalVariables?: string[];
   onChange: (name: string, value: string) => void;
 }) {
   if (variables.length === 0) return null;
@@ -32,23 +35,29 @@ export function DynamicVariableFields({
         written if left blank.
       </p>
       <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        {variables.map((name) => (
-          <div key={name}>
-            <label
-              htmlFor={`var-${name}`}
-              className="mb-1 block font-mono text-xs text-slate-600"
-            >
-              {`{{${name}}}`}
-            </label>
-            <TextInput
-              id={`var-${name}`}
-              value={values[name] ?? ""}
-              onChange={(e) => onChange(name, e.target.value)}
-              placeholder="Required"
-              className={values[name]?.trim() ? undefined : "border-amber-300"}
-            />
-          </div>
-        ))}
+        {variables.map((name) => {
+          const optional = optionalVariables.includes(name);
+          return (
+            <div key={name}>
+              <label
+                htmlFor={`var-${name}`}
+                className="mb-1 block font-mono text-xs text-slate-600"
+              >
+                {`{{${name}}}`}
+                {optional && <span className="ml-1 font-sans text-slate-400">optional</span>}
+              </label>
+              <TextInput
+                id={`var-${name}`}
+                value={values[name] ?? ""}
+                onChange={(e) => onChange(name, e.target.value)}
+                placeholder={optional ? "Optional — the agent asks on the call" : "Required"}
+                className={
+                  optional || values[name]?.trim() ? undefined : "border-amber-300"
+                }
+              />
+            </div>
+          );
+        })}
       </div>
     </div>
   );

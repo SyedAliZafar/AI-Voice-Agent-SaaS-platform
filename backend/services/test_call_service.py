@@ -23,6 +23,7 @@ functions above answer yes while that one answers no.
 ADR-002: all Retell HTTP stays behind the adapter; this service only orchestrates.
 """
 
+import re
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +44,47 @@ _NOT_SET = object()
 
 class TestCallError(Exception):
     """Raised for operator-actionable failures (missing from-number, etc)."""
+
+
+# Placeholders a dashboard prompt may declare that the operator is allowed to leave
+# blank. The contact/owner name is usually unknown when a call is queued, and a
+# well-built script asks for it live — so blocking the dial on it just forces a junk
+# value. Kept in sync with the frontend's isOptionalProspectVariable
+# (frontend/src/lib/dynamicVariables.ts). Match is case- and separator-insensitive.
+_OPTIONAL_VARIABLE_NAMES = frozenset(
+    {"contactname", "contact", "name", "firstname", "ownername", "customername"}
+)
+
+
+def _is_optional_variable(name: str) -> bool:
+    return re.sub(r"[^a-z0-9]", "", name.lower()) in _OPTIONAL_VARIABLE_NAMES
+
+
+def _resolve_call_variables(
+    declared: list[str], agent_name: str, supplied: dict[str, str] | None
+) -> dict[str, str]:
+    """Map the operator-supplied values onto the {{placeholders}} the prompt declares.
+
+    An unfilled placeholder is not a silent no-op: Retell leaves the literal
+    "{{company_name}}" in the prompt and the agent reads it aloud to a real prospect.
+    So every *required* name the prompt declares must arrive with a non-blank value —
+    a whitespace-only box counts as blank. Optional names (the contact name) that were
+    left blank are still sent, as "", so Retell substitutes nothing rather than leaving
+    the literal placeholder. Only declared names are sent: extras would make the
+    CallEvent audit trail read as though the agent used data it never saw.
+    """
+    have = {k: str(v) for k, v in (supplied or {}).items() if str(v).strip()}
+    missing = [name for name in declared if name not in have and not _is_optional_variable(name)]
+    if missing:
+        raise TestCallError(
+            f"'{agent_name}' needs a value for {', '.join(missing)} — its prompt uses "
+            "{{...}} placeholders, and an empty one gets spoken to the caller verbatim."
+        )
+    resolved = {k: v for k, v in have.items() if k in declared}
+    for name in declared:
+        if name not in resolved and _is_optional_variable(name):
+            resolved[name] = ""
+    return resolved
 
 
 async def place_test_call(
@@ -264,27 +306,14 @@ async def place_platform_agent_call(
             "It may have been deleted, or belong to a different account."
         )
 
-    # An unfilled placeholder is not a silent no-op: Retell leaves the literal
-    # "{{company_name}}" in the prompt, and the agent reads it out loud to a real
-    # prospect. Blocking the dial is strictly better than spending a call on that, so
-    # every name the prompt declares must arrive with a non-blank value.
     declared = await adapter.get_agent_dynamic_variables(external_agent_id)
-    supplied = {k: v for k, v in (dynamic_variables or {}).items() if str(v).strip()}
-    missing = [name for name in declared if name not in supplied]
-    if missing:
-        raise TestCallError(
-            f"'{match['name']}' needs a value for {', '.join(missing)} — its prompt uses "
-            "{{...}} placeholders, and an empty one gets spoken to the caller verbatim."
-        )
+    call_variables = _resolve_call_variables(declared, match["name"], dynamic_variables)
 
     call_id = await adapter.create_outbound_call(
         from_number=settings.retell_from_number,
         to_number=to_number,
         agent_external_id=external_agent_id,
-        # Only what the prompt actually asks for. Sending extras is harmless to Retell,
-        # but it makes the CallEvent audit trail read as though the agent used data it
-        # never saw.
-        dynamic_variables={k: str(v) for k, v in supplied.items() if k in declared},
+        dynamic_variables=call_variables,
     )
 
     await call_service.create_outbound_call_record(
@@ -348,17 +377,11 @@ async def place_platform_agent_web_call(
         )
 
     declared = await adapter.get_agent_dynamic_variables(external_agent_id)
-    supplied = {k: v for k, v in (dynamic_variables or {}).items() if str(v).strip()}
-    missing = [name for name in declared if name not in supplied]
-    if missing:
-        raise TestCallError(
-            f"'{match['name']}' needs a value for {', '.join(missing)} — its prompt uses "
-            "{{...}} placeholders, and an empty one gets spoken to the caller verbatim."
-        )
+    call_variables = _resolve_call_variables(declared, match["name"], dynamic_variables)
 
     result = await adapter.create_web_call(
         agent_external_id=external_agent_id,
-        dynamic_variables={k: str(v) for k, v in supplied.items() if k in declared},
+        dynamic_variables=call_variables,
     )
 
     await call_service.create_outbound_call_record(

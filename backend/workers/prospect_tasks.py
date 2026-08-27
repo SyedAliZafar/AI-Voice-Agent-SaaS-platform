@@ -16,42 +16,25 @@ Redis reachable, its queue empty, so the enqueued tasks were lost rather than wa
 Mirrors lead_tasks.sweep_stale_leads (ADR-011), same shape: a Celery Beat tick re-drives
 anything a chain should have already caught.
 
-Note on _run_sync: with CELERY_TASK_ALWAYS_EAGER=true (the solo-dev mode from RUN.md),
-.delay() executes the task body immediately, in-process. If that call originates from an
-async FastAPI route (api/prospects.py does exactly this), we're already inside a running
-event loop, and plain asyncio.run() would raise "cannot be called from a running event
-loop". _run_sync runs the coroutine on a dedicated thread with its own loop when that
-happens, and falls back to a plain asyncio.run() in a real worker process (no loop
-running there). This is a real hazard, not a hypothetical — flagged because the identical
-asyncio.run(_process(...)) pattern in transcript_tasks.py has the same latent issue.
+Note on _run_sync: the task body hands its coroutine to async_bridge.run_sync, which
+runs it on one long-lived event loop per worker process. A fresh asyncio.run() per task
+closes its loop on return and leaves SQLAlchemy's asyncpg pool holding connections bound
+to a dead loop — see async_bridge for the full write-up. It also transparently handles
+CELERY_TASK_ALWAYS_EAGER (RUN.md's solo-dev mode), where .delay() runs the task body
+synchronously from inside the async FastAPI route in api/prospects.py.
 """
 
-import asyncio
 import uuid
-from collections.abc import Coroutine
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal
 from backend.schemas.prospect import CompanyResearch
 from backend.services import places_service, prospect_service, research_service
+from backend.workers.async_bridge import run_sync as _run_sync
 from backend.workers.celery_app import celery_app
 
 settings = get_settings()
-
-
-def _run_sync(coro: Coroutine[Any, Any, None]) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(coro)
-        return
-    # A loop is already running on this thread (eager-mode call from an async route) —
-    # run the coroutine to completion on a separate thread instead.
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(asyncio.run, coro).result()
 
 
 @celery_app.task(name="discover_prospects")
