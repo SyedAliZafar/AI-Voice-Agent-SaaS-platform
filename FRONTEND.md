@@ -38,7 +38,7 @@ frontend/src/
 │   └── features/             # domain components, grouped by resource
 │       ├── agents/           #   AgentCard, AgentBuilder, Stepper, PromptEditor
 │       ├── calls/            #   CallTable, TranscriptViewer, LiveCallPanel
-│       ├── prospects/        #   Search/filter/group tree/detail panel + sandbox chat
+│       ├── prospects/        #   Search/section-tabs/filter/group tree/detail panel + sandbox chat + sync-calls
 │       ├── leads/            #   Create form/row/detail panel + stats (ADR-011)
 │       ├── dashboard/        #   SetupChecklist, RetellStatus, SyncNotice
 │       └── marketing/        #   landing page sections (Hero, Pricing, …)

@@ -87,7 +87,7 @@ voiceagent/
 │   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012); GET /templates + POST /from-template for the scripts/agent_templates gallery
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
-│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/batch-call/export/sandbox-chat/city-autocomplete. /call + /batch-call take agent_id OR external_agent_id — only the former personalizes (ADR-012)
+│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list(?status=)/stats/research/status/call/batch-call/sync-calls/export/sandbox-chat/city-autocomplete. /call + /batch-call take agent_id OR external_agent_id — only the former personalizes (ADR-012). /sync-calls backfills the platform's own call history into the ledger
 │   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
 │   │   ├── integrations.py       # Connect a tenant's CRM: GET/PUT/DELETE /{kind} + POST /{kind}/test — the repo's first credential CRUD surface
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
@@ -115,7 +115,7 @@ voiceagent/
 │   │   ├── places_service.py     # Google Places search, city/country extraction, autocomplete — prospecting Agent 1, discovery (ADR-006)
 │   │   ├── research_service.py   # Company research — prospecting Agent 2, knowledge base (ADR-006)
 │   │   ├── script_service.py     # Call-script generation for prospects AND leads (build_prospect_prompt / build_lead_prompt)
-│   │   ├── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking (ADR-006)
+│   │   ├── prospect_service.py   # Prospect CRUD, upsert-from-places, priority ranking, phone_match_key + call-outcome ladder (ADR-006)
 │   │   └── lead_service.py       # Lead CRUD, retry/backoff state machine, dispatch, outcome evaluation (ADR-011)
 │   │
 │   ├── tools/                    # LLM function-calling tool definitions
@@ -197,11 +197,13 @@ voiceagent/
 │   │   │   │                 #   scripts/agent_templates — /agents/new's "Use a template" tab)
 │   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
 │   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
-│   │   │   │                     #   ProspectStatsStrip, ProspectGroupTree, ProspectRow,
+│   │   │   │                     #   ProspectSectionTabs (URL param `section`, client-side
+│   │   │   │                     #   filter on Prospect.status), ProspectStatsStrip,
+│   │   │   │                     #   ProspectGroupTree, ProspectRow (+ call-history line),
 │   │   │   │                     #   ProspectDetailPanel, ProspectCallDrawer (fixed right-side
 │   │   │   │                     #   panel — the call form; NOT rendered inside the tree, see
-│   │   │   │                     #   its docstring), CsvImportButton, SandboxChat,
-│   │   │   │                     #   SandboxContextPanel, prospectStatus.ts (status meta/labels)
+│   │   │   │                     #   its docstring), CsvImportButton, SyncCallsButton,
+│   │   │   │                     #   SandboxChat, SandboxContextPanel, prospectStatus.ts
 │   │   │   │   ├── leads/        # LeadCreateForm, LeadRow, LeadDetailPanel, LeadStatsStrip,
 │   │   │   │   │                 #   leadStatus.ts (retry_state/status meta, ADR-011)
 │   │   │   │   ├── dashboard/    # SetupChecklist (first-run steps, derived from live data),
@@ -355,6 +357,17 @@ state; `POST /api/calls/sync` runs it across every still-`in_progress` call for 
 tenant. Both the webhook path and the reconcile path write through **one** function,
 `apply_retell_call_state()` — if they were separate writers they could disagree about
 the same call's outcome.
+
+A third path, `call_service.backfill_from_platform()` (`POST /api/prospects/sync-calls`),
+pulls the platform's *entire* call history (`retell_adapter.list_call_history`, paginated
+`/v2/list-calls`) and upserts a `Call` row per entry keyed on `external_id`. It's the
+only path that can see a call this backend never placed — a batch run started from
+Retell's dashboard (ADR-012) creates no local row and fires webhooks at whatever tunnel
+URL was registered that day. Each call is matched to a prospect by
+`prospect_service.phone_match_key` (last 10 digits, so E.164 `+442077335265` and national
+`020 7733 5265` collide), still written through `apply_retell_call_state`, and afterward
+`resync_prospects_from_calls` recomputes each touched prospect's `call_count` /
+`last_called_at` / `status` from its full set of `Call` rows. Idempotent — re-run freely.
 
 **Hanging up a live call** (`call_service.end_call`, `POST /api/calls/{id}/end`,
 `scripts/kill_calls.py`) follows the same rule: it tells Retell to stop the call, then
@@ -843,15 +856,32 @@ no_answer | do_not_call`), the operator-set campaign-outcome axis behind the
 **not** auto-synced with it: `record_call()` (at dispatch) advances only
 `outreach_status`, and setting one via `PATCH /api/prospects/{id}` never moves the other.
 
-`status` *is* now advanced automatically too, but by a different trigger and only
-forward: `prospect_service.classify_call_outcome()`, called from
-`call_service._fanout_post_call` once a prospect's call reaches a terminal state (the
-same seam `lead_service.evaluate_call_outcome` hangs off — ADR-011). It walks
-`not_called → no_answer → called → flagged` off `Call.disconnection_reason` /
-`Call.answered_by_human` / sentiment, never downgrades, and never touches a row an
-operator has set to `booked` / `flagged` / `do_not_call`. "Rejected" = a human actually
-spoke *and* post-call sentiment was negative; a sharper transcript-based signal can
-replace the sentiment check without moving the seam.
+`status` *is* now advanced automatically too, off a call's terminal state. The per-call
+verdict lives in one pure function, `prospect_service.outcome_status_for_call()`, and
+two callers consume it:
+
+- `classify_call_outcome()` — from `call_service._fanout_post_call` once a prospect's
+  call reaches terminal state (same seam `lead_service.evaluate_call_outcome` hangs off,
+  ADR-011). **Forward-only** along `not_called → no_answer → voicemail → called →
+  flagged` (`_OUTCOME_STATUS_ORDER`), because it sees one call and can be handed a
+  partial view of it.
+- `resync_status_from_calls()` — from `call_service.resync_prospects_from_calls`, the
+  settle-up step after a platform backfill. Takes a prospect's **entire** call history
+  and sets status to the *best* outcome across all attempts. Deliberately **not**
+  forward-only: with every call in hand there's no ordering to protect, so it can move a
+  status back down — which is what repaired every prospect the per-call path
+  misclassified before the `voicemail` rung existed.
+
+`voicemail` sits above `no_answer` (line's live, machine picked up) and is checked
+*before* `answered_by_human` — an answering-machine greeting transcribes as a caller
+turn, so `answered_by_human` is True for voicemails and testing it first put a whole
+campaign of voicemails in `called`. `Call.disconnection_reason ∈ {voicemail_reached,
+machine_detected}` is Retell's own machine-detection verdict and is authoritative.
+"Rejected" (→ `flagged`) = a human actually spoke *and* post-call sentiment was negative.
+
+`lead_service.evaluate_call_outcome` is **not** affected by that voicemail subtlety: it
+gates success on `Call.status ∈ {resolved, escalated}`, and `voicemail_reached` maps to
+`failed` via `_FAILURE_REASONS` — so a voicemail is already a failed attempt there.
 
 Adding a parallel column was chosen over widening `outreach_status`'s value set
 because the latter is load-bearing for step 3 above (`record_call`'s auto-transition),
@@ -1176,8 +1206,10 @@ files, stop.
 | **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. If the change touches `{{placeholders}}`, `_DYNAMIC_VARIABLE_RE` and the missing-value guard in `place_platform_agent_call` move together — a name the UI can't see is a name that gets spoken aloud. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
 | **Offer the platform-agent source on another dial surface** | the surface's request schema (exactly-one-of validator, mirroring `ProspectCallRequest`) → its router, branching to `place_platform_agent_call` *before* any personalization work → the UI picker, and **say in the UI what the platform agent won't receive** — silently dropping a personalized prompt is the failure mode this pattern exists to prevent → its router test, asserting the personalized path was NOT taken |
 | **Add work that must happen when a call ends** (lead or prospect) | `call_service._fanout_post_call` — branch on `Call.lead_id` / `Call.prospect_id`; keep it to a few local queries or enqueue to Celery (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
-| **Change how a prospect call's outcome maps to `Prospect.status`** | `prospect_service.classify_call_outcome` (+ `_OUTCOME_STATUS_ORDER` if the ladder changes) → `call_service.apply_retell_call_state` if it needs a new `Call` field off Retell's payload → `tests/test_prospect_service.py` → this ADR-006 note if the axis semantics move |
+| **Change how a prospect call's outcome maps to `Prospect.status`** | `prospect_service.outcome_status_for_call` (the pure per-call verdict) → `_OUTCOME_STATUS_ORDER` if the ladder changes → both consumers get it for free: `classify_call_outcome` (single call, forward-only) and `resync_status_from_calls` (whole history, may move status *down*) → `call_service.apply_retell_call_state` if it needs a new `Call` field off Retell's payload → `tests/test_prospect_service.py` |
+| **Reconcile the platform's call history into the prospect ledger** | `retell_adapter.list_call_history` (paginated `/v2/list-calls`) → `call_service.backfill_from_platform` (match by `prospect_service.phone_match_key`, then `resync_prospects_from_calls`) → `POST /api/prospects/sync-calls` (above `/{prospect_id}`) → frontend `SyncCallsButton` → `tests/test_call_service.py`. This is the *only* path that sees a call this backend never placed (ADR-012 dashboard runs) |
 | **Add a batch/bulk outbound action or a prospect CSV export** | `prospect_service` (`batch_call_targets` / `export_csv` — pure query + serialize) → `api/prospects.py`, declared *above* `/{prospect_id}` so the literal path wins → `schemas/prospect.py` → `tests/test_prospects.py` |
+| **Dedupe or match phone numbers** | `prospect_service.phone_match_key` (last 10 digits — bridges E.164 vs national trunk-prefix). Use it for dedupe/matching; `normalize_phone` is validation/storage only. Backfill of pre-existing dupes: `scripts/merge_duplicate_prospects.py` |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
 do real work inline in a webhook handler (ADR-005). See [EFFICIENCY.md](EFFICIENCY.md)

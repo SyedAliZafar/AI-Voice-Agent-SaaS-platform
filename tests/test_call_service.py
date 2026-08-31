@@ -193,6 +193,101 @@ class _StubAdapter:
         self.stopped.append(call_external_id)
 
 
+class _HistoryAdapter:
+    """Stands in for RetellAdapter.list_call_history in backfill tests."""
+
+    def __init__(self, calls: list[dict]):
+        self.calls = calls
+
+    async def list_call_history(
+        self, *, since_ms: int | None = None, max_calls: int = 1000
+    ) -> list[dict]:
+        return self.calls[:max_calls]
+
+
+def _retell_call(call_id: str, to_number: str | None, reason: str, **extra: object) -> dict:
+    base = {
+        "call_id": call_id,
+        "call_type": "phone_call" if to_number else "web_call",
+        "direction": "outbound",
+        "to_number": to_number,
+        "call_status": "ended",
+        "disconnection_reason": reason,
+        "start_timestamp": 1_788_000_000_000,
+        "duration_ms": 20_000,
+    }
+    base.update(extra)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_backfill_imports_dashboard_calls_and_classifies_prospects(db_session, tenant_id):
+    """The whole point: calls placed from Retell's dashboard created no local Call row,
+    so their prospects read not_called. Backfill matches them by phone and settles status.
+    """
+    from backend.services import prospect_service
+
+    [vm] = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [{"google_place_id": "b1", "name": "VM Co", "phone": "+442077335265"}],
+        "q",
+    )
+    [spoke] = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [{"google_place_id": "b2", "name": "Spoke Co", "phone": "+14059146006"}],
+        "q",
+    )
+
+    adapter = _HistoryAdapter(
+        [
+            _retell_call("c_vm", "+442077335265", "voicemail_reached", answered_by_human=True),
+            _retell_call(
+                "c_spoke",
+                "+14059146006",
+                "user_hangup",
+                call_status="ended",
+                transcript_object=[{"role": "user", "content": "hello?"}],
+                call_analysis={"user_sentiment": "neutral"},
+            ),
+            _retell_call("c_web", None, "user_hangup"),  # web call — no number, stays unlinked
+        ]
+    )
+
+    stats = await call_service.backfill_from_platform(db_session, tenant_id, adapter)
+
+    assert stats == {"fetched": 3, "created": 3, "updated": 0, "matched": 2, "unmatched": 1}
+    assert (await prospect_service.get_prospect(db_session, vm.id, tenant_id)).status == "voicemail"
+    assert (await prospect_service.get_prospect(db_session, spoke.id, tenant_id)).status == "called"
+
+    vm_reloaded = await prospect_service.get_prospect(db_session, vm.id, tenant_id)
+    assert vm_reloaded.call_count == 1
+    assert vm_reloaded.last_called_at is not None
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent(db_session, tenant_id):
+    from backend.services import prospect_service
+
+    [p] = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [{"google_place_id": "b3", "name": "Idem Co", "phone": "+442077335265"}],
+        "q",
+    )
+    adapter = _HistoryAdapter([_retell_call("c1", "020 7733 5265", "voicemail_reached")])
+
+    first = await call_service.backfill_from_platform(db_session, tenant_id, adapter)
+    second = await call_service.backfill_from_platform(db_session, tenant_id, adapter)
+
+    assert first["created"] == 1
+    assert second["created"] == 0 and second["updated"] == 1
+    reloaded = await prospect_service.get_prospect(db_session, p.id, tenant_id)
+    assert reloaded.call_count == 1  # recomputed, not incremented on the second run
+    assert reloaded.status == "voicemail"  # national-format number still matched
+
+
 @pytest.mark.asyncio
 async def test_reconcile_unsticks_a_call_whose_webhook_never_arrived(db_session, tenant_id):
     """The core of the self-healing path: no call_ended was ever delivered, so the row

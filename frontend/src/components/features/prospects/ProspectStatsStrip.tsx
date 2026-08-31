@@ -7,6 +7,7 @@ import { ProspectStats } from "@/lib/types";
 const STAT_TILES: { key: keyof ProspectStats; label: string }[] = [
   { key: "total", label: "Total" },
   { key: "called", label: "Called" },
+  { key: "voicemail", label: "Voicemail" },
   { key: "booked", label: "Booked" },
   { key: "flagged", label: "Flagged" },
   { key: "no_answer", label: "No answer" },
@@ -14,7 +15,7 @@ const STAT_TILES: { key: keyof ProspectStats; label: string }[] = [
 
 export function ProspectStatsStrip({ stats }: { stats: ProspectStats }) {
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
       {STAT_TILES.map(({ key, label }) => (
         <Card key={key} className="p-3">
           <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>

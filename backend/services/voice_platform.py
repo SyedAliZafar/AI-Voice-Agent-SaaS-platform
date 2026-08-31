@@ -138,6 +138,19 @@ class VoicePlatformAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support list_live_calls")
 
+    async def list_call_history(
+        self, *, since_ms: int | None = None, max_calls: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Every call the platform has a record of, newest first — finished ones included.
+
+        Distinct from list_live_calls, which filters to ongoing calls for the emergency
+        stop. This is the reconciliation feed: it's how calls placed OUTSIDE this backend
+        (a batch run started in the platform's own dashboard, ADR-012) become visible to
+        us at all. Each entry is the platform's raw call object, so it can be handed
+        straight to call_service.apply_retell_call_state.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support list_call_history")
+
     async def list_platform_agents(self, limit: int = 100) -> list[dict[str, Any]]:
         """Agents that exist on the platform itself, including ones built by hand in its
         dashboard and never seen by this backend (ADR-012).

@@ -289,6 +289,67 @@ class RetellAdapter(VoicePlatformAdapter):
             return list(body.get("items") or [])
         return list(body)
 
+    # Retell caps list-calls at 1000 per request; we page well under that so a slow
+    # response can't hold the reconcile request open for minutes.
+    _HISTORY_PAGE_SIZE = 200
+
+    async def list_call_history(
+        self, *, since_ms: int | None = None, max_calls: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Full call history off /v2/list-calls, newest first, following pagination.
+
+        This is the only way calls placed from Retell's own dashboard — batch runs, the
+        "test call" button — ever reach our database: nothing local created a Call row for
+        them, and their webhooks (if any registered) fired against whatever tunnel URL was
+        live at the time. See call_sync_service.backfill_from_platform.
+
+        Paginates on `pagination_key`, which Retell returns as the LAST item's call_id
+        rather than an opaque cursor. The loop stops on an empty page, on a page shorter
+        than the page size, or once max_calls is reached — three independent guards,
+        because an API that keeps returning the same page would otherwise spin forever.
+        """
+        collected: list[dict[str, Any]] = []
+        pagination_key: str | None = None
+
+        filter_criteria: dict[str, Any] = {}
+        if since_ms is not None:
+            # Retell's window filter is inclusive-lower/exclusive-upper and expects
+            # epoch milliseconds, matching the `start_timestamp` it reports back.
+            filter_criteria["start_timestamp"] = {"lower_threshold": since_ms}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while len(collected) < max_calls:
+                body: dict[str, Any] = {
+                    "limit": min(self._HISTORY_PAGE_SIZE, max_calls - len(collected)),
+                    "sort_order": "descending",
+                }
+                if filter_criteria:
+                    body["filter_criteria"] = filter_criteria
+                if pagination_key:
+                    body["pagination_key"] = pagination_key
+
+                resp = await client.post(
+                    f"{BASE_URL}/v2/list-calls", headers=self.headers, json=body
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                # Same dual shape list_live_calls tolerates: a bare array today, a
+                # {items: [...]} envelope if Retell rolls out pagination differently.
+                page = payload.get("items") if isinstance(payload, dict) else payload
+                page = list(page or [])
+                if not page:
+                    break
+
+                collected.extend(page)
+                if len(page) < body["limit"]:
+                    break
+                next_key = page[-1].get("call_id")
+                if not next_key or next_key == pagination_key:
+                    break
+                pagination_key = next_key
+
+        return collected[:max_calls]
+
     async def list_platform_agents(self, limit: int = 100) -> list[dict[str, Any]]:
         """Every agent on the Retell account, including ones created by hand in their
         dashboard that this backend has never provisioned (ADR-012).

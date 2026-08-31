@@ -190,6 +190,7 @@ export type ProspectStatus =
   | "called"
   | "booked"
   | "flagged"
+  | "voicemail"
   | "no_answer"
   | "do_not_call";
 
@@ -199,6 +200,7 @@ export interface ProspectStats {
   called: number;
   booked: number;
   flagged: number;
+  voicemail: number;
   no_answer: number;
   do_not_call: number;
 }

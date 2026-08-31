@@ -21,6 +21,7 @@ export const STATUS_LABELS: Record<ProspectStatus, string> = {
   called: "Called",
   booked: "Booked",
   flagged: "Flagged",
+  voicemail: "Voicemail",
   no_answer: "No answer",
   do_not_call: "Do not call",
 };
@@ -30,6 +31,7 @@ export const STATUS_ORDER: ProspectStatus[] = [
   "called",
   "booked",
   "flagged",
+  "voicemail",
   "no_answer",
   "do_not_call",
 ];

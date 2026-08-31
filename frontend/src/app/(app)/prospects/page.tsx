@@ -4,16 +4,33 @@ import { Suspense, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { CsvImportButton } from "@/components/features/prospects/CsvImportButton";
+import { SyncCallsButton } from "@/components/features/prospects/SyncCallsButton";
 import { ProspectCallDrawer } from "@/components/features/prospects/ProspectCallDrawer";
 import { ProspectFilters } from "@/components/features/prospects/ProspectFilters";
 import { ProspectGroupTree } from "@/components/features/prospects/ProspectGroupTree";
 import { ProspectSearchForm } from "@/components/features/prospects/ProspectSearchForm";
+import {
+  ProspectSection,
+  ProspectSectionTabs,
+} from "@/components/features/prospects/ProspectSectionTabs";
 import { ProspectStatsStrip } from "@/components/features/prospects/ProspectStatsStrip";
 import { TargetIcon } from "@/components/icons";
 import { EmptyState, PageHeader, Skeleton } from "@/components/ui";
 import { useAgents } from "@/hooks/useAgents";
 import { useProspects } from "@/hooks/useProspects";
 import { groupProspects, sortLabels, UNSPECIFIED } from "@/lib/prospectGrouping";
+import { ProspectStatus } from "@/lib/types";
+
+const SECTION_KEYS: ProspectSection[] = [
+  "all",
+  "not_called",
+  "voicemail",
+  "called",
+  "no_answer",
+  "booked",
+  "flagged",
+  "do_not_call",
+];
 
 /** useSearchParams() opts this whole tree out of static rendering unless wrapped in
  * Suspense — Next.js requires this at build time. The page has no server data (it's
@@ -35,6 +52,10 @@ function ProspectsPageInner() {
   const countryFilter = searchParams.get("country") || "";
   const categoryFilter = searchParams.get("category") || "";
   const cityFilter = searchParams.get("city") || "";
+  const sectionParam = searchParams.get("section") || "all";
+  const section: ProspectSection = SECTION_KEYS.includes(sectionParam as ProspectSection)
+    ? (sectionParam as ProspectSection)
+    : "all";
 
   // Reflects filters/search terms into the URL (shareable, survives refresh) rather
   // than into component state — searchParams is already the single source of truth.
@@ -91,6 +112,7 @@ function ProspectsPageInner() {
   );
 
   const filteredProspects = prospects.filter((p) => {
+    if (section !== "all" && p.status !== (section as ProspectStatus)) return false;
     if (countryFilter && (p.country || UNSPECIFIED) !== countryFilter) return false;
     if (categoryFilter && (p.category || UNSPECIFIED) !== categoryFilter) return false;
     if (cityFilter && (p.city || UNSPECIFIED) !== cityFilter) return false;
@@ -108,7 +130,12 @@ function ProspectsPageInner() {
       <PageHeader
         title="Prospects"
         subtitle="Discovery finds companies, research builds their knowledge base — you just pick who to call."
-        actions={<CsvImportButton onImported={() => refetch().catch(() => {})} />}
+        actions={
+          <div className="flex items-center gap-2">
+            <SyncCallsButton onSynced={() => refetch().catch(() => {})} />
+            <CsvImportButton onImported={() => refetch().catch(() => {})} />
+          </div>
+        }
       />
 
       {stats && <ProspectStatsStrip stats={stats} />}
@@ -126,6 +153,11 @@ function ProspectsPageInner() {
 
       {!loading && prospects.length > 0 && (
         <>
+          <ProspectSectionTabs
+            active={section}
+            stats={stats}
+            onChange={(s) => setParam("section", s === "all" ? "" : s)}
+          />
           <ProspectFilters
             country={countryFilter}
             category={categoryFilter}
@@ -161,8 +193,12 @@ function ProspectsPageInner() {
       ) : filteredProspects.length === 0 ? (
         <EmptyState
           icon={<TargetIcon />}
-          title="No prospects match these filters"
-          description="Try a different country, category, or city, or clear the filters above."
+          title={section === "all" ? "No prospects match these filters" : "Nothing in this section"}
+          description={
+            section === "all"
+              ? "Try a different country, category, or city, or clear the filters above."
+              : "No prospects have this status yet. Pick another section, or run some calls."
+          }
         />
       ) : (
         <ProspectGroupTree

@@ -27,6 +27,20 @@ export function ProspectRow({
   const outreach = OUTREACH_META[prospect.outreach_status];
   const ready = prospect.research_status === "ready";
 
+  // "Called N× · last called <date time>" — shown only once a call has actually
+  // landed, so the not-called queue stays clean. last_called_at is an ISO string from
+  // the API; toLocaleString matches how LeadRow / LeadDetailPanel render timestamps.
+  const callHistory =
+    prospect.call_count > 0
+      ? `Called ${prospect.call_count}×` +
+        (prospect.last_called_at
+          ? ` · last called ${new Date(prospect.last_called_at).toLocaleString(undefined, {
+              dateStyle: "medium",
+              timeStyle: "short",
+            })}`
+          : "")
+      : null;
+
   async function setStatus(status: ProspectStatus) {
     await api.patch(`/prospects/${prospect.id}`, { status });
     onChanged();
@@ -51,6 +65,9 @@ export function ProspectRow({
             {[prospect.city, prospect.address].filter(Boolean).join(" · ") || "—"}
             {prospect.rating != null && ` · ★ ${prospect.rating} (${prospect.review_count})`}
           </p>
+          {callHistory && (
+            <p className="mt-0.5 truncate text-xs text-slate-400 tabular-nums">{callHistory}</p>
+          )}
         </div>
 
         <div className="flex items-center gap-2">

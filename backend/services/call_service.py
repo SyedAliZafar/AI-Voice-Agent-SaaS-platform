@@ -29,12 +29,13 @@ webhook-updated call could disagree about the same call's outcome.
 import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.call import Call, CallEvent, Transcript
+from backend.models.prospect import Prospect
 
 logger = logging.getLogger(__name__)
 
@@ -588,3 +589,177 @@ async def reconcile_stale_calls(db: AsyncSession, tenant_id: uuid.UUID, adapter:
         if await reconcile_call(db, call, adapter):
             updated += 1
     return updated
+
+
+# platform history import ------------------------------------------------------------
+
+
+def counterparty_number(payload: dict[str, Any]) -> str | None:
+    """The number at the *other end* of a call — the prospect's, whichever way it was
+    dialed. None for web calls, which have no phone number at all.
+
+    Call.caller_number has always held this for outbound calls, so keeping inbound on the
+    same convention is what lets one column be the phone-match key in both directions.
+    """
+    if payload.get("call_type") == "web_call":
+        return None
+    number = (
+        payload.get("from_number")
+        if payload.get("direction") == "inbound"
+        else payload.get("to_number")
+    )
+    return number if isinstance(number, str) and number else None
+
+
+async def backfill_from_platform(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    adapter: Any,
+    *,
+    since_ms: int | None = None,
+    max_calls: int = 1000,
+) -> dict[str, int]:
+    """Import the platform's own call history into `calls`, linking each to a prospect
+    by phone number. Returns counts for the operator.
+
+    This is the third path into terminal call state, alongside webhooks and per-call
+    reconciliation — and the only one that can see a call this backend never placed. A
+    batch run started from Retell's dashboard (ADR-012) creates no local Call row and
+    fires its webhooks at whatever tunnel URL happened to be registered that day, so
+    without this the entire outreach ledger silently disagrees with reality: prospects
+    sit at "not_called" having been dialed five times.
+
+    Idempotent, and safe to re-run as often as you like:
+      - Rows are keyed on `external_id`, so a call already imported is updated, not
+        duplicated.
+      - Terminal state goes through apply_retell_call_state + _fanout_post_call like
+        every other path, so classify_call_outcome's forward-only status ladder applies.
+      - call_count is *recomputed* from the imported rows rather than incremented, since
+        record_call() never ran for dashboard-placed calls and incrementing on each
+        re-run would inflate it without bound.
+
+    Calls that match no prospect (inbound to our own number, web calls, one-off test
+    dials) are still stored, with prospect_id left null — the local call history should
+    be complete even where the prospect ledger has nothing to say.
+    """
+    from backend.services.prospect_service import phone_match_key
+
+    history = await adapter.list_call_history(since_ms=since_ms, max_calls=max_calls)
+
+    # Prospect phones come from Google Places / scraped lists with their own spacing and,
+    # for UK numbers, often national format ("020 7733 5265"); the platform reports strict
+    # E.164 ("+442077335265"). phone_match_key reduces both to the same trailing digits —
+    # comparing raw or merely-stripped strings finds nothing.
+    prospect_rows = await db.execute(
+        select(Prospect.id, Prospect.phone).where(
+            Prospect.tenant_id == tenant_id, Prospect.phone.is_not(None)
+        )
+    )
+    by_phone: dict[str, uuid.UUID] = {}
+    for prospect_id, phone in prospect_rows.all():
+        key = phone_match_key(phone)
+        # First writer wins: two prospect rows sharing a number is a data problem to fix
+        # in the list, not something to resolve arbitrarily on every sync.
+        if key and key not in by_phone:
+            by_phone[key] = prospect_id
+
+    stats = dict.fromkeys(("fetched", "created", "updated", "matched", "unmatched"), 0)
+    stats["fetched"] = len(history)
+    touched_prospects: set[uuid.UUID] = set()
+
+    for payload in history:
+        external_id = payload.get("call_id")
+        if not isinstance(external_id, str) or not external_id:
+            continue
+
+        number = counterparty_number(payload)
+        key = phone_match_key(number)
+        prospect_id = by_phone.get(key) if key else None
+        if prospect_id:
+            stats["matched"] += 1
+            touched_prospects.add(prospect_id)
+        else:
+            stats["unmatched"] += 1
+
+        call = await get_call_by_external_id(db, external_id)
+        if call is None:
+            started_ms = payload.get("start_timestamp")
+            started_at = (
+                datetime.fromtimestamp(started_ms / 1000, tz=UTC)
+                if isinstance(started_ms, int | float) and started_ms > 0
+                else datetime.now(UTC)
+            )
+            call = Call(
+                tenant_id=tenant_id,
+                # Imported calls are by definition not ours to attribute to a local Agent
+                # row — the platform's agent id is all we have (ADR-012), and
+                # create_outbound_call_record's XOR rule is satisfied by setting only it.
+                agent_id=None,
+                external_agent_id=payload.get("agent_id"),
+                # "" rather than null for web calls: the column is NOT NULL, and an empty
+                # string reads unambiguously as "this call had no phone number".
+                caller_number=(number or "")[:20],
+                status="in_progress",
+                started_at=started_at,
+                external_id=external_id,
+                prospect_id=prospect_id,
+            )
+            db.add(call)
+            await db.flush()
+            stats["created"] += 1
+        else:
+            # Heal a row imported (or placed) before its prospect existed in the list.
+            # Never overwrite an existing link: the placing code knew better than a
+            # phone match does.
+            if prospect_id and call.prospect_id is None:
+                # cast: the models annotate id columns with SQLAlchemy's UUID type rather
+                # than uuid.UUID, so assigning a real uuid.UUID reads as a mismatch. Same
+                # repo-wide wart lead_service works around; not this change's to fix.
+                call.prospect_id = cast(Any, prospect_id)
+            stats["updated"] += 1
+
+        await apply_retell_call_state(db, call, payload)
+        await db.commit()
+        await _fanout_post_call(db, call)
+
+    await resync_prospects_from_calls(db, tenant_id, touched_prospects)
+    return stats
+
+
+async def resync_prospects_from_calls(
+    db: AsyncSession, tenant_id: uuid.UUID, prospect_ids: set[uuid.UUID]
+) -> None:
+    """Rebuild call_count, last_called_at and status for the given prospects from their
+    Call rows — the settle-up step after a backfill.
+
+    Everything here is *recomputed*, never incremented, because backfill_from_platform is
+    re-run routinely: `call_count` gates batch_call_targets, so an inflated count would
+    silently make a prospect ineligible for outreach forever — a much worse failure than
+    a stale one.
+
+    Status goes through prospect_service.resync_status_from_calls, which unlike the
+    per-call classifier is allowed to move a status *down*. That is the point: it is what
+    repairs prospects whose status the single-call path got wrong before the whole history
+    was available.
+    """
+    if not prospect_ids:
+        return
+
+    from backend.services import prospect_service
+
+    rows = await db.execute(
+        select(Call).where(Call.tenant_id == tenant_id, Call.prospect_id.in_(prospect_ids))
+    )
+    # Keyed on Any for the same UUID-annotation reason as the cast above; every key is a
+    # real uuid.UUID at runtime, matched against Prospect.id below.
+    calls_by_prospect: dict[Any, list[Call]] = {}
+    for call in rows.scalars():
+        calls_by_prospect.setdefault(call.prospect_id, []).append(call)
+
+    prospects = await db.execute(select(Prospect).where(Prospect.id.in_(prospect_ids)))
+    for prospect in prospects.scalars():
+        calls = calls_by_prospect.get(prospect.id, [])
+        prospect.call_count = len(calls)
+        prospect.last_called_at = max((c.started_at for c in calls), default=None)
+        await prospect_service.resync_status_from_calls(db, prospect, calls)
+    await db.commit()

@@ -132,6 +132,23 @@ export function ProspectDetailPanel({
 
   return (
     <div className={bare ? "" : "mt-4 border-t border-slate-100 pt-4"}>
+      {prospect.call_count > 0 && (
+        <p className="mb-3 text-xs text-slate-500">
+          Called <span className="font-medium tabular-nums">{prospect.call_count}×</span>
+          {prospect.last_called_at && (
+            <>
+              {" · last on "}
+              <span className="tabular-nums">
+                {new Date(prospect.last_called_at).toLocaleString(undefined, {
+                  dateStyle: "medium",
+                  timeStyle: "short",
+                })}
+              </span>
+            </>
+          )}
+        </p>
+      )}
+
       {prospect.research.summary && (
         <div className="mb-4 rounded-lg bg-slate-50/70 p-3">
           <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">

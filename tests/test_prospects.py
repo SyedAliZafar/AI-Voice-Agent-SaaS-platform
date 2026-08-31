@@ -165,6 +165,7 @@ async def test_stats_counts_by_status(client, db_session, tenant_id, auth_header
         "booked": 1,
         "flagged": 0,
         "no_answer": 1,
+        "voicemail": 0,
         "do_not_call": 0,
     }
 
@@ -288,6 +289,22 @@ def test_normalize_phone(raw, expected):
     assert prospect_service.normalize_phone(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("+442077335265", "2077335265"),  # UK E.164
+        ("020 7733 5265", "2077335265"),  # ...same line, national format — must collide
+        ("+14059146006", "4059146006"),  # NANP
+        ("4059146006", "4059146006"),
+        ("555-123", None),  # too short to be a number
+        ("", None),
+        (None, None),
+    ],
+)
+def test_phone_match_key_bridges_e164_and_national(raw, expected):
+    assert prospect_service.phone_match_key(raw) == expected
+
+
 @pytest.mark.asyncio
 async def test_import_csv_creates_prospects(client, db_session, tenant_id, auth_headers):
     content = CSV_HEADER + (
@@ -346,6 +363,26 @@ async def test_import_csv_skips_duplicate_phones(client, db_session, tenant_id, 
 
 
 @pytest.mark.asyncio
+async def test_import_csv_dedupes_e164_against_national_format(
+    client, db_session, tenant_id, auth_headers
+):
+    """The bug that seeded 5 duplicate London roofers: a list carrying "+442077335265"
+    and a later list carrying "020 7733 5265" are the same line and must not both import.
+    """
+    first = CSV_HEADER + "Dulwich Roofing,+442077335265,London,cold-list,roofing\n"
+    await client.post("/api/prospects/import-csv", files=_upload(first), headers=auth_headers)
+
+    second = CSV_HEADER + "Dulwich Roofing Ltd,020 7733 5265,London,cold-list,roofing\n"
+    resp = await client.post(
+        "/api/prospects/import-csv", files=_upload(second), headers=auth_headers
+    )
+
+    assert resp.json()["skipped_duplicates"] == 1
+    assert resp.json()["imported"] == 0
+    assert len(await prospect_service.list_prospects(db_session, tenant_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_import_csv_reports_invalid_rows_without_failing(client, tenant_id, auth_headers):
     content = CSV_HEADER + (
         "Good Co,+491701234567,Berlin,cold-list,hvac\n"
@@ -367,14 +404,35 @@ async def test_import_csv_reports_invalid_rows_without_failing(client, tenant_id
 
 @pytest.mark.asyncio
 async def test_import_csv_rejects_missing_required_columns(client, auth_headers):
+    # "company"/"telephone" used to be the fixture here, but they are now recognized
+    # aliases (CSV_HEADER_ALIASES) and import fine — which is the point of the aliases.
+    # Headers that map to nothing at all are what this test is actually about.
     resp = await client.post(
         "/api/prospects/import-csv",
-        files=_upload("company,telephone\nAcme,+491701234567\n"),
+        files=_upload("org_label,contact_digits\nAcme,+491701234567\n"),
         headers=auth_headers,
     )
 
     assert resp.status_code == 422
     assert "business_name" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_import_csv_accepts_header_aliases(client, auth_headers):
+    """The operator's real lists say "phone number" / "company_name", and Retell's batch
+    template says "phone number" too — rejecting those made the importer useless for
+    exactly the files it exists to load.
+    """
+    resp = await client.post(
+        "/api/prospects/import-csv",
+        files=_upload("company_name,phone number,url\nAcme Roofing,+491701234567,acme.test\n"),
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 1
+    assert body["with_website"] == 1
 
 
 @pytest.mark.asyncio

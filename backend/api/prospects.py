@@ -6,7 +6,9 @@ go through prospect_service.get_prospect() (tenant-scoped), never get_prospect_u
 """
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
+import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +20,7 @@ from backend.schemas.prospect import (
     BatchCallRequest,
     BatchCallResult,
     BatchCallSkip,
+    CallSyncResult,
     CityAutocompleteResponse,
     CityAutocompleteResult,
     CompanyResearch,
@@ -31,6 +34,7 @@ from backend.schemas.prospect import (
 )
 from backend.services import (
     agent_service,
+    call_service,
     llm_service,
     places_service,
     prospect_service,
@@ -38,12 +42,21 @@ from backend.services import (
     script_service,
     test_call_service,
 )
+from backend.services.retell_adapter import RetellAdapter
 from backend.workers.prospect_tasks import discover_prospects, research_prospect
 
 router = APIRouter()
 
 VALID_OUTREACH_STATUSES = {"not_reached", "reached", "callback", "do_not_call"}
-VALID_STATUSES = {"not_called", "called", "booked", "flagged", "no_answer", "do_not_call"}
+VALID_STATUSES = {
+    "not_called",
+    "called",
+    "booked",
+    "flagged",
+    "no_answer",
+    "voicemail",
+    "do_not_call",
+}
 
 
 def _build_personalized_prompt(agent, prospect) -> str:
@@ -143,13 +156,17 @@ async def city_autocomplete(
 async def list_prospects(
     research_status: str | None = None,
     outreach_status: str | None = None,
+    status: str | None = None,
     limit: int = 100,
     offset: int = 0,
     tenant_id: uuid.UUID = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
 ):
+    """`status` accepts a comma-separated list — this is what backs the dashboard's
+    Not called / Voicemail / Called sections off one endpoint.
+    """
     return await prospect_service.list_prospects(
-        db, tenant_id, research_status, outreach_status, limit, offset
+        db, tenant_id, research_status, outreach_status, status, limit, offset
     )
 
 
@@ -189,6 +206,39 @@ async def export_prospects(
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="prospects.csv"'},
     )
+
+
+@router.post("/sync-calls", response_model=CallSyncResult)
+async def sync_calls_from_platform(
+    days: int = 30,
+    max_calls: int = 1000,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pull the voice platform's call history and reconcile it into the prospect ledger.
+
+    Answers the question the dashboard alone can't: *which of my prospects have actually
+    been called, and what happened*. Calls placed from Retell's own dashboard never
+    created a local Call row, so until this runs every one of those prospects reads
+    "not_called" no matter how many times it was dialed.
+
+    Matches on phone number, updates Prospect.status / call_count / last_called_at, and
+    is safe to re-run — see call_service.backfill_from_platform for the idempotency
+    rules. Distinct from POST /api/calls/sync, which only repairs calls this backend
+    already knows about.
+
+    Declared above /{prospect_id} so "sync-calls" isn't parsed as a UUID.
+    """
+    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    try:
+        stats = await call_service.backfill_from_platform(
+            db, tenant_id, RetellAdapter(), since_ms=since_ms, max_calls=max_calls
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Could not read call history from the platform: {exc}"
+        ) from exc
+    return CallSyncResult(**stats)
 
 
 @router.post("/batch-call", response_model=BatchCallResult)

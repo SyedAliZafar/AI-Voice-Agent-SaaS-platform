@@ -108,7 +108,23 @@ class ProspectStats(BaseModel):
     booked: int = 0
     flagged: int = 0
     no_answer: int = 0
+    voicemail: int = 0
     do_not_call: int = 0
+
+
+class CallSyncResult(BaseModel):
+    """What POST /api/prospects/sync-calls did — the operator's receipt for a backfill.
+
+    `matched` / `unmatched` split the fetched calls by whether a prospect's phone number
+    lined up, which is the number to look at when a sync "did nothing": a high unmatched
+    count usually means the list was never imported, not that the sync is broken.
+    """
+
+    fetched: int = 0
+    created: int = 0
+    updated: int = 0
+    matched: int = 0
+    unmatched: int = 0
 
 
 class CityAutocompleteResult(BaseModel):

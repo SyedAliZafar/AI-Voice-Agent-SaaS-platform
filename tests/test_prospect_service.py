@@ -230,6 +230,100 @@ async def test_classify_marks_called_for_a_neutral_conversation(db_session, tena
 
 
 @pytest.mark.asyncio
+async def test_classify_marks_voicemail_even_when_the_machine_greeting_transcribed(
+    db_session, tenant_id
+):
+    """The bug this rung was added for: answered_by_human is "did any turn come from the
+    far end", and an answering machine's greeting IS such a turn — so every voicemail
+    looked like a human who talked. Retell's voicemail_reached verdict must win.
+    """
+    prospect = await _prospect(db_session, tenant_id)
+    call = await _terminal_call(
+        db_session,
+        tenant_id,
+        prospect.id,
+        status="failed",
+        disconnection_reason="voicemail_reached",
+        answered_by_human=True,  # the greeting was transcribed
+        sentiment_score=0.5,
+    )
+
+    await prospect_service.classify_call_outcome(db_session, call)
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "voicemail"
+    # A machine picking up is not the prospect being reached.
+    assert updated.outreach_status == "not_reached"
+
+
+@pytest.mark.asyncio
+async def test_resync_from_calls_can_move_status_back_down(db_session, tenant_id):
+    """The whole-history path is allowed to correct what the per-call ladder ratcheted
+    into place — without it, prospects misclassified before the voicemail fix would have
+    stayed "called" forever.
+    """
+    prospect = await _prospect(db_session, tenant_id)
+    await prospect_service.set_status(db_session, prospect.id, tenant_id, "called")
+
+    voicemail = await _terminal_call(
+        db_session,
+        tenant_id,
+        prospect.id,
+        status="failed",
+        disconnection_reason="voicemail_reached",
+        answered_by_human=True,
+    )
+
+    await prospect_service.resync_status_from_calls(db_session, prospect, [voicemail])
+    await db_session.commit()
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "voicemail"
+
+
+@pytest.mark.asyncio
+async def test_resync_takes_the_best_outcome_not_the_latest(db_session, tenant_id):
+    """A prospect who spoke to us once and hit voicemail since has still been reached."""
+    prospect = await _prospect(db_session, tenant_id)
+    spoke = await _terminal_call(
+        db_session, tenant_id, prospect.id, status="resolved", answered_by_human=True
+    )
+    later_voicemail = await _terminal_call(
+        db_session,
+        tenant_id,
+        prospect.id,
+        status="failed",
+        disconnection_reason="voicemail_reached",
+        answered_by_human=True,
+    )
+
+    await prospect_service.resync_status_from_calls(db_session, prospect, [spoke, later_voicemail])
+    await db_session.commit()
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "called"
+
+
+@pytest.mark.asyncio
+async def test_resync_leaves_operator_set_status_alone(db_session, tenant_id):
+    prospect = await _prospect(db_session, tenant_id)
+    await prospect_service.set_status(db_session, prospect.id, tenant_id, "booked")
+    call = await _terminal_call(
+        db_session,
+        tenant_id,
+        prospect.id,
+        status="failed",
+        disconnection_reason="voicemail_reached",
+    )
+
+    await prospect_service.resync_status_from_calls(db_session, prospect, [call])
+    await db_session.commit()
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "booked"
+
+
+@pytest.mark.asyncio
 async def test_classify_never_downgrades_or_touches_operator_status(db_session, tenant_id):
     prospect = await _prospect(db_session, tenant_id)
     await prospect_service.set_status(db_session, prospect.id, tenant_id, "booked")

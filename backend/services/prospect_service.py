@@ -131,13 +131,35 @@ def _cell(row: dict[str, str | None], name: str) -> str:
     return (row.get(name) or "").strip()
 
 
+# Header spellings that mean one of our columns but don't normalize to its name. Kept
+# small and explicit rather than fuzzy-matched: a wrong guess here silently imports a
+# column into the wrong field, which is far worse than an "unknown column" skip. These
+# are the spellings the operator's own lists and Retell's batch-call template use.
+CSV_HEADER_ALIASES = {
+    "phone_number": "phone",
+    "phone_no": "phone",
+    "telephone": "phone",
+    "company_name": "business_name",
+    "company": "business_name",
+    "name": "business_name",
+    "business": "business_name",
+    "url": "website",
+    "web": "website",
+    "category": "niche",
+}
+
+
 def _normalize_header(h: str | None) -> str:
     """Casing/spacing/punctuation in a CSV's header row is an artifact of whatever
     exported it (Excel, Google Sheets, a scraper) — "Business Name" and "business_name"
     are the same column. Collapse both to the snake_case form CSV_REQUIRED_COLUMNS /
-    CSV_OPTIONAL_COLUMNS and every _cell() lookup below expect.
+    CSV_OPTIONAL_COLUMNS and every _cell() lookup below expect, then map the known
+    synonyms (CSV_HEADER_ALIASES) onto those names — "phone number" and "company_name"
+    are what real scraped lists actually carry, and rejecting them as "missing required
+    column" made the importer useless for exactly the files it exists to load.
     """
-    return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
+    normalized = re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
+    return CSV_HEADER_ALIASES.get(normalized, normalized)
 
 
 def normalize_website(raw: str | None) -> str | None:
@@ -161,11 +183,42 @@ def normalize_website(raw: str | None) -> str | None:
 
 
 def normalize_phone(raw: str | None) -> str | None:
-    """Formatting-insensitive form used both to validate and to dedupe. None if unusable."""
+    """Formatting-insensitive form used for validation and storage. None if unusable.
+
+    Strips spacing/punctuation only — it does NOT reconcile E.164 against national
+    format, so "+442077335265" and "020 7733 5265" (the same London line) come back as
+    two different strings. Use phone_match_key() for dedupe and cross-source matching;
+    this is the wrong function for that and produced duplicate prospect rows when it was
+    used for it.
+    """
     if not raw:
         return None
     candidate = _PHONE_STRIP_RE.sub("", raw.strip())
     return candidate if _PHONE_RE.match(candidate) else None
+
+
+def phone_match_key(raw: str | None) -> str | None:
+    """A loose identity for a phone number — for dedupe and matching a call back to a
+    prospect, NOT for storage or validation (that's normalize_phone).
+
+    Reduces a number to its last 10 significant digits. That collapses the two ways the
+    same line gets written down: strict E.164 ("+442077335265", what a voice platform
+    reports) and national format with a trunk prefix ("020 7733 5265", what a scraped
+    list often carries) — both end "2077335265". Ten digits because that is the
+    significant-digit length of a NANP number and of a UK number past its country code:
+    long enough that collisions within one tenant's prospect list are very unlikely,
+    short enough to bridge the trunk-prefix gap.
+
+    Deliberately not phonenumbers-library parsing — that needs a per-number region and a
+    dependency this project has done without. If real lists ever throw false-positive
+    collisions, that is the upgrade path.
+    """
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 7:  # below E.164's own lower bound — junk, not a number
+        return None
+    return digits[-10:]
 
 
 async def import_from_csv(
@@ -201,11 +254,13 @@ async def import_from_csv(
         raise CsvImportError(f"CSV is missing required column(s): {', '.join(missing)}")
 
     # One pass to build the dedupe set: stored phones keep their original formatting
-    # (Places writes them verbatim), so they have to be normalized here to compare.
+    # (Places writes them verbatim, scraped lists vary), so they're reduced to a loose
+    # match key here — phone_match_key, not normalize_phone, so a row already stored as
+    # "+442077335265" blocks a re-import of the same line written "020 7733 5265".
     existing = await db.execute(
         select(Prospect.phone).where(Prospect.tenant_id == tenant_id, Prospect.phone.isnot(None))
     )
-    seen_phones = {p for p in (normalize_phone(row) for row in existing.scalars()) if p}
+    seen_phones = {k for k in (phone_match_key(row) for row in existing.scalars()) if k}
 
     result = CsvImportResult()
     created: list[Prospect] = []
@@ -229,7 +284,8 @@ async def import_from_csv(
             result.skipped_invalid += 1
             note(row_num, f"unusable phone {_cell(row, 'phone')!r}")
             continue
-        if phone in seen_phones:
+        match_key = phone_match_key(phone)
+        if match_key in seen_phones:
             result.skipped_duplicates += 1
             continue
 
@@ -241,7 +297,8 @@ async def import_from_csv(
         # that only carries a city. The two holding the same value is a fair price.
         address = _cell(row, "address") or city
 
-        seen_phones.add(phone)
+        if match_key:
+            seen_phones.add(match_key)
         prospect = Prospect(
             tenant_id=tenant_id,
             # Not from Places, but the column is NOT NULL and (tenant, place_id) is
@@ -284,14 +341,26 @@ async def list_prospects(
     tenant_id: uuid.UUID,
     research_status: str | None = None,
     outreach_status: str | None = None,
+    status: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[Prospect]:
+    """One filtered page of the prospect list.
+
+    `status` is the campaign-outcome axis, and it's what the dashboard's sections are
+    built on: "not_called" is the work queue, "voicemail" the callback pile, "called" the
+    ones a person actually spoke to. Comma-separated values are accepted so a section can
+    span rungs (e.g. status=no_answer,voicemail) without needing its own endpoint.
+    """
     query = select(Prospect).where(Prospect.tenant_id == tenant_id)
     if research_status:
         query = query.where(Prospect.research_status == research_status)
     if outreach_status:
         query = query.where(Prospect.outreach_status == outreach_status)
+    if status:
+        wanted = [s.strip() for s in status.split(",") if s.strip()]
+        if wanted:
+            query = query.where(Prospect.status.in_(wanted))
     query = query.order_by(Prospect.priority_score.desc()).limit(limit).offset(offset)
 
     result = await db.execute(query)
@@ -445,10 +514,56 @@ async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.
 # Forward-only ranking of the campaign-outcome axis, used by classify_call_outcome. A
 # later, richer webhook can move a prospect *up* this ladder (a call_ended with nobody
 # on the line, then a call_analyzed showing a human + negative sentiment), never back
-# down — and a status not on the ladder at all (booked / flagged / do_not_call, all
+# down — and a status not on the ladder at all (booked / do_not_call, both
 # operator-set) is never touched. "flagged" IS on the ladder: it's the terminal
 # auto-outcome for "a person rejected us", above a plain "called".
-_OUTCOME_STATUS_ORDER = {"not_called": 0, "no_answer": 1, "called": 2, "flagged": 3}
+#
+# "voicemail" sits above "no_answer" because it carries strictly more information: the
+# line is live and an answering machine picked up, versus a phone that just rang out.
+# That distinction is the operator's main retry signal — a voicemail number is worth
+# calling back at a different hour, a dial_no_answer number may simply be dead — so it
+# gets its own rung and its own dashboard section rather than being collapsed into one
+# "we didn't reach anybody" bucket.
+_OUTCOME_STATUS_ORDER = {
+    "not_called": 0,
+    "no_answer": 1,
+    "voicemail": 2,
+    "called": 3,
+    "flagged": 4,
+}
+
+# Retell disconnection_reasons meaning "a machine, not a person, took the call".
+_VOICEMAIL_REASONS = {"voicemail_reached", "machine_detected"}
+
+
+def outcome_status_for_call(call: Call) -> str:
+    """How one terminal call maps onto the campaign-outcome axis. Pure, so the
+    single-call path (classify_call_outcome) and the whole-history path
+    (resync_status_from_calls) can never disagree about what a call means.
+
+    "Rejected" = a human was actually on the line AND Retell's post-call sentiment came
+    back negative. Sentiment on a call nobody answered (or a 3-second hangup) is noise,
+    so answered_by_human gates it. A sharper transcript-based signal can replace the
+    sentiment check later without touching this seam.
+    """
+    if (call.disconnection_reason or "").lower() in _VOICEMAIL_REASONS:
+        # Checked FIRST, ahead of answered_by_human, and that order is load-bearing.
+        # answered_by_human is a heuristic — "did any transcript turn come from the far
+        # end" — and an answering machine's outgoing greeting is transcribed as exactly
+        # such a turn. So every voicemail looks like a human who talked, and testing
+        # answered_by_human first classified a whole campaign of voicemails as "called".
+        # Retell's own voicemail_reached verdict comes from its machine detection and is
+        # authoritative about who picked up; our transcript heuristic is not.
+        new_status = "voicemail"
+    elif call.answered_by_human:
+        rejected = call.sentiment_score is not None and call.sentiment_score <= 0.0
+        new_status = "flagged" if rejected else "called"
+    else:
+        # dial_no_answer, user_declined, dial_busy/failed, or a "resolved" call with zero
+        # caller turns — all "the phone rang and nothing picked up".
+        new_status = "no_answer"
+
+    return new_status
 
 
 async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
@@ -458,13 +573,13 @@ async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
 
     Idempotent by construction: it fires on call_ended, call_analyzed and any later
     reconcile, and only ever moves status forward along
-    not_called -> no_answer -> called -> flagged (see _OUTCOME_STATUS_ORDER). A prospect
-    an operator has already set to booked / flagged / do_not_call is left alone.
+    not_called -> no_answer -> voicemail -> called -> flagged (see _OUTCOME_STATUS_ORDER).
+    A prospect an operator has already set to booked / do_not_call is left alone.
 
-    "Rejected" = a human was actually on the line AND Retell's post-call sentiment came
-    back negative. Sentiment on a call nobody answered (or a 3-second hangup) is noise,
-    so answered_by_human gates it. A sharper transcript-based signal can replace the
-    sentiment check later without touching this seam.
+    Forward-only because this path sees ONE call at a time and can be handed a stale or
+    partial view of it (a call_ended before call_analyzed has filled in sentiment). When
+    the whole call history is available instead, resync_status_from_calls is the better
+    authority and is allowed to move status down.
     """
     if not call.prospect_id:
         return
@@ -472,21 +587,47 @@ async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
     if not prospect or prospect.status not in _OUTCOME_STATUS_ORDER:
         return
 
-    if call.answered_by_human:
-        rejected = call.sentiment_score is not None and call.sentiment_score <= 0.0
-        new_status = "flagged" if rejected else "called"
-    else:
-        # voicemail_reached, dial_no_answer, user_declined, dial_busy/failed, or a
-        # "resolved" call with zero caller turns — all "we didn't reach a person".
-        new_status = "no_answer"
-
+    new_status = outcome_status_for_call(call)
     if _OUTCOME_STATUS_ORDER[new_status] <= _OUTCOME_STATUS_ORDER[prospect.status]:
         return
 
     prospect.status = new_status
-    if call.answered_by_human and prospect.outreach_status == "not_reached":
+    if new_status in ("called", "flagged") and prospect.outreach_status == "not_reached":
         prospect.outreach_status = "reached"
     await db.commit()
+
+
+async def resync_status_from_calls(db: AsyncSession, prospect: Prospect, calls: list[Call]) -> None:
+    """Recompute Prospect.status from that prospect's ENTIRE call history.
+
+    The whole-history counterpart to classify_call_outcome, and deliberately *not*
+    forward-only: with every call in hand there is no ordering to protect against, so
+    this is free to correct a status that the single-call path got wrong. That matters
+    because the ladder is a ratchet — when voicemail detection was fixed, every prospect
+    already stuck at "called" would have stayed there forever without a path that can
+    move a status down.
+
+    Status is the best outcome across all attempts (highest _OUTCOME_STATUS_ORDER rank),
+    not the latest: a prospect who spoke to us in June and hit voicemail in August has
+    still been reached, and burying that under the most recent attempt would lose the
+    only fact the operator cares about. Operator-set statuses (booked, do_not_call) are
+    off the ladder and never touched. Caller commits.
+    """
+    if prospect.status not in _OUTCOME_STATUS_ORDER:
+        return
+
+    best = "not_called"
+    for call in calls:
+        # Only terminal calls say anything; an in_progress row has no outcome yet.
+        if call.status not in ("resolved", "escalated", "failed"):
+            continue
+        candidate = outcome_status_for_call(call)
+        if _OUTCOME_STATUS_ORDER[candidate] > _OUTCOME_STATUS_ORDER[best]:
+            best = candidate
+
+    prospect.status = best
+    if best in ("called", "flagged") and prospect.outreach_status == "not_reached":
+        prospect.outreach_status = "reached"
 
 
 # batch outreach + CSV export -------------------------------------------------------
