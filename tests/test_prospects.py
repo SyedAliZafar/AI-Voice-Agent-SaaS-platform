@@ -331,7 +331,10 @@ async def test_import_csv_creates_prospects(client, db_session, tenant_id, auth_
     assert by_name["Acme HVAC"].phone == "+491701234567"
     assert by_name["Acme HVAC"].city == "Berlin"  # city -> its own column
     assert by_name["Acme HVAC"].address == "Berlin"  # ...and still the address fallback
-    assert by_name["Acme HVAC"].category == "hvac"  # niche -> category
+    # niche -> category, but only for the verticals we sell into: "hvac" isn't one, so
+    # it lands unlabelled ("Unspecified" in the UI) rather than minting its own bucket.
+    assert by_name["Acme HVAC"].category is None
+    assert by_name["Sunbeam Solar"].category == "Solar"
     assert by_name["Acme HVAC"].source_query == "cold-list"  # source -> source_query
     assert by_name["Acme HVAC"].status == "not_called"
 

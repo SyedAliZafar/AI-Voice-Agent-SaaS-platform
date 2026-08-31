@@ -75,6 +75,45 @@ async def test_upsert_from_places_dedupes_by_place_id(db_session, tenant_id):
     assert len(all_prospects) == 1
 
 
+def test_normalize_category_keeps_only_the_verticals_we_sell_into():
+    assert prospect_service.normalize_category("Roofing Contractor") == "Roofing"
+    assert prospect_service.normalize_category("roofer") == "Roofing"
+    assert prospect_service.normalize_category("Solar Energy Contractor") == "Solar"
+    assert prospect_service.normalize_category("photovoltaic installer") == "Solar"
+    # Everything else loses its label rather than minting a bucket in the operator's
+    # category filter; None is what the UI shows as "Unspecified".
+    assert prospect_service.normalize_category("Dental Clinic") is None
+    assert prospect_service.normalize_category("British Restaurant") is None
+    assert prospect_service.normalize_category("") is None
+    assert prospect_service.normalize_category(None) is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_normalizes_category(db_session, tenant_id):
+    """Google's primaryTypeDisplayName is free text; the row must not carry it through."""
+    [roofer] = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [
+            {
+                "google_place_id": "place_roof",
+                "name": "Acme Roofing",
+                "category": "Roofing Contractor",
+            }
+        ],
+        "roofers",
+    )
+    assert roofer.category == "Roofing"
+
+    [dentist] = await prospect_service.upsert_from_places(
+        db_session,
+        tenant_id,
+        [{"google_place_id": "place_dds", "name": "Acme Dental", "category": "Dental Clinic"}],
+        "dentists",
+    )
+    assert dentist.category is None
+
+
 @pytest.mark.asyncio
 async def test_upsert_persists_city_and_country(db_session, tenant_id):
     """places_service extracts these from Google's typed addressComponents; if the

@@ -36,6 +36,35 @@ def compute_priority(
     return round(rating_component + reviews_component + website_component + phone_component, 4)
 
 
+# The only verticals we actually sell into. Google's `primaryTypeDisplayName` and the
+# CSV `niche` column are both free text, so historically every stray discovery run left
+# its own bucket behind ("Dental Clinic", "British Restaurant", "Services", ...) and the
+# operator's category filter turned into a junk drawer. Everything that isn't one of
+# these collapses to NULL, which the UI already renders as "Unspecified" — the row is
+# kept, only its label is dropped, so nothing is lost if we add a vertical later.
+CANONICAL_CATEGORIES = ("Roofing", "Solar")
+
+# Substring match on the lowercased raw value: Google says "Roofing Contractor",
+# operators type "roofer"/"roofing", and solar shows up as "Solar Energy Contractor" or
+# "photovoltaic". Order matters only in that the first hit wins.
+_CATEGORY_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("roof", "Roofing"),
+    ("solar", "Solar"),
+    ("photovoltaic", "Solar"),
+)
+
+
+def normalize_category(raw: str | None) -> str | None:
+    """Map a free-text category onto one of CANONICAL_CATEGORIES, or None."""
+    if not raw:
+        return None
+    lowered = raw.lower()
+    for keyword, canonical in _CATEGORY_KEYWORDS:
+        if keyword in lowered:
+            return canonical
+    return None
+
+
 async def upsert_from_places(
     db: AsyncSession,
     tenant_id: uuid.UUID,
@@ -77,7 +106,7 @@ async def upsert_from_places(
             prospect.address = place.get("address") or prospect.address
             prospect.city = place.get("city") or prospect.city
             prospect.country = place.get("country") or prospect.country
-            prospect.category = place.get("category") or prospect.category
+            prospect.category = normalize_category(place.get("category")) or prospect.category
             prospect.rating = place.get("rating")
             prospect.review_count = place.get("review_count", 0)
             prospect.priority_score = priority
@@ -91,7 +120,7 @@ async def upsert_from_places(
                 address=place.get("address"),
                 city=place.get("city"),
                 country=place.get("country"),
-                category=place.get("category"),
+                category=normalize_category(place.get("category")),
                 rating=place.get("rating"),
                 review_count=place.get("review_count", 0),
                 source_query=source_query,
@@ -315,7 +344,7 @@ async def import_from_csv(
             # ("UK" vs "United Kingdom") will group separately in the UI — worth knowing
             # before blaming the grouping code.
             country=_cell(row, "country") or None,
-            category=_cell(row, "niche") or None,
+            category=normalize_category(_cell(row, "niche")),
             source_query=_cell(row, "source") or source_query,
             # website is a scoring signal (see compute_priority), so a CSV row that
             # carries one should outrank one that doesn't, same as a Places row.
