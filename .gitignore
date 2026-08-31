@@ -5,6 +5,17 @@ venv/
 .env
 .env.local
 .env*.local
+# Service-account keys and anything else credential-shaped. The Google Sheets sync key
+# (GOOGLE_SHEETS_CREDENTIALS_FILE) lives in one of these — a private key, not a scoped
+# API key, so it must never reach the repo.
+.secrets/
+googleKeys/
+*-sa.json
+service-account*.json
+# Google's own download filename for a service-account key: <project>-<keyid>.json.
+# Broad on purpose — a key that slips through this net is a credential leak, whereas a
+# false positive is one `git add -f` away from being resolved.
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
 *.egg-info/
 .pytest_cache/
 .ruff_cache/

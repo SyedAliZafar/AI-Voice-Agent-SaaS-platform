@@ -31,15 +31,18 @@ from backend.schemas.prospect import (
     ProspectSandboxChatRequest,
     ProspectStats,
     ProspectUpdate,
+    SheetSyncResult,
 )
 from backend.services import (
     agent_service,
     call_service,
+    integration_config_service,
     llm_service,
     places_service,
     prospect_service,
     sandbox_service,
     script_service,
+    sheets_service,
     test_call_service,
 )
 from backend.services.retell_adapter import RetellAdapter
@@ -239,6 +242,47 @@ async def sync_calls_from_platform(
             status_code=502, detail=f"Could not read call history from the platform: {exc}"
         ) from exc
     return CallSyncResult(**stats)
+
+
+@router.post("/sync-sheet", response_model=SheetSyncResult)
+async def sync_sheet(
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sync the prospect list with the tenant's connected Google Sheet — pull, then push.
+
+    Manual by design, not a background job: the operator pressing this button *is* the
+    conflict resolution, because they know whether they just edited the sheet or just ran
+    a batch of calls. See sheets_service's module docstring for why a live bidirectional
+    sync is the wrong thing to build here.
+
+    Which document to sync comes from the tenant's `sheet` integration row; the
+    service-account credential comes from env, never the database.
+
+    Declared above /{prospect_id} so "sync-sheet" isn't parsed as a UUID.
+    """
+    integration = await integration_config_service.get(db, tenant_id, "sheet")
+    if not integration or not integration.enabled:
+        raise HTTPException(
+            status_code=422,
+            detail="No Google Sheet connected. Configure one via PUT /api/integrations/sheet.",
+        )
+    config = integration.config or {}
+    spreadsheet_id = str(config.get("spreadsheet_id") or "")
+    if not spreadsheet_id:
+        raise HTTPException(status_code=422, detail="The sheet integration has no spreadsheet_id.")
+
+    try:
+        stats = await sheets_service.sync(
+            db, tenant_id, spreadsheet_id, str(config.get("sheet_name") or "Sheet1")
+        )
+    except sheets_service.SheetSyncError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Could not reach Google Sheets: {exc}"
+        ) from exc
+    return SheetSyncResult(**stats)
 
 
 @router.post("/batch-call", response_model=BatchCallResult)

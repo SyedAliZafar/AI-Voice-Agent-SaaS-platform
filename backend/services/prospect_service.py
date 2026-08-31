@@ -12,7 +12,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
@@ -506,7 +506,10 @@ async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.
         return
     prospect.call_count += 1
     prospect.last_called_at = datetime.now(UTC)
-    if prospect.outreach_status == "not_reached":
+    # "callback" is consumed here, not just advanced past: it's a one-shot request for a
+    # retry (see batch_call_targets), and leaving it set would keep the prospect
+    # permanently eligible and re-dial them on every subsequent batch run.
+    if prospect.outreach_status in ("not_reached", "callback"):
         prospect.outreach_status = "reached"
     await db.commit()
 
@@ -644,13 +647,24 @@ async def batch_call_targets(
     max_call_count: int = 0,
 ) -> list[Prospect]:
     """Prospects eligible for a batch outreach run: has a phone, not opted out, and
-    called no more than `max_call_count` times (0 = never called). Highest priority
-    first, so a truncated run works the best leads.
+    either called no more than `max_call_count` times (0 = never called) **or** explicitly
+    flagged for a callback. Highest priority first, so a truncated run works the best leads.
+
+    The callback escape hatch is what makes "call this one again" possible at all: a
+    prospect who has already been dialled three times and went to voicemail fails the
+    `call_count <= max_call_count` test forever, which is correct as a default and wrong
+    the moment an operator deliberately asks for a retry. `outreach_status == "callback"`
+    is that ask — set from the sheet's "Call again?" column (sheets_service) or by hand
+    via PATCH — and record_call() clears it back to "reached" as the call goes out, so
+    one tick buys exactly one retry rather than a permanent re-dial loop.
     """
     query = select(Prospect).where(
         Prospect.tenant_id == tenant_id,
         Prospect.phone.isnot(None),
-        Prospect.call_count <= max_call_count,
+        or_(
+            Prospect.call_count <= max_call_count,
+            Prospect.outreach_status == "callback",
+        ),
         Prospect.status.notin_(["do_not_call", "booked"]),
         Prospect.outreach_status != "do_not_call",
     )

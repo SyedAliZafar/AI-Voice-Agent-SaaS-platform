@@ -112,6 +112,21 @@ class ProspectStats(BaseModel):
     do_not_call: int = 0
 
 
+class SheetSyncResult(BaseModel):
+    """What POST /api/prospects/sync-sheet did — one pull-then-push round trip.
+
+    `rows_read` is what the sheet held; `written` is what it holds now (prospects the
+    sheet didn't have, from discovery or a CSV import, get appended). `queued` counts
+    rows whose "Call again?" box was ticked and are now eligible for the next batch call.
+    """
+
+    rows_read: int = 0
+    created: int = 0
+    updated: int = 0
+    queued: int = 0
+    written: int = 0
+
+
 class CallSyncResult(BaseModel):
     """What POST /api/prospects/sync-calls did — the operator's receipt for a backfill.
 

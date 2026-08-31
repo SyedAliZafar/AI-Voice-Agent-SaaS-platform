@@ -33,13 +33,22 @@ from backend.services import integration_service
 # "esign" is deliberately absent: we supply the NDA template and send it from our own
 # Dropbox Sign account, so that credential is platform config, not a tenant row. See
 # models/integration.py.
-SUPPORTED: dict[str, set[str]] = {"crm": {"hubspot"}}
+SUPPORTED: dict[str, set[str]] = {"crm": {"hubspot"}, "sheet": {"google_sheets"}}
 
 # Config keys each provider understands. Unknown keys are rejected rather than stored:
 # a typo'd "api_kye" that silently persists reads as "connected" in the UI and then fails
 # on the first real sync, which is the failure mode this whole endpoint exists to prevent.
+#
+# google_sheets deliberately stores NO credential — only which document to sync. The
+# service-account private key lives in GOOGLE_SHEETS_CREDENTIALS_FILE (see config.py),
+# not in this table: `Integration.config` is plaintext (see models/integration.py's
+# closing note), and a service-account private key is a much worse thing to leave
+# unencrypted in a shared database than a scoped API key. Keeping it out of the row also
+# means the sheet connection can be reconfigured by an operator who was never given the
+# key.
 ALLOWED_CONFIG_KEYS: dict[str, set[str]] = {
     "hubspot": {"api_key", "pipeline_id", "stage_id", "portal_id"},
+    "google_sheets": {"spreadsheet_id", "sheet_name"},
 }
 
 

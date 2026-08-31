@@ -152,6 +152,13 @@ class Settings(BaseSettings):
 
     # Prospecting — Google Places discovery + website research
     google_places_api_key: str = ""
+    # Path to a Google service-account JSON key, used to read/write the prospect sheet.
+    # Deliberately a file path in env rather than a value in the `integrations` table:
+    # Integration.config is plaintext (see models/integration.py), and a service-account
+    # private key is a far worse thing to leave unencrypted in a shared database than a
+    # scoped API key. The `integrations` row holds only which document to sync.
+    # The sheet must be shared with the service account's email as an Editor.
+    google_sheets_credentials_file: str = ""
     research_max_page_bytes: int = 400_000  # cap scraped HTML so one huge page can't stall a task
     research_http_timeout_sec: float = 10.0
     # Priority weights — tune these once real call outcomes are in. See

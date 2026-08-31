@@ -5,6 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { CsvImportButton } from "@/components/features/prospects/CsvImportButton";
 import { SyncCallsButton } from "@/components/features/prospects/SyncCallsButton";
+import { SyncSheetButton } from "@/components/features/prospects/SyncSheetButton";
 import { ProspectCallDrawer } from "@/components/features/prospects/ProspectCallDrawer";
 import { ProspectFilters } from "@/components/features/prospects/ProspectFilters";
 import { ProspectGroupTree } from "@/components/features/prospects/ProspectGroupTree";
@@ -133,6 +134,7 @@ function ProspectsPageInner() {
         actions={
           <div className="flex items-center gap-2">
             <SyncCallsButton onSynced={() => refetch().catch(() => {})} />
+            <SyncSheetButton onSynced={() => refetch().catch(() => {})} />
             <CsvImportButton onImported={() => refetch().catch(() => {})} />
           </div>
         }

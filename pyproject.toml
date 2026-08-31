@@ -19,6 +19,12 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "python-multipart>=0.0.12",
     "beautifulsoup4>=4.12.0",
+    # RS256 JWT signing for the Google Sheets prospect sync (services/sheets_service.py).
+    # ONLY the crypto is used — not google-auth's own refresh(), which routes through
+    # google.auth.transport.requests and would drag in `requests`, a second synchronous
+    # HTTP stack, purely for one token call. The token exchange and every Sheets request
+    # are plain httpx, same as retell_adapter.
+    "google-auth>=2.35.0",
     # Used only for Retell webhook signature verification (Retell.verify) in
     # services/retell_adapter.py — the HMAC scheme is not worth reimplementing by hand.
     "retell-sdk>=4.0.0",
