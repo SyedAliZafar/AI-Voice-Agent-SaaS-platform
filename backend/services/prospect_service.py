@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
+from backend.models.call import Call
 from backend.models.prospect import Prospect
 from backend.schemas.prospect import CompanyResearch, CsvImportResult
 
@@ -439,3 +440,140 @@ async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.
     if prospect.outreach_status == "not_reached":
         prospect.outreach_status = "reached"
     await db.commit()
+
+
+# Forward-only ranking of the campaign-outcome axis, used by classify_call_outcome. A
+# later, richer webhook can move a prospect *up* this ladder (a call_ended with nobody
+# on the line, then a call_analyzed showing a human + negative sentiment), never back
+# down — and a status not on the ladder at all (booked / flagged / do_not_call, all
+# operator-set) is never touched. "flagged" IS on the ladder: it's the terminal
+# auto-outcome for "a person rejected us", above a plain "called".
+_OUTCOME_STATUS_ORDER = {"not_called": 0, "no_answer": 1, "called": 2, "flagged": 3}
+
+
+async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
+    """Advance Prospect.status off how a just-terminal prospect call ended. The prospect
+    counterpart to lead_service.evaluate_call_outcome — called from
+    call_service._fanout_post_call for any Call carrying a prospect_id.
+
+    Idempotent by construction: it fires on call_ended, call_analyzed and any later
+    reconcile, and only ever moves status forward along
+    not_called -> no_answer -> called -> flagged (see _OUTCOME_STATUS_ORDER). A prospect
+    an operator has already set to booked / flagged / do_not_call is left alone.
+
+    "Rejected" = a human was actually on the line AND Retell's post-call sentiment came
+    back negative. Sentiment on a call nobody answered (or a 3-second hangup) is noise,
+    so answered_by_human gates it. A sharper transcript-based signal can replace the
+    sentiment check later without touching this seam.
+    """
+    if not call.prospect_id:
+        return
+    prospect = await get_prospect_unscoped(db, call.prospect_id)
+    if not prospect or prospect.status not in _OUTCOME_STATUS_ORDER:
+        return
+
+    if call.answered_by_human:
+        rejected = call.sentiment_score is not None and call.sentiment_score <= 0.0
+        new_status = "flagged" if rejected else "called"
+    else:
+        # voicemail_reached, dial_no_answer, user_declined, dial_busy/failed, or a
+        # "resolved" call with zero caller turns — all "we didn't reach a person".
+        new_status = "no_answer"
+
+    if _OUTCOME_STATUS_ORDER[new_status] <= _OUTCOME_STATUS_ORDER[prospect.status]:
+        return
+
+    prospect.status = new_status
+    if call.answered_by_human and prospect.outreach_status == "not_reached":
+        prospect.outreach_status = "reached"
+    await db.commit()
+
+
+# batch outreach + CSV export -------------------------------------------------------
+
+BATCH_CALL_MAX = 50  # one dispatch loop, capped so a fat-fingered limit can't drain credit
+
+
+async def batch_call_targets(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    limit: int,
+    city: str | None = None,
+    max_call_count: int = 0,
+) -> list[Prospect]:
+    """Prospects eligible for a batch outreach run: has a phone, not opted out, and
+    called no more than `max_call_count` times (0 = never called). Highest priority
+    first, so a truncated run works the best leads.
+    """
+    query = select(Prospect).where(
+        Prospect.tenant_id == tenant_id,
+        Prospect.phone.isnot(None),
+        Prospect.call_count <= max_call_count,
+        Prospect.status.notin_(["do_not_call", "booked"]),
+        Prospect.outreach_status != "do_not_call",
+    )
+    if city:
+        query = query.where(Prospect.city == city)
+    query = query.order_by(Prospect.priority_score.desc()).limit(limit)
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
+CSV_EXPORT_COLUMNS = (
+    "phone number",
+    "business_name",
+    "website",
+    "address",
+    "city",
+    "rating",
+    "reviews",
+    "status",
+    "outreach_status",
+    "call_count",
+    "last_called_at",
+)
+
+
+async def export_csv(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    status: str | None = None,
+    outreach_status: str | None = None,
+    city: str | None = None,
+) -> str:
+    """Render the prospect list (optionally filtered) as CSV text. `phone number` is the
+    first column so the file re-uploads straight into a Retell batch call; the trailing
+    status columns are the outreach ledger classify_call_outcome maintains.
+    """
+    query = select(Prospect).where(Prospect.tenant_id == tenant_id)
+    if status:
+        query = query.where(Prospect.status == status)
+    if outreach_status:
+        query = query.where(Prospect.outreach_status == outreach_status)
+    if city:
+        query = query.where(Prospect.city == city)
+    query = query.order_by(Prospect.priority_score.desc())
+    rows = (await db.execute(query)).scalars().all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(CSV_EXPORT_COLUMNS)
+    for p in rows:
+        writer.writerow(
+            [
+                p.phone or "",
+                p.name,
+                p.website or "",
+                p.address or "",
+                p.city or "",
+                p.rating if p.rating is not None else "",
+                p.review_count,
+                p.status,
+                p.outreach_status,
+                p.call_count,
+                p.last_called_at.isoformat() if p.last_called_at else "",
+            ]
+        )
+    return buf.getvalue()

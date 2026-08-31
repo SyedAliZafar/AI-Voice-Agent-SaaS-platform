@@ -26,6 +26,13 @@ class CallResponse(BaseModel):
     duration_sec: int
     sentiment_score: float | None
     started_at: datetime
+    # Set when the call was placed to work a Prospect (per-prospect /call or a batch run).
+    prospect_id: uuid.UUID | None = None
+    # Retell's raw disconnection_reason, kept verbatim next to the coarser `status` —
+    # "voicemail_reached", "dial_no_answer", "user_hangup", … Null until terminal.
+    disconnection_reason: str | None = None
+    # True/False once terminal (did a person speak), None while in progress or unknown.
+    answered_by_human: bool | None = None
 
     model_config = {"from_attributes": True}
 

@@ -147,6 +147,51 @@ class ProspectCallRequest(BaseModel):
         return self
 
 
+class BatchCallRequest(BaseModel):
+    """Dial a batch of not-yet-called prospects with one agent.
+
+    Same agent-source rule as ProspectCallRequest: exactly one of agent_id /
+    external_agent_id. The local-agent path only dials prospects whose research is
+    "ready" (it needs the [COMPANY BRIEF]); anything not ready is reported as skipped
+    rather than failing the run. The platform-agent path has no such gate.
+    """
+
+    agent_id: uuid.UUID | None = None
+    external_agent_id: str | None = None
+    limit: int = Field(default=10, ge=1, le=50)
+    city: str | None = None  # restrict the batch to one city
+    # Prospects called at most this many times are eligible — 0 (default) means "never
+    # called". Raise it to re-work no-answers.
+    max_call_count: int = Field(default=0, ge=0)
+    # Platform-agent path only — fills the dashboard prompt's {{placeholders}}, applied
+    # to every call in the batch (per-prospect personalization is the local-agent path).
+    dynamic_variables: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _exactly_one_agent(self) -> "BatchCallRequest":
+        if (self.agent_id is None) == (self.external_agent_id is None):
+            raise ValueError("provide exactly one of agent_id or external_agent_id")
+        return self
+
+
+class BatchCallDispatch(BaseModel):
+    prospect_id: uuid.UUID
+    name: str
+    call_id: str
+
+
+class BatchCallSkip(BaseModel):
+    prospect_id: uuid.UUID
+    name: str
+    reason: str
+
+
+class BatchCallResult(BaseModel):
+    requested: int  # how many eligible prospects the filter matched (<= limit)
+    dispatched: list[BatchCallDispatch] = Field(default_factory=list)
+    skipped: list[BatchCallSkip] = Field(default_factory=list)
+
+
 class ProspectSandboxChatRequest(BaseModel):
     """Text-chat sandbox for one prospect's personalized script. Reuses SandboxMessage
     from schemas.agent rather than redefining it — same shape, one type.

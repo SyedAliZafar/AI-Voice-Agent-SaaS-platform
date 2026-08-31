@@ -94,6 +94,7 @@ async def place_test_call(
     to_number: str,
     system_prompt_override: str | None = None,
     lead_id: uuid.UUID | None = None,
+    prospect_id: uuid.UUID | None = None,
 ) -> dict:
     """Place an outbound call for `agent`.
 
@@ -105,9 +106,10 @@ async def place_test_call(
     provisioning time, while the custom-LLM path stores it on the Call row for
     backend/api/retell_ws.py to pick up (see Call.system_prompt_override).
 
-    `lead_id` tags the resulting Call row so call_service's terminal-state writer can
-    hand off to lead_service.evaluate_call_outcome (ADR-011) — None for every other
-    caller (plain test calls, prospect calls).
+    `lead_id` / `prospect_id` tag the resulting Call row so call_service._fanout_post_call
+    can hand a terminal call to lead_service.evaluate_call_outcome (ADR-011) or
+    prospect_service.classify_call_outcome. At most one is set; both are None for a plain
+    test call.
 
     tenant_id is required: this endpoint spends real telephony money on the caller's
     Retell/Twilio account, so it must never dial on behalf of an agent the caller
@@ -157,6 +159,7 @@ async def place_test_call(
         call_id,
         to_number,
         lead_id=lead_id,
+        prospect_id=prospect_id,
         system_prompt_override=system_prompt_override if agent.use_custom_llm else None,
     )
 
@@ -264,6 +267,7 @@ async def place_platform_agent_call(
     to_number: str,
     platform: str = "retell",
     dynamic_variables: dict[str, str] | None = None,
+    prospect_id: uuid.UUID | None = None,
 ) -> dict:
     """Dial using an agent that already exists on the voice platform (ADR-012).
 
@@ -322,6 +326,7 @@ async def place_platform_agent_call(
         None,
         call_id,
         to_number,
+        prospect_id=prospect_id,
         external_agent_id=external_agent_id,
     )
 

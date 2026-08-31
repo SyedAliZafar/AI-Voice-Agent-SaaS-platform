@@ -87,7 +87,7 @@ voiceagent/
 │   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012); GET /templates + POST /from-template for the scripts/agent_templates gallery
 │   │   ├── calls.py              # Call history, transcript retrieval
 │   │   ├── analytics.py          # Metrics, aggregations
-│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/sandbox-chat/city-autocomplete. /call takes agent_id OR external_agent_id — only the former personalizes (ADR-012)
+│   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list/stats/research/status/call/batch-call/export/sandbox-chat/city-autocomplete. /call + /batch-call take agent_id OR external_agent_id — only the former personalizes (ADR-012)
 │   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
 │   │   ├── integrations.py       # Connect a tenant's CRM: GET/PUT/DELETE /{kind} + POST /{kind}/test — the repo's first credential CRUD surface
 │   │   ├── webhooks.py           # POST /webhooks/retell, POST /webhooks/vapi
@@ -244,7 +244,7 @@ voiceagent/
     ├── test_webhooks.py
     ├── test_llm_service.py
     ├── test_sandbox_service.py
-    ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import, sandbox-chat, city-autocomplete
+    ├── test_prospects.py         # /api/prospects router: validation, tenant scoping, CSV import, per-prospect + batch calling, CSV export, sandbox-chat, city-autocomplete
     ├── test_prospect_service.py
     ├── test_prospect_tasks.py    # discover_prospects task: arguments reach places_service, source_location/city/country persist; sweep_stale_prospects re-enqueue logic
     ├── test_places_service.py    # addressComponents extraction, autocomplete normalization
@@ -374,7 +374,10 @@ ended hours ago with a lost webhook.
 
 Status mapping lives there too: `disconnection_reason` distinguishes `resolved` from
 `escalated` (`call_transfer`) and `failed` (dial failures, `error*`), which is richer than
-the "everything that ended is resolved" assumption this code started with.
+the "everything that ended is resolved" assumption this code started with. The raw reason
+is also kept verbatim on `Call.disconnection_reason` (alongside the coarse `status`) plus
+a computed `Call.answered_by_human` — `status` alone collapses voicemail / declined /
+rang-out into `failed`, and prospect outcome classification (ADR-006) needs them apart.
 
 Signature verification (`X-Retell-Signature`, HMAC-SHA256 over the raw body with a
 5-minute replay window) is delegated to the official `retell-sdk` — see
@@ -837,8 +840,18 @@ pipeline sources and ranks call targets, upstream of everything else in this doc
 no_answer | do_not_call`), the operator-set campaign-outcome axis behind the
 /prospects dropdown and counts strip. It overlaps `outreach_status` heavily
 (`not_called`≈`not_reached`, `called`≈`reached`, `do_not_call` identical) but is
-**not** auto-synced with it: `record_call()` still advances only `outreach_status`,
-and setting one via `PATCH /api/prospects/{id}` never moves the other.
+**not** auto-synced with it: `record_call()` (at dispatch) advances only
+`outreach_status`, and setting one via `PATCH /api/prospects/{id}` never moves the other.
+
+`status` *is* now advanced automatically too, but by a different trigger and only
+forward: `prospect_service.classify_call_outcome()`, called from
+`call_service._fanout_post_call` once a prospect's call reaches a terminal state (the
+same seam `lead_service.evaluate_call_outcome` hangs off — ADR-011). It walks
+`not_called → no_answer → called → flagged` off `Call.disconnection_reason` /
+`Call.answered_by_human` / sentiment, never downgrades, and never touches a row an
+operator has set to `booked` / `flagged` / `do_not_call`. "Rejected" = a human actually
+spoke *and* post-call sentiment was negative; a sharper transcript-based signal can
+replace the sentiment check without moving the seam.
 
 Adding a parallel column was chosen over widening `outreach_status`'s value set
 because the latter is load-bearing for step 3 above (`record_call`'s auto-transition),
@@ -908,10 +921,12 @@ just flips `retry_state` to `in_flight` and increments `attempt_count`; whether 
 counts as a success is decided later, when Retell says the call ended.
 `call_service.apply_retell_call_state`'s three callers (`handle_call_ended`,
 `handle_call_analyzed`, `reconcile_call` — the single writer ADR-007 established) each
-now call a new `_fanout_lead_post_call(db, call)` once the call reaches a terminal status
-(named `_maybe_advance_lead` when ADR-011 landed; renamed in phase5 Session 1, when it
-gained further consumers — see the note at the end of this ADR), which hands off to
-`lead_service.evaluate_call_outcome` if `Call.lead_id` is set. This
+now call a `_fanout_post_call(db, call)` once the call reaches a terminal status
+(named `_maybe_advance_lead` when ADR-011 landed; `_fanout_lead_post_call` in phase5
+Session 1; renamed again once prospect classification joined it — see the note at the
+end of this ADR), which hands off to `lead_service.evaluate_call_outcome` if
+`Call.lead_id` is set (and to `prospect_service.classify_call_outcome` if
+`Call.prospect_id` is — ADR-006). This
 piggybacks on the *existing* self-healing path rather than adding a second one: a
 webhook that never arrives is already covered by reconciliation, and the lead scheduler
 gets that resilience for free.
@@ -952,7 +967,7 @@ wrong. Celery Beat is a separate process from the worker (a worker alone never r
 sweep is then a no-op — `call_service.reconcile_call` reports "still ongoing" and
 nothing changes) or a lost webhook (ADR-007's exact scenario), reusing that existing
 reconcile path rather than inventing a second one. If reconciling brings the call to a
-terminal status, the same `_fanout_lead_post_call` hook that call_service's webhook
+terminal status, the same `_fanout_post_call` hook that call_service's webhook
 handlers use fires automatically — the sweep's only job is to trigger reconciliation
 for leads old enough that Retell should have concluded them by now.
 
@@ -960,7 +975,8 @@ for leads old enough that Retell should have concluded them by now.
 `_maybe_advance_lead` did one thing, so it was named after it. phase5 gives the same
 terminal-state moment two more consumers (a CRM push, and NDA intent extraction), so it
 was renamed `_fanout_lead_post_call`: the name now describes the seam rather than one of
-its consumers.
+its consumers. (Renamed once more to `_fanout_post_call` when ADR-006's prospect
+classification became a consumer too — the seam isn't lead-specific.)
 
 Everything hung off that point inherits reconciliation's self-healing for free — which is
 the whole reason it's the right seam and not the webhook handler. A consumer added here
@@ -1159,7 +1175,9 @@ files, stop.
 | **Stop a live call / change how hangups work** | `retell_adapter.py` (`stop_call`/`list_live_calls`) → `call_service.end_call` → `api/calls.py` and `scripts/kill_calls.py` (both call the service; keep the CLI dependency-free so it works when the API is down) → `tests/test_retell_adapter.py`. Terminal state stays `apply_retell_call_state`'s job — don't write status here (ADR-007) |
 | **Change how platform-native agents are listed or dialed** (ADR-012) | `<platform>_adapter.py`'s `list_platform_agents` (normalization lives there, not in the service) → `test_call_service.list_platform_agents` / `place_platform_agent_call` → `schemas/agent.py`'s `PlatformAgent*` → `api/agents.py` (keep the routes ABOVE `/{agent_id}`) → `tests/test_retell_adapter.py` + `tests/test_test_call_service.py` → `frontend/src/hooks/usePlatformAgents.ts`. If the change touches `{{placeholders}}`, `_DYNAMIC_VARIABLE_RE` and the missing-value guard in `place_platform_agent_call` move together — a name the UI can't see is a name that gets spoken aloud. Do **not** add provisioning to this path — "we don't own this agent's config" is the whole distinction it encodes |
 | **Offer the platform-agent source on another dial surface** | the surface's request schema (exactly-one-of validator, mirroring `ProspectCallRequest`) → its router, branching to `place_platform_agent_call` *before* any personalization work → the UI picker, and **say in the UI what the platform agent won't receive** — silently dropping a personalized prompt is the failure mode this pattern exists to prevent → its router test, asserting the personalized path was NOT taken |
-| **Add work that must happen when a lead's call ends** | `call_service._fanout_lead_post_call` — enqueue only, never execute inline (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
+| **Add work that must happen when a call ends** (lead or prospect) | `call_service._fanout_post_call` — branch on `Call.lead_id` / `Call.prospect_id`; keep it to a few local queries or enqueue to Celery (ADR-005), and give it its own idempotency guard, since the hook fires on `call_ended`, `call_analyzed` *and* a later reconcile |
+| **Change how a prospect call's outcome maps to `Prospect.status`** | `prospect_service.classify_call_outcome` (+ `_OUTCOME_STATUS_ORDER` if the ladder changes) → `call_service.apply_retell_call_state` if it needs a new `Call` field off Retell's payload → `tests/test_prospect_service.py` → this ADR-006 note if the axis semantics move |
+| **Add a batch/bulk outbound action or a prospect CSV export** | `prospect_service` (`batch_call_targets` / `export_csv` — pure query + serialize) → `api/prospects.py`, declared *above* `/{prospect_id}` so the literal path wins → `schemas/prospect.py` → `tests/test_prospects.py` |
 
 Two rules that override anything above: never bypass tenant scoping (ADR-001), and never
 do real work inline in a webhook handler (ADR-005). See [EFFICIENCY.md](EFFICIENCY.md)
@@ -1176,6 +1194,13 @@ for how to move through these efficiently.
 3. Operator reviews ranked prospects in `frontend/src/app/prospects/page.tsx`, generates
    a script (`script_service.py`), and decides who becomes a `test-call` / outbound call
    target and when (`outreach_status` moves from `not_reached` onward).
+4. Calls go out one at a time (`POST /api/prospects/{id}/call`) or in bulk
+   (`POST /api/prospects/batch-call` — up to 50 not-yet-called prospects, highest
+   priority first). Each `Call` row carries `prospect_id`.
+5. When a call ends, `_fanout_post_call` → `prospect_service.classify_call_outcome`
+   advances `Prospect.status` (`no_answer` / `called` / `flagged`) off how it ended.
+   `GET /api/prospects/export` dumps the (optionally filtered) list as CSV, phone
+   column first so it re-uploads into a Retell batch call.
 
 ### Inbound call
 1. Caller dials → Twilio routes to Retell/Vapi

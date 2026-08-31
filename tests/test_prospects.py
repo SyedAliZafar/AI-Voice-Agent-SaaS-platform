@@ -700,12 +700,15 @@ def placed_calls(monkeypatch) -> list[dict]:
 
     calls: list[dict] = []
 
-    async def fake_place_test_call(db, agent_id, tenant_id, to_number, system_prompt_override=None):
+    async def fake_place_test_call(
+        db, agent_id, tenant_id, to_number, system_prompt_override=None, prospect_id=None
+    ):
         calls.append(
             {
                 "agent_id": agent_id,
                 "to_number": to_number,
                 "prompt": system_prompt_override,
+                "prospect_id": prospect_id,
             }
         )
         return {
@@ -846,12 +849,15 @@ def placed_platform_calls(monkeypatch) -> list[dict]:
 
     calls: list[dict] = []
 
-    async def fake_place(db, tenant_id, external_agent_id, to_number, dynamic_variables=None):
+    async def fake_place(
+        db, tenant_id, external_agent_id, to_number, dynamic_variables=None, prospect_id=None
+    ):
         calls.append(
             {
                 "external_agent_id": external_agent_id,
                 "to_number": to_number,
                 "dynamic_variables": dynamic_variables,
+                "prospect_id": prospect_id,
             }
         )
         return {
@@ -887,6 +893,7 @@ async def test_call_with_a_platform_agent_sends_no_personalized_prompt(
             "external_agent_id": "agent_ext_9",
             "to_number": prospect.phone,
             "dynamic_variables": {},
+            "prospect_id": prospect.id,
         }
     ]
 
@@ -990,6 +997,101 @@ async def test_call_forwards_dynamic_variables_to_the_platform_agent(
         "company_name": "Acme HVAC",
         "contact_name": "Maria",
     }
+
+
+@pytest.mark.asyncio
+async def test_call_links_the_call_to_its_prospect(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    """Without prospect_id on the Call row, the outcome webhook can't feed back."""
+    prospect = await _researched_prospect(db_session, tenant_id)
+    agent = await _agent(db_session, tenant_id)
+
+    await client.post(
+        f"/api/prospects/{prospect.id}/call",
+        json={"agent_id": str(agent.id)},
+        headers=auth_headers,
+    )
+
+    assert placed_calls[0]["prospect_id"] == prospect.id
+
+
+# --- batch outbound calling ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_call_dials_uncalled_prospects_and_reports(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    for i in range(3):
+        p = await _make_prospect(db_session, tenant_id, f"Roofer {i}", f"p_batch_{i}")
+        p.phone = f"+44117000000{i}"
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/prospects/batch-call",
+        json={"external_agent_id": "agent_ext_1", "limit": 2},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requested"] == 2
+    assert len(body["dispatched"]) == 2
+    assert len(placed_platform_calls) == 2
+    # every dial carried its prospect_id
+    assert all(c["prospect_id"] is not None for c in placed_platform_calls)
+
+
+@pytest.mark.asyncio
+async def test_batch_call_skips_prospects_without_ready_research_on_the_local_path(
+    client, db_session, tenant_id, auth_headers, placed_calls
+):
+    ready = await _researched_prospect(db_session, tenant_id)
+    not_ready = await _make_prospect(db_session, tenant_id, "Unresearched", "p_nr")
+    not_ready.phone = "+441170009999"
+    await db_session.commit()
+    agent = await _agent(db_session, tenant_id)
+
+    resp = await client.post(
+        "/api/prospects/batch-call",
+        json={"agent_id": str(agent.id), "limit": 10},
+        headers=auth_headers,
+    )
+
+    body = resp.json()
+    dispatched_names = [d["name"] for d in body["dispatched"]]
+    skipped_names = [s["name"] for s in body["skipped"]]
+    assert ready.name in dispatched_names
+    assert not_ready.name in skipped_names
+    assert len(placed_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_call_rejects_naming_both_or_neither_agent(client, auth_headers):
+    for body in ({}, {"agent_id": str(uuid.uuid4()), "external_agent_id": "x"}):
+        resp = await client.post("/api/prospects/batch-call", json=body, headers=auth_headers)
+        assert resp.status_code == 422
+
+
+# --- CSV export -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_export_returns_csv_with_the_retell_phone_header(
+    client, db_session, tenant_id, auth_headers
+):
+    p = await _make_prospect(db_session, tenant_id, "Exported Co", "p_exp")
+    p.phone = "+441170001234"
+    await db_session.commit()
+
+    resp = await client.get("/api/prospects/export", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    lines = resp.text.splitlines()
+    assert lines[0].split(",")[0] == "phone number"
+    assert "Exported Co" in resp.text
 
 
 # --- prospect sandbox chat ---------------------------------------------------------

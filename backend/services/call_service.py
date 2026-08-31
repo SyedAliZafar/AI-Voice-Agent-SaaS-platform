@@ -129,6 +129,7 @@ async def create_outbound_call_record(
     external_id: str,
     caller_number: str,
     lead_id: uuid.UUID | None = None,
+    prospect_id: uuid.UUID | None = None,
     system_prompt_override: str | None = None,
     external_agent_id: str | None = None,
 ) -> Call:
@@ -139,6 +140,10 @@ async def create_outbound_call_record(
     `system_prompt_override` is only meaningful for use_custom_llm agents: it's how a
     personalized, call-scoped prompt reaches backend/api/retell_ws.py, which resolves it
     off this row rather than from Agent.system_prompt. See Call.system_prompt_override.
+
+    `lead_id` / `prospect_id` tag the row so _fanout_post_call can hand a terminal call to
+    lead_service.evaluate_call_outcome (ADR-011) or prospect_service.classify_call_outcome
+    respectively. At most one is ever set; both are None for a plain test or web call.
 
     `agent_id` and `external_agent_id` are the two ways a call names its agent, and
     exactly one must be given: a local Agent row we provisioned, or a platform-native
@@ -158,6 +163,7 @@ async def create_outbound_call_record(
         started_at=datetime.now(UTC),
         external_id=external_id,
         lead_id=lead_id,
+        prospect_id=prospect_id,
         system_prompt_override=system_prompt_override,
     )
     db.add(call)
@@ -361,11 +367,16 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     """
     changed = False
 
-    new_status = _status_for(
-        str(payload.get("call_status") or ""), payload.get("disconnection_reason")
-    )
+    raw_reason = payload.get("disconnection_reason")
+    new_status = _status_for(str(payload.get("call_status") or ""), raw_reason)
     if new_status and call.status != new_status:
         call.status = new_status
+        changed = True
+
+    # Keep Retell's raw reason verbatim — _status_for collapses voicemail/declined/
+    # rang-out all into "failed", and prospect outcome classification needs them apart.
+    if isinstance(raw_reason, str) and raw_reason and call.disconnection_reason != raw_reason:
+        call.disconnection_reason = raw_reason
         changed = True
 
     duration_ms = payload.get("duration_ms")
@@ -407,48 +418,65 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
             await record_turns(db, call, turns, sync_full_text=False)
             changed = True
 
+    # Whether a person actually spoke — computed once the call is terminal, off the
+    # transcript this function has just finished writing. `caller` turns come only from
+    # the far end, so a voicemail pickup or an instant hangup lands zero. Mirrors the
+    # "human answered and talked" test in lead_service.evaluate_call_outcome.
+    effective_status = new_status or call.status
+    if effective_status in ("resolved", "escalated", "failed"):
+        transcript = await get_transcript(db, call.id, call.tenant_id)
+        answered = any(t.get("role") == "caller" for t in (transcript.turns if transcript else []))
+        if call.answered_by_human != answered:
+            call.answered_by_human = answered
+            changed = True
+
     return changed
 
 
-async def _fanout_lead_post_call(db: AsyncSession, call: Call) -> None:
-    """Everything that must happen once a lead's call reaches a terminal status.
+async def _fanout_post_call(db: AsyncSession, call: Call) -> None:
+    """Everything that must happen once a call reaches a terminal status.
 
-    Was `_maybe_advance_lead`, which did exactly one thing. Renamed when phase5 gave it a
-    second and third job (CRM push, NDA intent extraction) — the name now describes the
-    seam rather than one of its consumers, so adding the next one doesn't rename it again.
+    Was `_maybe_advance_lead`, then `_fanout_lead_post_call` — renamed again once
+    prospect outcome classification joined the lead scheduler here, since the seam is
+    no longer lead-specific.
 
     **All three callers must keep going through this one function.** `handle_call_ended`,
     `handle_call_analyzed` and `reconcile_call` each reach terminal state by a different
     route, and routing them all through here is what ADR-007's single-writer rule buys:
     anything hung off this point inherits reconciliation's self-healing for free, so a
     webhook that never arrives doesn't need its own recovery path. That's how the lead
-    scheduler got resilient (ADR-011), and it's why the CRM sync and the NDA extractor
-    belong here rather than in the webhook handler.
+    scheduler got resilient (ADR-011), and it's why prospect classification belongs here
+    rather than in the webhook handler.
 
     Two rules for whatever gets added below:
-    - **Enqueue, never execute.** This runs on the webhook request path, which has a
-      <200ms budget (ADR-005). Celery does the work.
+    - **Enqueue, never execute — unless the work is a couple of local queries.** This
+      runs on the webhook request path (<200ms budget, ADR-005); anything heavier than a
+      few statements goes to Celery. `evaluate_call_outcome` / `classify_call_outcome`
+      are cheap enough to stay inline, and their state must be correct before anything
+      downstream reads it.
     - **Assume it runs more than once per call.** call_ended and call_analyzed both reach
-      a terminal status, and a later reconcile can too. `evaluate_call_outcome` handles
-      that with its own `in_flight` guard; every new consumer needs its own equivalent
-      (phase5 Session 2 keys on `Call.crm_engagement_id`, Session 3 on a unique
-      constraint).
+      a terminal status, and a later reconcile can too. Each consumer carries its own
+      idempotency guard (`evaluate_call_outcome`'s `in_flight` check;
+      `classify_call_outcome`'s forward-only status ordering).
 
-    Imported locally, not at module level: lead_service doesn't import call_service
-    today, but keeping the dependency one-directional and lazy avoids ever having to
-    care about import order between the two.
+    Imported locally, not at module level: those services don't import call_service
+    today, and keeping the dependency one-directional and lazy avoids ever having to
+    care about import order.
     """
-    if not call.lead_id or call.status not in ("resolved", "escalated", "failed"):
+    if call.status not in ("resolved", "escalated", "failed"):
         return
-    from backend.services import lead_service
 
-    # 1. Scheduler bookkeeping — succeeded, or back on the backoff ladder (ADR-011).
-    #    Stays inline and awaited: it's two local queries, and the retry state must be
-    #    correct before anything downstream reads it.
-    await lead_service.evaluate_call_outcome(db, call)
+    if call.lead_id:
+        # Scheduler bookkeeping — succeeded, or back on the backoff ladder (ADR-011).
+        from backend.services import lead_service
 
-    # 2. CRM push (phase5 Session 2) and 3. NDA intent extraction (Session 4) get
-    #    enqueued here. Nothing to enqueue yet — those task bodies don't exist.
+        await lead_service.evaluate_call_outcome(db, call)
+
+    if call.prospect_id:
+        # Campaign-outcome axis — advance Prospect.status off how this call ended.
+        from backend.services import prospect_service
+
+        await prospect_service.classify_call_outcome(db, call)
 
 
 async def handle_call_ended(
@@ -469,7 +497,7 @@ async def handle_call_ended(
 
     await apply_retell_call_state(db, call, data)
     await db.commit()
-    await _fanout_lead_post_call(db, call)
+    await _fanout_post_call(db, call)
 
 
 async def handle_call_analyzed(
@@ -488,7 +516,7 @@ async def handle_call_analyzed(
 
     await apply_retell_call_state(db, call, payload)
     await db.commit()
-    await _fanout_lead_post_call(db, call)
+    await _fanout_post_call(db, call)
 
 
 async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
@@ -514,7 +542,7 @@ async def reconcile_call(db: AsyncSession, call: Call, adapter: Any) -> bool:
     changed = await apply_retell_call_state(db, call, payload)
     if changed:
         await db.commit()
-        await _fanout_lead_post_call(db, call)
+        await _fanout_post_call(db, call)
     return changed
 
 

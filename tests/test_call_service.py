@@ -98,6 +98,76 @@ async def test_handle_call_ended_prefers_platform_duration(db_session, tenant_id
     assert updated.duration_sec == 31
 
 
+@pytest.mark.asyncio
+async def test_call_ended_records_disconnection_reason_and_human_flag(db_session, tenant_id):
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "reason_call", "+491701234567"
+    )
+
+    await call_service.handle_call_ended(
+        db_session,
+        "reason_call",
+        {
+            "call_status": "ended",
+            "disconnection_reason": "voicemail_reached",
+            "transcript_object": [{"role": "agent", "content": "Hi, are you there?"}],
+        },
+    )
+
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated.disconnection_reason == "voicemail_reached"
+    assert updated.answered_by_human is False  # only an agent turn — nobody picked up
+
+
+@pytest.mark.asyncio
+async def test_call_ended_marks_answered_when_the_callee_spoke(db_session, tenant_id):
+    call = await call_service.create_outbound_call_record(
+        db_session, tenant_id, uuid.uuid4(), "answered_call", "+491701234567"
+    )
+
+    await call_service.handle_call_ended(
+        db_session,
+        "answered_call",
+        {
+            "call_status": "ended",
+            "disconnection_reason": "user_hangup",
+            "transcript_object": [
+                {"role": "agent", "content": "Hi there"},
+                {"role": "user", "content": "Not interested, thanks"},
+            ],
+        },
+    )
+
+    updated = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated.answered_by_human is True
+
+
+@pytest.mark.asyncio
+async def test_fanout_classifies_the_linked_prospect(db_session, tenant_id):
+    from backend.services import prospect_service
+
+    [prospect] = await prospect_service.upsert_from_places(
+        db_session, tenant_id, [{"google_place_id": "fp_1", "name": "FanoutCo"}], "q"
+    )
+    await call_service.create_outbound_call_record(
+        db_session,
+        tenant_id,
+        uuid.uuid4(),
+        "fanout_call",
+        "+491701234567",
+        prospect_id=prospect.id,
+    )
+
+    await call_service.handle_call_ended(
+        db_session,
+        "fanout_call",
+        {"call_status": "ended", "disconnection_reason": "dial_no_answer"},
+    )
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "no_answer"
+
+
 class _StubAdapter:
     """Stands in for RetellAdapter in reconcile and end_call tests."""
 

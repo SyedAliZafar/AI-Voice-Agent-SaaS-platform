@@ -7,13 +7,17 @@ go through prospect_service.get_prospect() (tenant-scoped), never get_prospect_u
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_tenant
 from backend.database import get_db
 from backend.schemas.agent import SandboxChatResponse, TestCallResponse
 from backend.schemas.prospect import (
+    BatchCallDispatch,
+    BatchCallRequest,
+    BatchCallResult,
+    BatchCallSkip,
     CityAutocompleteResponse,
     CityAutocompleteResult,
     CompanyResearch,
@@ -163,6 +167,108 @@ async def prospect_stats(
     return ProspectStats(**{k: v for k, v in counts.items() if k in ProspectStats.model_fields})
 
 
+@router.get("/export")
+async def export_prospects(
+    status: str | None = None,
+    outreach_status: str | None = None,
+    city: str | None = None,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """The prospect list as CSV, optionally filtered by status / outreach_status / city.
+
+    `phone number` is the first column so the file drops straight back into a Retell
+    batch call; the trailing status columns are the outreach ledger. Declared above
+    /{prospect_id} so "export" isn't parsed as a UUID.
+    """
+    csv_text = await prospect_service.export_csv(
+        db, tenant_id, status=status, outreach_status=outreach_status, city=city
+    )
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="prospects.csv"'},
+    )
+
+
+@router.post("/batch-call", response_model=BatchCallResult)
+async def batch_call(
+    payload: BatchCallRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dial up to `limit` not-yet-called prospects with one agent.
+
+    Per-prospect behaviour matches POST /{prospect_id}/call: a local `agent_id` gets
+    this prospect's [COMPANY BRIEF] injected (and is skipped, not failed, when research
+    isn't ready); an `external_agent_id` dials the platform-native agent with shared
+    dynamic_variables. record_call() advances the outreach counter as each dial lands;
+    the *outcome* is filled in later by classify_call_outcome off the call webhook.
+
+    Declared above /{prospect_id} so "batch-call" isn't parsed as a UUID.
+    """
+    targets = await prospect_service.batch_call_targets(
+        db,
+        tenant_id,
+        limit=payload.limit,
+        city=payload.city,
+        max_call_count=payload.max_call_count,
+    )
+    result = BatchCallResult(requested=len(targets))
+
+    agent = None
+    if payload.agent_id:
+        agent = await agent_service.get_agent(db, payload.agent_id, tenant_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+    for prospect in targets:
+        # batch_call_targets filters Prospect.phone.isnot(None); narrow for the type checker.
+        assert prospect.phone is not None
+        try:
+            if payload.external_agent_id:
+                call = await test_call_service.place_platform_agent_call(
+                    db,
+                    tenant_id,
+                    payload.external_agent_id,
+                    prospect.phone,
+                    dynamic_variables=payload.dynamic_variables,
+                    prospect_id=prospect.id,
+                )
+            else:
+                assert agent is not None  # resolved above whenever agent_id was given
+                if prospect.research_status != "ready":
+                    result.skipped.append(
+                        BatchCallSkip(
+                            prospect_id=prospect.id,
+                            name=prospect.name,
+                            reason=f"research is '{prospect.research_status}', not ready",
+                        )
+                    )
+                    continue
+                personalized_prompt = _build_personalized_prompt(agent, prospect)
+                call = await test_call_service.place_test_call(
+                    db,
+                    agent.id,
+                    tenant_id,
+                    prospect.phone,
+                    system_prompt_override=personalized_prompt,
+                    prospect_id=prospect.id,
+                )
+        except test_call_service.TestCallError as exc:
+            result.skipped.append(
+                BatchCallSkip(prospect_id=prospect.id, name=prospect.name, reason=str(exc))
+            )
+            continue
+
+        await prospect_service.record_call(db, prospect.id, tenant_id)
+        result.dispatched.append(
+            BatchCallDispatch(prospect_id=prospect.id, name=prospect.name, call_id=call["call_id"])
+        )
+
+    return result
+
+
 @router.get("/{prospect_id}", response_model=ProspectResponse)
 async def get_prospect(
     prospect_id: uuid.UUID,
@@ -269,6 +375,7 @@ async def call_prospect(
                 payload.external_agent_id,
                 to_number,
                 dynamic_variables=payload.dynamic_variables,
+                prospect_id=prospect_id,
             )
         except test_call_service.TestCallError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -295,6 +402,7 @@ async def call_prospect(
             tenant_id,
             to_number,
             system_prompt_override=personalized_prompt,
+            prospect_id=prospect_id,
         )
     except test_call_service.TestCallError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

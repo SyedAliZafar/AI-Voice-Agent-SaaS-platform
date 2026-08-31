@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -51,6 +51,26 @@ class Call(Base, UUIDMixin, TimestampMixin, TenantMixin):
     # so the override rides on the Call row it already looks up by external_id.
     # Null for plain test calls and lead-retry calls, which use Agent.system_prompt as-is.
     system_prompt_override: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Set when this call was placed to work a Prospect — the per-prospect /call button or
+    # a batch-outreach run. It's the link call_service._fanout_post_call follows to hand a
+    # terminal call to prospect_service.classify_call_outcome, exactly as lead_id drives
+    # lead_service.evaluate_call_outcome. Null for plain test calls, web calls and
+    # lead-retry calls; a call carries lead_id OR prospect_id, never both.
+    prospect_id: Mapped[UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prospects.id"), nullable=True, index=True
+    )
+    # Retell's raw disconnection_reason, stored verbatim next to the coarser Call.status
+    # it maps onto ("dial_no_answer", "voicemail_reached", "user_hangup", ...). status
+    # collapses every non-conversational ending into "failed"; this preserves the
+    # distinction — voicemail vs. declined vs. rang-out — that outcome classification and
+    # the operator's call history both need. Null until the call reaches a terminal state.
+    disconnection_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Whether a person actually spoke on this call (the callee produced >=1 transcript
+    # turn). None until terminal or genuinely unknown — deliberately distinct from False
+    # ("call ended, nobody said anything"). A negative-sentiment call only counts as a
+    # real rejection when this is True.
+    answered_by_human: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     events: Mapped[list["CallEvent"]] = relationship(back_populates="call")
     transcript: Mapped["Transcript"] = relationship(back_populates="call", uselist=False)
