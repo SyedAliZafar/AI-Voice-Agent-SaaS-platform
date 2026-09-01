@@ -3,11 +3,20 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { CallEventTimeline } from "@/components/features/calls/CallEventTimeline";
 import { TranscriptViewer } from "@/components/features/calls/TranscriptViewer";
 import { ArrowLeftIcon } from "@/components/icons";
-import { Card, Skeleton } from "@/components/ui";
+import { Badge, Card, Skeleton } from "@/components/ui";
+import { useCallEvents } from "@/hooks/useCallEvents";
 import { api, getApiErrorMessage } from "@/lib/api";
-import { CALL_STATUS_META, formatCost, formatDuration, sentimentMeta } from "@/lib/format";
+import {
+  CALL_STATUS_META,
+  answeredLabel,
+  disconnectionLabel,
+  formatCost,
+  formatDuration,
+  sentimentMeta,
+} from "@/lib/format";
 import { Call, Transcript } from "@/lib/types";
 
 export default function CallDetailPage({ params }: { params: { id: string } }) {
@@ -17,6 +26,11 @@ export default function CallDetailPage({ params }: { params: { id: string } }) {
   const [hangingUp, setHangingUp] = useState(false);
   const [hangUpError, setHangUpError] = useState<string | null>(null);
   const router = useRouter();
+  const {
+    events,
+    loading: eventsLoading,
+    error: eventsError,
+  } = useCallEvents(params.id);
 
   async function hangUp() {
     // Irreversible and affects a real person mid-conversation, so it asks first — but
@@ -145,9 +159,66 @@ export default function CallDetailPage({ params }: { params: { id: string } }) {
         ))}
       </div>
 
+      {/* How the call ended, in words. The status pill above says "Failed" for a
+          voicemail, a busy line and a number that doesn't exist alike — this is the row
+          that tells them apart, and it's what decides whether calling back is worth it.
+          Only rendered once terminal: both fields are null while a call is live. */}
+      {call.status !== "in_progress" && (call.disconnection_reason || call.answered_by_human !== null) && (
+        <Card className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 p-5">
+          {call.disconnection_reason && (
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Outcome</p>
+              <p className="mt-1 text-sm text-slate-800">
+                {disconnectionLabel(call.disconnection_reason)}
+              </p>
+            </div>
+          )}
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Answered by</p>
+            <div className="mt-1">
+              {(() => {
+                const answered = answeredLabel(call.answered_by_human, call.disconnection_reason);
+                return <Badge tone={answered.tone}>{answered.label}</Badge>;
+              })()}
+            </div>
+          </div>
+          {call.external_agent_id && (
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Agent</p>
+              {/* A platform-native agent (ADR-012) — its script, brain and voice are
+                  Retell's, so none of this backend's prompt or tools were involved.
+                  Worth stating on the page where someone asks "why did it say that?". */}
+              <p className="mt-1 font-mono text-xs text-slate-600">
+                {call.external_agent_id}
+                <span className="ml-1.5 font-sans text-slate-400">
+                  (built in the Retell dashboard)
+                </span>
+              </p>
+            </div>
+          )}
+          {call.disconnection_reason && (
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Platform reason
+              </p>
+              <p className="mt-1 font-mono text-xs text-slate-500">{call.disconnection_reason}</p>
+            </div>
+          )}
+        </Card>
+      )}
+
       <Card className="mt-6 p-5">
         <p className="mb-4 text-sm font-semibold text-slate-900">Transcript</p>
         <TranscriptViewer turns={transcript?.turns ?? []} />
+      </Card>
+
+      <Card className="mt-4 p-5">
+        <p className="mb-1 text-sm font-semibold text-slate-900">Agent activity</p>
+        <p className="mb-4 text-xs text-slate-500">
+          Tools the agent used, how long each turn took to answer, and anything the
+          backend stopped or ended on its own.
+        </p>
+        <CallEventTimeline events={events} loading={eventsLoading} error={eventsError} />
       </Card>
 
       {transcript?.s3_audio_url && (

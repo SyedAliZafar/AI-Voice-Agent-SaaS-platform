@@ -147,6 +147,38 @@ export interface Call {
   sentiment_score: number | null;
   started_at: string;
   cost_usd: number;
+  /** Set when this call was placed to work a Prospect (per-prospect /call or a batch
+   * run). Null for plain test calls and lead-retry calls. */
+  prospect_id: string | null;
+  /** Retell's own reason verbatim — "voicemail_reached", "dial_no_answer",
+   * "user_hangup", "call_transfer", … Null until the call is terminal.
+   *
+   * This is the field `status` throws away: every non-conversational ending collapses
+   * into "failed", so voicemail, a declined call and a phone that rang out are
+   * indistinguishable without it. */
+  disconnection_reason: string | null;
+  /** Whether a person actually spoke. Null while in progress or genuinely unknown —
+   * deliberately distinct from false ("the call ended and nobody said anything").
+   *
+   * Careful: an answering-machine greeting transcribes as a caller turn, so this is
+   * true for voicemails. Check disconnection_reason first when the difference matters. */
+  answered_by_human: boolean | null;
+}
+
+/** One row of a call's server-side audit trail (GET /calls/{id}/events).
+ *
+ * `payload` is intentionally unknown-shaped: each event_type carries its own keys, and
+ * they're written by the backend at the moment they happen —
+ *  - "tool_call"   {phase: "dispatched" | "result" | "error", tool, arguments?, result?, error?}
+ *  - "llm_timing"  {stage, model, duration_ms, ttfb_ms?, prompt_tokens, completion_tokens}
+ *  - "ivr_hangup"  the detector's evidence for ending the call
+ * Narrowing them here would put a second, drifting copy of those shapes in the frontend;
+ * the timeline renders known keys when present and falls back to raw JSON otherwise. */
+export interface CallEvent {
+  id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  ts: string;
 }
 
 export interface TranscriptTurn {
@@ -300,4 +332,50 @@ export interface Prospect {
 
   priority_score: number;
   created_at: string;
+}
+
+/** A third party this tenant has connected (GET /integrations).
+ *
+ * `config` comes back with secrets MASKED by the backend — an api_key reads as
+ * "••••••••cd12", never the real value. That mask is display-only: never send it back
+ * in a PUT, or it gets stored as the credential. The PUT merges, so a form that changes
+ * only `pipeline_id` should send only `pipeline_id`.
+ *
+ * `secrets_set` names which secret keys actually hold a value, which is the only
+ * reliable way to render "a key is stored" without the key. */
+export interface Integration {
+  id: string;
+  kind: string;
+  provider: string;
+  config: Record<string, string>;
+  secrets_set: string[];
+  enabled: boolean;
+  last_verified_at: string | null;
+  last_verify_error: string | null;
+  created_at: string;
+}
+
+/** Result of POST /integrations/{kind}/test. `ok: false` arrives as a 200 — "your key
+ * is wrong" is a successful answer to "is my key right?", so this is data, not an
+ * error path. */
+export interface IntegrationTestResult {
+  ok: boolean;
+  provider: string;
+  detail: string;
+  checked_at: string;
+}
+
+/** One phone number on the voice platform account (GET /phone-numbers), fetched live
+ * for the same reason PlatformAgent is: numbers are bought, released and re-pointed in
+ * the platform's dashboard with no webhook telling us.
+ *
+ * Both agent ids null is the case worth showing: the number costs money and answers
+ * nothing. */
+export interface PlatformPhoneNumber {
+  number: string;
+  pretty: string;
+  nickname: string | null;
+  inbound_agent_id: string | null;
+  outbound_agent_id: string | null;
+  last_modified_ms: number | null;
 }

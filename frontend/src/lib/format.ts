@@ -26,6 +26,66 @@ export const CALL_STATUS_META: Record<Call["status"], StatusMeta> = {
   failed: { label: "Failed", badge: "bg-red-50 text-red-700", dot: "bg-red-500" },
 };
 
+/** Plain-English labels for Retell's `disconnection_reason`, which the backend stores
+ * verbatim alongside the coarse `status`.
+ *
+ * This exists because `status` deliberately collapses every non-conversational ending
+ * into "failed" — a voicemail, a declined call and a phone that rang out are the same
+ * word on screen, and they mean completely different things to whoever has to decide
+ * whether to call again. Only reasons that are genuinely ambiguous-looking are
+ * translated; anything unlisted falls back to the raw string (de-underscored) rather
+ * than being hidden, so a reason Retell adds later still shows up.
+ *
+ * Kept in sync by hand with call_service's _FAILURE_REASONS / _TRANSFER_REASONS, same
+ * convention as lib/types.ts. */
+const DISCONNECTION_LABELS: Record<string, string> = {
+  user_hangup: "The person hung up",
+  agent_hangup: "The agent ended the call",
+  call_transfer: "Transferred to a human",
+  voicemail_reached: "Reached voicemail",
+  machine_detected: "An answering machine picked up",
+  dial_no_answer: "Rang out — nobody answered",
+  dial_busy: "Line was busy",
+  dial_failed: "The call could not be placed",
+  user_declined: "The person declined the call",
+  invalid_destination: "Not a valid number",
+  marked_as_spam: "The carrier flagged this call as spam",
+  scam_detected: "Blocked as a suspected scam call",
+  registered_call_timeout: "Timed out before connecting",
+  concurrency_limit_reached: "Blocked — too many calls at once",
+  no_concurrency_fallback: "Blocked — too many calls at once",
+  telephony_provider_unavailable: "The phone provider was unavailable",
+  telephony_provider_permission_denied: "The phone provider refused the call",
+  sip_routing_error: "Could not be routed",
+  no_valid_payment: "Blocked — billing problem on the voice platform",
+};
+
+export function disconnectionLabel(reason: string | null): string | null {
+  if (!reason) return null;
+  if (DISCONNECTION_LABELS[reason]) return DISCONNECTION_LABELS[reason];
+  if (reason.startsWith("error")) return "Ended with an error on the platform";
+  return reason.replace(/_/g, " ");
+}
+
+/** Did a person actually talk on this call?
+ *
+ * The subtlety worth preserving on screen: an answering machine's greeting transcribes
+ * as a caller turn, so `answered_by_human` is true for voicemails. `disconnection_reason`
+ * carries Retell's own machine detection and is authoritative, so it is checked first —
+ * the same order prospect_service uses when classifying an outcome. Getting this
+ * backwards once put a whole campaign of voicemails in "called". */
+export function answeredLabel(
+  answeredByHuman: boolean | null,
+  reason: string | null,
+): { label: string; tone: "success" | "warning" | "neutral" } {
+  if (reason === "voicemail_reached" || reason === "machine_detected") {
+    return { label: "Voicemail — not a person", tone: "warning" };
+  }
+  if (answeredByHuman === true) return { label: "A person spoke", tone: "success" };
+  if (answeredByHuman === false) return { label: "Nobody spoke", tone: "warning" };
+  return { label: "Unknown", tone: "neutral" };
+}
+
 /** Maps a sentiment score in [-1, 1] to a color + label. */
 export function sentimentMeta(score: number | null): { color: string; label: string } {
   if (score === null) return { color: "bg-slate-300", label: "n/a" };

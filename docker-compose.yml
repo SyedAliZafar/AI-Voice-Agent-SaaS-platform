@@ -1,6 +1,6 @@
 services:
   # Local Postgres is now OPT-IN (`--profile local-db`). The shared Neon instance in .env
-  # is the default so both devs read and write the same calls/prospects/leads — a local
+  # is the default so both devs read and write the same calls/prospects/leads â€” a local
   # container DB would silently give each machine its own private, diverging copy.
   # Only start this if you deliberately want throwaway local data:
   #   docker compose --profile local-db up -d postgres
@@ -51,7 +51,7 @@ services:
       # Redis/MinIO stay per-machine, so those still get compose-network overrides.
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
-      # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
+      # Only used when PUBLIC_BASE_URL=auto â€” the compose-network route to the quick
       # tunnel's metrics server. config.py's default targets localhost instead, for
       # host-run tooling.
       CLOUDFLARED_METRICS_URL: http://tunnel-quick:20241
@@ -63,6 +63,10 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./scripts:/app/scripts
+      # Read-only so the service-account private key stays out of the image (it is
+      # gitignored and must never be COPYed in). GOOGLE_SHEETS_CREDENTIALS_FILE is a
+      # path relative to WORKDIR=/app, so this mount is what makes it resolve.
+      - ./googleKeys:/app/googleKeys:ro
     # --proxy-headers/--forwarded-allow-ips matter once the tunnel below is running:
     # without them uvicorn sees the tunnel as the client and builds http:// URLs for
     # what is really an https:// request.
@@ -70,7 +74,7 @@ services:
       uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
       --proxy-headers --forwarded-allow-ips=*
 
-  # Public ingress for local dev — Retell has to reach this backend from the internet
+  # Public ingress for local dev â€” Retell has to reach this backend from the internet
   # (webhooks, and the custom-LLM websocket). Opt-in by design: starting either service
   # below publishes your local API to a public URL, so only run one once auth is working
   # (backend/api/deps.py) and never leave it running unattended.
@@ -81,19 +85,19 @@ services:
   #   docker compose --profile tunnel-quick up -d  # quick tunnel, zero setup
   #
   # `tunnel` (recommended) needs a one-time Cloudflare setup that produces CF_TUNNEL_TOKEN
-  # in .env — see RUN.md "Named tunnel setup". The payoff: PUBLIC_BASE_URL never changes,
+  # in .env â€” see RUN.md "Named tunnel setup". The payoff: PUBLIC_BASE_URL never changes,
   # so it's set once and never has to be updated again.
   #
   # `tunnel-quick` needs no account, but its https://<random>.trycloudflare.com hostname
   # changes on every restart, AND the tunnel can silently die mid-session while
-  # `docker compose ps` still reports it as Up (see RUN.md) — that exact failure mode is
+  # `docker compose ps` still reports it as Up (see RUN.md) â€” that exact failure mode is
   # what caused custom-LLM calls to go to dead air on 2026-08-04. Fine for a quick check,
   # not for anything you want to leave running.
   tunnel:
     image: cloudflare/cloudflared:latest
     profiles: ["tunnel"]
     # CF_TUNNEL_TOKEN comes from the project's .env, substituted here by `docker compose`
-    # itself (not passed into the container as an env var) — see RUN.md for how to mint
+    # itself (not passed into the container as an env var) â€” see RUN.md for how to mint
     # one. --metrics exposes the /ready endpoint the healthcheck below calls.
     # --protocol http2: see the tunnel-quick service below for why QUIC is not the default
     # here. Same network, same failure mode.
@@ -105,7 +109,7 @@ services:
       - api
     healthcheck:
       # `cloudflared tunnel ready` hits its own /ready endpoint and only exits 0 once a
-      # connection is actually registered — unlike `docker compose ps`, this catches the
+      # connection is actually registered â€” unlike `docker compose ps`, this catches the
       # "stuck in a silent reconnect loop while still reporting Up" failure documented in
       # RUN.md and CONTEXT.md ADR-007. cloudflared's image has no shell, so this has to be
       # its own subcommand rather than a curl/wget one-liner.
@@ -124,11 +128,11 @@ services:
     # "Failed to dial a quic connection"), taking PUBLIC_BASE_URL down with it mid-request
     # and making the custom-LLM websocket unusable. cloudflared also logged
     # "failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB,
-    # got: 416 kiB)" — Docker Desktop on Windows can't give QUIC the UDP buffers it wants,
+    # got: 416 kiB)" â€” Docker Desktop on Windows can't give QUIC the UDP buffers it wants,
     # and restrictive networks frequently drop or throttle UDP outright. HTTP/2 is slightly
     # slower in theory but actually stays connected, which matters rather more.
     # --metrics exposes cloudflared's own HTTP server on :20241, which serves
-    # /quicktunnel — the assigned https://<random>.trycloudflare.com hostname. That's
+    # /quicktunnel â€” the assigned https://<random>.trycloudflare.com hostname. That's
     # what lets PUBLIC_BASE_URL=auto discover the current URL instead of a human
     # copy-pasting it out of the logs after every restart (see backend/services/
     # public_url.py). The named `tunnel` service above already runs with --metrics for
@@ -136,7 +140,7 @@ services:
     command: >
       tunnel --no-autoupdate --protocol http2 --metrics 0.0.0.0:20241
       --url http://api:8000
-    # A quick tunnel that dies stays dead otherwise — that's how PUBLIC_BASE_URL went
+    # A quick tunnel that dies stays dead otherwise â€” that's how PUBLIC_BASE_URL went
     # stale on 2026-08-08 (container Exited 255, nothing restarted it) and cost a test
     # call on 2026-08-10. Restarting mints a NEW hostname, which is exactly why the
     # auto-discovery above is the other half of this fix.
@@ -158,7 +162,7 @@ services:
       # See the api service above for why DATABASE_URL must not be set here.
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
-      # Only used when PUBLIC_BASE_URL=auto — the compose-network route to the quick
+      # Only used when PUBLIC_BASE_URL=auto â€” the compose-network route to the quick
       # tunnel's metrics server. config.py's default targets localhost instead, for
       # host-run tooling.
       CLOUDFLARED_METRICS_URL: http://tunnel-quick:20241
@@ -168,10 +172,14 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./scripts:/app/scripts
+      # Read-only so the service-account private key stays out of the image (it is
+      # gitignored and must never be COPYed in). GOOGLE_SHEETS_CREDENTIALS_FILE is a
+      # path relative to WORKDIR=/app, so this mount is what makes it resolve.
+      - ./googleKeys:/app/googleKeys:ro
     command: celery -A backend.workers.celery_app worker --loglevel=info
 
   # Fires the lead retry scheduler (ADR-011: dispatch_due_leads/sweep_stale_leads) on
-  # celery_app.py's beat_schedule. A worker alone never runs a beat_schedule — it only
+  # celery_app.py's beat_schedule. A worker alone never runs a beat_schedule â€” it only
   # executes tasks it's handed, so this is a separate process, not the worker's job.
   # No Bark leads means no cost to leaving this running; skip it if leads aren't in use yet.
   beat:
@@ -187,6 +195,10 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./scripts:/app/scripts
+      # Read-only so the service-account private key stays out of the image (it is
+      # gitignored and must never be COPYed in). GOOGLE_SHEETS_CREDENTIALS_FILE is a
+      # path relative to WORKDIR=/app, so this mount is what makes it resolve.
+      - ./googleKeys:/app/googleKeys:ro
     command: celery -A backend.workers.celery_app beat --loglevel=info
 
 volumes:

@@ -163,6 +163,17 @@ class VoicePlatformAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support list_platform_agents")
 
+    async def list_phone_numbers(self) -> list[dict[str, Any]]:
+        """Phone numbers the platform account holds, with whichever agent answers each.
+
+        Live and read-only for the same reason as list_platform_agents: numbers are
+        bought, released and re-pointed in the platform's own dashboard, and no webhook
+        tells us when that happens — a mirrored copy could only ever be confidently
+        wrong. Each entry is normalized to
+        {number, pretty, nickname, inbound_agent_id, outbound_agent_id, last_modified_ms}.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support list_phone_numbers")
+
     def verify_webhook_signature(self, raw_body: str, signature: str | None) -> bool:
         """Verify a platform webhook's signature over the raw request body.
 

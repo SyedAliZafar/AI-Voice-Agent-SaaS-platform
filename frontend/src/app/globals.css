@@ -2,54 +2,67 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg: #f8fafc;
-  --surface: #ffffff;
-  --border: #e2e8f0;
-  --text: #0f172a;
-  --muted: #64748b;
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
-  --accent-tint: #eef2ff;
-}
+/* Design tokens live in tailwind.config.ts — see FRONTEND.md.
+ *
+ * There used to be a `:root` block of eight custom properties here that restated values
+ * the Tailwind config already defined: --accent was brand-600, --accent-hover was
+ * brand-700, --accent-tint was brand-50, --bg was slate-50, --text was slate-900. Six of
+ * the eight were referenced by nothing at all; the two that were (--bg, --text) are now
+ * applied from the scale directly.
+ *
+ * Why it mattered: the accent indigo existed in three places (this file, the brand scale,
+ * and the literal rgb() in the focus ring below), so a rebrand meant changing the same
+ * colour three times and missing one was invisible until someone noticed a stale ring.
+ *
+ * What stays in this file is what Tailwind genuinely can't express as a utility: base
+ * body styles, scrollbar theming, and the skeleton shimmer keyframes. */
 
 @layer base {
   body {
-    color: var(--text);
-    background: var(--bg);
+    @apply bg-slate-50 text-slate-900;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
 
-  /* Subtle, consistent focus ring on interactive elements */
+  /* Subtle, consistent focus ring on interactive elements. Both values are read from
+     the config rather than written out, so the brand scale is the only place either
+     lives — this ring was previously a literal rgb(99 102 241) that had to be kept in
+     sync with shadow-focus by hand. */
   a:focus-visible,
   button:focus-visible,
   input:focus-visible,
   select:focus-visible,
   textarea:focus-visible {
     outline: none;
-    box-shadow: 0 0 0 3px rgb(99 102 241 / 0.25);
-    border-color: #a5b4fc;
+    box-shadow: theme("boxShadow.focus");
+    border-color: theme("colors.brand.300");
   }
 }
 
 @layer components {
+  /* Still here, and still overlapping the `Card` component in components/ui — FRONTEND.md
+     calls that out as something to collapse. Not done in this pass: it's used on plain
+     divs in six places (including loading placeholders, where a full component is
+     overkill), so removing it is a visual-regression risk with no user-facing payoff.
+     It composes from the same tokens as everything else, so it is not a third copy of
+     any colour — which is what the token cleanup above was actually about. */
   .card {
     @apply bg-white rounded-2xl border border-slate-200 shadow-card;
   }
 }
 
-/* Thin, unobtrusive scrollbars */
+/* Thin, unobtrusive scrollbars. scrollbar-color has no Tailwind utility, so the value is
+   read from the scale rather than written as a hex that could drift from slate-300. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #cbd5e1 transparent;
+  scrollbar-color: theme("colors.slate.300") transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background-color: #cbd5e1;
+  background-color: theme("colors.slate.300");
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-track {
@@ -60,7 +73,7 @@
 .skeleton {
   position: relative;
   overflow: hidden;
-  background-color: #e2e8f0;
+  background-color: theme("colors.slate.200");
 }
 .skeleton::after {
   content: "";

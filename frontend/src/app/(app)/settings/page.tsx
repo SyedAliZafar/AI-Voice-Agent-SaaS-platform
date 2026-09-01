@@ -1,30 +1,17 @@
 "use client";
 
-import { useState } from "react";
-
 import Link from "next/link";
 
-import { CreditCardIcon, HashIcon, MicIcon, PlugIcon, PlusIcon } from "@/components/icons";
+import { IntegrationCard } from "@/components/features/settings/IntegrationCard";
+import { PhoneNumberTable } from "@/components/features/settings/PhoneNumberTable";
+import { CreditCardIcon, HashIcon, MicIcon, PlugIcon } from "@/components/icons";
 import { Badge, Button, Card, PageHeader, Skeleton } from "@/components/ui";
+import { INTEGRATION_PROVIDERS, useIntegrations } from "@/hooks/useIntegrations";
+import { usePhoneNumbers } from "@/hooks/usePhoneNumbers";
 import { usePlatformAgents } from "@/hooks/usePlatformAgents";
 import { workspace } from "@/lib/workspace";
 
-type Integration = { key: string; name: string; desc: string; connected: boolean };
-
-const INITIAL_INTEGRATIONS: Integration[] = [
-  { key: "hubspot", name: "HubSpot", desc: "Sync leads and contacts after each call.", connected: true },
-  { key: "salesforce", name: "Salesforce", desc: "Push qualified opportunities to your CRM.", connected: false },
-  { key: "gcal", name: "Google Calendar", desc: "Let agents book appointments on live calendars.", connected: true },
-];
-
-const PHONE_NUMBERS = [
-  { number: "+1 (415) 555-0142", agent: "Sales qualifier", region: "US · CA" },
-  { number: "+1 (628) 555-0199", agent: "Support triage", region: "US · CA" },
-];
-
 export default function SettingsPage() {
-  const [integrations, setIntegrations] = useState(INITIAL_INTEGRATIONS);
-
   // The same live probe the dashboard's RetellStatus uses. This card used to hardcode a
   // green "Connected" badge, which meant a dead Retell account showed red on /dashboard
   // and green here — and this page is where you'd come to check.
@@ -35,10 +22,22 @@ export default function SettingsPage() {
   } = usePlatformAgents();
   const retellOk = !platformError;
 
-  const toggle = (key: string) =>
-    setIntegrations((prev) =>
-      prev.map((i) => (i.key === key ? { ...i, connected: !i.connected } : i)),
-    );
+  // Everything below is now read from its real source for the same reason. The
+  // integrations list and phone numbers were the last two hardcoded arrays on this page:
+  // both described things outside the browser, and both were describing them wrongly.
+  const {
+    integrations,
+    loading: integrationsLoading,
+    error: integrationsError,
+    save,
+    disconnect,
+    test,
+  } = useIntegrations();
+  const {
+    numbers,
+    loading: numbersLoading,
+    error: numbersError,
+  } = usePhoneNumbers();
 
   return (
     <div className="animate-fade-in">
@@ -98,60 +97,65 @@ export default function SettingsPage() {
           <PlugIcon width={18} height={18} className="text-slate-400" />
           <h2 className="text-sm font-semibold text-slate-900">Integrations</h2>
         </div>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-          {integrations.map((i) => (
-            <Card key={i.key} className="flex flex-col p-4">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="font-medium text-slate-900">{i.name}</p>
-                <Badge tone={i.connected ? "success" : "neutral"}>
-                  {i.connected ? "Connected" : "Off"}
-                </Badge>
-              </div>
-              <p className="flex-1 text-sm text-slate-500">{i.desc}</p>
-              <Button
-                variant={i.connected ? "secondary" : "primary"}
-                size="sm"
-                className="mt-4 w-full"
-                onClick={() => toggle(i.key)}
-              >
-                {i.connected ? "Disconnect" : "Connect"}
-              </Button>
-            </Card>
-          ))}
-        </div>
+        {integrationsError && (
+          <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {integrationsError}
+          </p>
+        )}
+        {integrationsLoading ? (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            {INTEGRATION_PROVIDERS.map((spec) => (
+              <Skeleton key={spec.provider} className="h-40 w-full rounded-2xl" />
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            {/* One card per provider the BACKEND supports, not per row that exists — an
+                unconnected provider still needs somewhere to be connected from. The list
+                comes from INTEGRATION_PROVIDERS, hand-synced with the backend's
+                SUPPORTED/ALLOWED_CONFIG_KEYS. Salesforce and Google Calendar used to
+                appear here and are gone: the backend accepts neither, so offering them
+                was offering a button that could only ever fail. */}
+            {INTEGRATION_PROVIDERS.map((spec) => (
+              <IntegrationCard
+                key={`${spec.kind}:${spec.provider}`}
+                spec={spec}
+                integration={integrations.find((i) => i.kind === spec.kind)}
+                onSave={save}
+                onDisconnect={disconnect}
+                onTest={test}
+              />
+            ))}
+          </div>
+        )}
+        <p className="mt-3 text-xs text-slate-400">
+          Calendar booking credentials aren&apos;t here yet — an agent&apos;s Cal.com key
+          lives on its tool config and still has to be set in the database directly.
+        </p>
       </section>
 
       {/* Phone numbers */}
       <section className="mb-8">
-        <div className="mb-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <HashIcon width={18} height={18} className="text-slate-400" />
-            <h2 className="text-sm font-semibold text-slate-900">Phone numbers</h2>
-          </div>
-          <Button variant="secondary" size="sm" icon={<PlusIcon width={14} height={14} />}>
-            Add number
-          </Button>
+        <div className="mb-3 flex items-center gap-2">
+          <HashIcon width={18} height={18} className="text-slate-400" />
+          <h2 className="text-sm font-semibold text-slate-900">Phone numbers</h2>
         </div>
+        {/* The "Add number" button that used to sit here had no handler. Numbers are
+            bought and imported in the voice platform's own dashboard, so there is no
+            in-app flow to send anyone to — same reasoning as the Retell card's missing
+            "Manage" button. */}
         <Card className="p-2">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs font-medium uppercase tracking-wide text-slate-400">
-                <th className="px-3 py-2 font-medium">Number</th>
-                <th className="px-3 py-2 font-medium">Assigned agent</th>
-                <th className="px-3 py-2 font-medium">Region</th>
-              </tr>
-            </thead>
-            <tbody>
-              {PHONE_NUMBERS.map((p) => (
-                <tr key={p.number} className="border-t border-slate-50">
-                  <td className="px-3 py-2.5 font-mono text-[13px] text-slate-700">{p.number}</td>
-                  <td className="px-3 py-2.5 text-slate-600">{p.agent}</td>
-                  <td className="px-3 py-2.5 text-slate-500">{p.region}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <PhoneNumberTable
+            numbers={numbers}
+            agents={platformAgents}
+            loading={numbersLoading}
+            error={numbersError}
+          />
         </Card>
+        <p className="mt-3 text-xs text-slate-400">
+          Read live from the voice platform account. Numbers are added or released in its
+          dashboard, not here.
+        </p>
       </section>
 
       {/* Billing */}

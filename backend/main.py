@@ -16,6 +16,7 @@ from backend.api import (
     calls,
     integrations,
     leads,
+    phone_numbers,
     prospects,
     retell_ws,
     webhooks,
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     app.include_router(prospects.router, prefix="/api/prospects", tags=["prospects"])
     app.include_router(leads.router, prefix="/api/leads", tags=["leads"])
     app.include_router(integrations.router, prefix="/api/integrations", tags=["integrations"])
+    app.include_router(phone_numbers.router, prefix="/api/phone-numbers", tags=["phone-numbers"])
     app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
     app.include_router(ws.router, tags=["websocket"])
     app.include_router(retell_ws.router, tags=["websocket"])

@@ -159,6 +159,65 @@ async def test_list_platform_agents_accepts_a_paginated_body(monkeypatch):
     ]
 
 
+# --- phone numbers -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_phone_numbers_normalizes_and_keeps_unassigned_numbers(monkeypatch):
+    """An unassigned number is the one an operator most needs to see — it costs money and
+    answers nothing — so it must survive normalization rather than being filtered out for
+    having no agent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/list-phone-numbers"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "phone_number": "+441234567890",
+                    "phone_number_pretty": "+44 1234 567890",
+                    "nickname": "UK outbound",
+                    "outbound_agent_id": "agent_1",
+                    "last_modification_timestamp": 1724371200000,
+                },
+                {"phone_number": "+15551230000"},
+            ],
+        )
+
+    _patch_transport(monkeypatch, handler)
+    numbers = await RetellAdapter().list_phone_numbers()
+
+    assert numbers[0] == {
+        "number": "+441234567890",
+        "pretty": "+44 1234 567890",
+        "nickname": "UK outbound",
+        "inbound_agent_id": None,
+        "outbound_agent_id": "agent_1",
+        "last_modified_ms": 1724371200000,
+    }
+    # No pretty form, no nickname, no agent at either end — still a row, and `pretty`
+    # falls back to the raw number so the UI never renders a blank label.
+    assert numbers[1]["pretty"] == "+15551230000"
+    assert numbers[1]["nickname"] is None
+    assert numbers[1]["inbound_agent_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_phone_numbers_accepts_a_paginated_body_and_skips_numberless_rows(
+    monkeypatch,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"items": [{"nickname": "orphan"}, {"phone_number": "+15551230000"}]}
+        )
+
+    _patch_transport(monkeypatch, handler)
+    numbers = await RetellAdapter().list_phone_numbers()
+
+    # A row with no number is unusable — it can't be displayed, dialed from, or matched.
+    assert [n["number"] for n in numbers] == ["+15551230000"]
+
+
 # --- dynamic variables (ADR-012) ----------------------------------------------
 
 

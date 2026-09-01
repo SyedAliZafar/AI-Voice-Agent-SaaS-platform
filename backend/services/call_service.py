@@ -114,6 +114,33 @@ async def get_transcript(
     return result.scalar_one_or_none()
 
 
+async def list_call_events(
+    db: AsyncSession, call_id: uuid.UUID, tenant_id: uuid.UUID, limit: int = 200
+) -> list[CallEvent]:
+    """A call's CallEvent trail, oldest first, scoped via the parent call's tenant.
+
+    Same isolation mechanism as get_transcript above: CallEvent has no tenant_id of its
+    own, so the join to Call is what makes another tenant's trail unreachable.
+
+    Oldest-first because this is read as a timeline of what the agent did while the call
+    ran — newest-first would mean reading a conversation backwards. Ordered by (ts, id)
+    rather than ts alone because record_llm_events writes a whole turn's samples with one
+    shared `now`: ties are arbitrary either way, but including id makes them *stable*, so
+    the same call doesn't reshuffle its own timeline between two page loads.
+
+    Capped rather than paginated: even a long call with tool calls on every turn is a few
+    hundred rows, and an operator reading a trail wants the whole call, not page 3 of it.
+    """
+    result = await db.execute(
+        select(CallEvent)
+        .join(Call, CallEvent.call_id == Call.id)
+        .where(CallEvent.call_id == call_id, Call.tenant_id == tenant_id)
+        .order_by(CallEvent.ts.asc(), CallEvent.id.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def get_call_by_external_id(db: AsyncSession, external_call_id: str) -> Call | None:
     """Tenant-unscoped by necessity — used both by webhook handlers (no tenant context
     yet) and backend/api/retell_ws.py (Retell's frames carry only its own call_id, no
@@ -197,13 +224,20 @@ async def _get_or_create_transcript(db: AsyncSession, call: Call) -> Transcript:
     return transcript
 
 
-async def _write_transcript(db: AsyncSession, call: Call, transcript_text: str) -> None:
+async def _write_transcript(
+    db: AsyncSession, call: Call, transcript_text: str, *, transcript: Transcript | None = None
+) -> None:
     """Upsert a call's transcript full_text — Retell's own raw transcript string
     (payload["transcript"]), kept separate from the structured turns record_turns
     writes. Caller commits.
+
+    `transcript` lets a caller that has already loaded this call's row hand it in rather
+    than paying for the same SELECT again — see apply_retell_call_state, which needs the
+    row up to three times per call and now fetches it once. Omitted, behaviour is
+    unchanged.
     """
-    transcript = await _get_or_create_transcript(db, call)
-    transcript.full_text = transcript_text
+    row = transcript if transcript is not None else await _get_or_create_transcript(db, call)
+    row.full_text = transcript_text
 
 
 # Retell's transcript role -> our storage role, matching what TranscriptViewer.tsx and
@@ -230,7 +264,12 @@ def parse_retell_turns(transcript_items: list[dict[str, Any]]) -> list[dict]:
 
 
 async def record_turns(
-    db: AsyncSession, call: Call, turns: list[dict], *, sync_full_text: bool = True
+    db: AsyncSession,
+    call: Call,
+    turns: list[dict],
+    *,
+    sync_full_text: bool = True,
+    transcript: Transcript | None = None,
 ) -> None:
     """Wholesale-replace a call's Transcript.turns.
 
@@ -247,10 +286,13 @@ async def record_turns(
     string to fall back on, so it takes the default and gets full_text synthesized
     from turns.
 
+    `transcript` is the same already-loaded-row optimization _write_transcript takes;
+    omitted, this fetches its own as before.
+
     Caller commits.
     """
-    transcript = await _get_or_create_transcript(db, call)
-    existing = transcript.turns or []
+    row = transcript if transcript is not None else await _get_or_create_transcript(db, call)
+    existing = row.turns or []
     now = datetime.now(UTC).isoformat()
 
     new_turns = []
@@ -266,9 +308,9 @@ async def record_turns(
         ts = ts or now
         new_turns.append({"role": role, "text": text, "ts": ts})
 
-    transcript.turns = new_turns
+    row.turns = new_turns
     if sync_full_text:
-        transcript.full_text = "\n".join(f"{t['role']}: {t['text']}" for t in new_turns)
+        row.full_text = "\n".join(f"{t['role']}: {t['text']}" for t in new_turns)
 
 
 async def record_llm_events(db: AsyncSession, call: Call, llm_events: list[dict]) -> None:
@@ -401,9 +443,22 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
             call.sentiment_score = score
             changed = True
 
+    # This call's Transcript row, loaded at most once and reused by all three consumers
+    # below. Each used to fetch it independently — _write_transcript, record_turns and the
+    # answered_by_human check — costing three identical SELECTs per call. Invisible at one
+    # call per webhook; the dominant cost in backfill_from_platform, which runs this in a
+    # loop over the platform's entire call history against a remote database.
+    #
+    # Deliberately created only when there is something to WRITE. The answered_by_human
+    # branch falls back to a read-only get_transcript so a terminal call that never had a
+    # transcript doesn't get an empty row inserted for it, which is what get-or-create
+    # here would silently start doing.
+    transcript: Transcript | None = None
+
     transcript_text = payload.get("transcript")
     if isinstance(transcript_text, str) and transcript_text.strip():
-        await _write_transcript(db, call, transcript_text)
+        transcript = await _get_or_create_transcript(db, call)
+        await _write_transcript(db, call, transcript_text, transcript=transcript)
         changed = True
 
     # transcript_object is Retell's structured per-turn record. Parsing it here makes
@@ -413,10 +468,12 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     if isinstance(transcript_object, list) and transcript_object:
         turns = parse_retell_turns(transcript_object)
         if turns:
+            if transcript is None:
+                transcript = await _get_or_create_transcript(db, call)
             # sync_full_text=False: transcript_text above (Retell's own raw string) is
             # the better full_text when both are present; don't clobber it with a
             # synthesized "role: text" join.
-            await record_turns(db, call, turns, sync_full_text=False)
+            await record_turns(db, call, turns, sync_full_text=False, transcript=transcript)
             changed = True
 
     # Whether a person actually spoke — computed once the call is terminal, off the
@@ -425,8 +482,15 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     # "human answered and talked" test in lead_service.evaluate_call_outcome.
     effective_status = new_status or call.status
     if effective_status in ("resolved", "escalated", "failed"):
-        transcript = await get_transcript(db, call.id, call.tenant_id)
-        answered = any(t.get("role") == "caller" for t in (transcript.turns if transcript else []))
+        # Reuses the row written above when there was one; only pays for a SELECT when
+        # this payload carried no transcript at all (see the note where `transcript` is
+        # declared for why this stays a read rather than a get-or-create).
+        existing = (
+            transcript
+            if transcript is not None
+            else await get_transcript(db, call.id, call.tenant_id)
+        )
+        answered = any(t.get("role") == "caller" for t in (existing.turns if existing else []))
         if call.answered_by_human != answered:
             call.answered_by_human = answered
             changed = True
@@ -434,7 +498,9 @@ async def apply_retell_call_state(db: AsyncSession, call: Call, payload: dict[st
     return changed
 
 
-async def _fanout_post_call(db: AsyncSession, call: Call) -> None:
+async def _fanout_post_call(
+    db: AsyncSession, call: Call, *, prospect: Prospect | None = None
+) -> None:
     """Everything that must happen once a call reaches a terminal status.
 
     Was `_maybe_advance_lead`, then `_fanout_lead_post_call` — renamed again once
@@ -475,9 +541,12 @@ async def _fanout_post_call(db: AsyncSession, call: Call) -> None:
 
     if call.prospect_id:
         # Campaign-outcome axis — advance Prospect.status off how this call ended.
+        # `prospect`, when supplied, is an already-loaded row (backfill_from_platform
+        # preloads them all); the webhook and reconcile paths pass nothing and this
+        # fetches its own, unchanged.
         from backend.services import prospect_service
 
-        await prospect_service.classify_call_outcome(db, call)
+        await prospect_service.classify_call_outcome(db, call, prospect=prospect)
 
 
 async def handle_call_ended(
@@ -667,6 +736,34 @@ async def backfill_from_platform(
     stats["fetched"] = len(history)
     touched_prospects: set[uuid.UUID] = set()
 
+    # Two prefetches, both for the same reason: this loop runs once per call in the
+    # platform's entire history, and every query inside it is a separate round trip to a
+    # remote database. Doing them per-call made a routine 30-day sync take upwards of ten
+    # minutes — long enough that the operator reasonably reads it as hung.
+    #
+    # Neither changes what the loop does, only how many times it asks. Matching the
+    # existing lookups exactly: calls are keyed on external_id with no tenant filter (as
+    # get_call_by_external_id is, deliberately — see its docstring), prospects are loaded
+    # unscoped by id (as get_prospect_unscoped is).
+    external_ids = [
+        payload["call_id"]
+        for payload in history
+        if isinstance(payload.get("call_id"), str) and payload["call_id"]
+    ]
+    calls_by_external_id: dict[str, Call] = {}
+    if external_ids:
+        existing_calls = await db.execute(select(Call).where(Call.external_id.in_(external_ids)))
+        calls_by_external_id = {
+            call.external_id: call for call in existing_calls.scalars() if call.external_id
+        }
+
+    prospects_by_id: dict[Any, Prospect] = {}
+    if by_phone:
+        matched_prospects = await db.execute(
+            select(Prospect).where(Prospect.id.in_(set(by_phone.values())))
+        )
+        prospects_by_id = {prospect.id: prospect for prospect in matched_prospects.scalars()}
+
     for payload in history:
         external_id = payload.get("call_id")
         if not isinstance(external_id, str) or not external_id:
@@ -681,7 +778,7 @@ async def backfill_from_platform(
         else:
             stats["unmatched"] += 1
 
-        call = await get_call_by_external_id(db, external_id)
+        call = calls_by_external_id.get(external_id)
         if call is None:
             started_ms = payload.get("start_timestamp")
             started_at = (
@@ -706,6 +803,10 @@ async def backfill_from_platform(
             )
             db.add(call)
             await db.flush()
+            # Keep the prefetch map authoritative: the platform can report the same
+            # call_id twice in one history page, and without this the second sighting
+            # would insert a duplicate row rather than updating the one just created.
+            calls_by_external_id[external_id] = call
             stats["created"] += 1
         else:
             # Heal a row imported (or placed) before its prospect existed in the list.
@@ -720,7 +821,7 @@ async def backfill_from_platform(
 
         await apply_retell_call_state(db, call, payload)
         await db.commit()
-        await _fanout_post_call(db, call)
+        await _fanout_post_call(db, call, prospect=prospects_by_id.get(call.prospect_id))
 
     await resync_prospects_from_calls(db, tenant_id, touched_prospects)
     return stats

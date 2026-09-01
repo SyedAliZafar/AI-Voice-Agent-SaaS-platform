@@ -79,13 +79,15 @@ voiceagent/
 │   │   ├── lead.py
 │   │   ├── integration.py        # + mask_config/mask_secret — responses never echo a stored secret
 │   │   ├── nda.py
+│   │   ├── phone_number.py       # PlatformPhoneNumber — live platform roster, not persisted
 │   │   └── webhook.py
 │   │
 │   ├── api/                      # FastAPI routers
 │   │   ├── __init__.py
 │   │   ├── deps.py               # get_current_tenant — the tenant-scoping dependency (ADR-001)
 │   │   ├── agents.py             # CRUD for agents + prompt config; GET /platform + POST /platform/call for platform-native agents (ADR-012); GET /templates + POST /from-template for the scripts/agent_templates gallery
-│   │   ├── calls.py              # Call history, transcript retrieval
+│   │   ├── calls.py              # Call history, transcript retrieval, GET /{id}/events (the CallEvent audit trail — tool calls, llm_timing, ivr_hangup)
+│   │   ├── phone_numbers.py      # GET /api/phone-numbers — the platform account's number roster, fetched live (same not-mirrored rule as ADR-012's agent roster)
 │   │   ├── analytics.py          # Metrics, aggregations
 │   │   ├── prospects.py          # Prospecting pipeline: discover/import-csv/list(?status=)/stats/research/status/call/batch-call/sync-calls/export/sandbox-chat/city-autocomplete. /call + /batch-call take agent_id OR external_agent_id — only the former personalizes (ADR-012). /sync-calls backfills the platform's own call history into the ledger
 │   │   ├── leads.py              # Bark/warm-lead CRUD + scheduler control (start/pause/do-not-call) + call-now (ADR-011)
@@ -195,7 +197,11 @@ voiceagent/
 │   │   │   │                 #   DynamicVariableFields ({{placeholder}} inputs, ADR-012a),
 │   │   │   │                 #   TemplateGallery (industry/service/style picker over
 │   │   │   │                 #   scripts/agent_templates — /agents/new's "Use a template" tab)
-│   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel
+│   │   │   │   ├── calls/        # CallTable, TranscriptViewer, LiveCallPanel,
+│   │   │   │   │                 #   CallEventTimeline (the CallEvent trail on /calls/[id] —
+│   │   │   │   │                 #   flags a tool dispatched with no recorded result)
+│   │   │   │   ├── settings/     # IntegrationCard (real /api/integrations CRUD + test),
+│   │   │   │   │                 #   PhoneNumberTable (live platform number roster)
 │   │   │   │   └── prospects/    # ProspectSearchForm, CityAutocomplete, ProspectFilters,
 │   │   │   │                     #   ProspectSectionTabs (URL param `section`, client-side
 │   │   │   │                     #   filter on Prospect.status), ProspectStatsStrip,
@@ -214,6 +220,10 @@ voiceagent/
 │   │   ├── hooks/                 # all data fetching lives here (FRONTEND.md)
 │   │   │   ├── useWebSocket.ts
 │   │   │   ├── useCallMetrics.ts
+│   │   │   ├── useCallEvents.ts   # one call's CallEvent trail; empty is normal, not an error
+│   │   │   ├── useIntegrations.ts # /api/integrations CRUD + test, plus INTEGRATION_PROVIDERS
+│   │   │   │                      #   (hand-synced with the backend's SUPPORTED/ALLOWED_CONFIG_KEYS)
+│   │   │   ├── usePhoneNumbers.ts # live platform number roster
 │   │   │   ├── useAgents.ts
 │   │   │   ├── useLlmModels.ts
 │   │   │   ├── usePlatformAgents.ts  # live Retell roster + per-agent {{variables}} + callPlatformAgent (ADR-012)

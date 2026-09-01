@@ -407,6 +407,52 @@ class RetellAdapter(VoicePlatformAdapter):
             for item in latest.values()
         ]
 
+    async def list_phone_numbers(self) -> list[dict[str, Any]]:
+        """Every phone number on the Retell account, and which agent answers each.
+
+        Same live-fetch discipline as list_platform_agents: numbers are bought, released
+        and re-pointed in Retell's dashboard with no webhook telling us, so a mirrored
+        copy would go stale silently. The settings page reads this instead of the
+        hardcoded list it used to show.
+
+        `inbound_agent_id`/`outbound_agent_id` are surfaced because an unassigned number
+        is the actionable case — it costs money and answers nothing, which is exactly
+        what an operator opens this page to notice.
+
+        Shape caveat, stated rather than hidden: unlike list_platform_agents (whose
+        per-version quirk was found by probing the real account), this normalization was
+        written from Retell's documented response and has NOT been checked against a live
+        account. It is defensive in the same two ways as its neighbours — a bare array or
+        a paginated {items: [...]} both parse, and a missing key degrades to None rather
+        than raising — so the worst case is a thinner row, not a broken page. Verify
+        against a real account before relying on any field here for a decision.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{BASE_URL}/list-phone-numbers", headers=self.headers)
+            resp.raise_for_status()
+            body = resp.json()
+
+        raw = list(body.get("items") or []) if isinstance(body, dict) else list(body)
+
+        numbers: list[dict[str, Any]] = []
+        for item in raw:
+            number = item.get("phone_number")
+            if not number:
+                continue
+            numbers.append(
+                {
+                    "number": number,
+                    # Retell's own display formatting when it has one; the E.164 string
+                    # is a fine fallback and never blank, unlike nickname.
+                    "pretty": item.get("phone_number_pretty") or number,
+                    "nickname": item.get("nickname"),
+                    "inbound_agent_id": item.get("inbound_agent_id"),
+                    "outbound_agent_id": item.get("outbound_agent_id"),
+                    "last_modified_ms": item.get("last_modification_timestamp"),
+                }
+            )
+        return numbers
+
     async def get_agent_prompt(self, agent_external_id: str) -> dict[str, Any]:
         """The script a platform-native agent actually runs on (ADR-012).
 

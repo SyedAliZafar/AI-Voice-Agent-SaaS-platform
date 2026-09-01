@@ -598,7 +598,9 @@ def outcome_status_for_call(call: Call) -> str:
     return new_status
 
 
-async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
+async def classify_call_outcome(
+    db: AsyncSession, call: Call, *, prospect: Prospect | None = None
+) -> None:
     """Advance Prospect.status off how a just-terminal prospect call ended. The prospect
     counterpart to lead_service.evaluate_call_outcome — called from
     call_service._fanout_post_call for any Call carrying a prospect_id.
@@ -615,7 +617,13 @@ async def classify_call_outcome(db: AsyncSession, call: Call) -> None:
     """
     if not call.prospect_id:
         return
-    prospect = await get_prospect_unscoped(db, call.prospect_id)
+    # `prospect` lets a caller that has already loaded this row hand it in instead of
+    # paying for the same SELECT again — backfill_from_platform loads every matched
+    # prospect once up front, then classifies hundreds of calls against them. Omitted,
+    # this fetches its own exactly as before, which is what the webhook and reconcile
+    # paths (one call at a time, nothing preloaded) still do.
+    if prospect is None:
+        prospect = await get_prospect_unscoped(db, call.prospect_id)
     if not prospect or prospect.status not in _OUTCOME_STATUS_ORDER:
         return
 

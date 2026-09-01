@@ -245,6 +245,19 @@ async def list_platform_agents(platform: str = "retell") -> list[dict]:
         raise TestCallError(f"'{platform}' does not expose an agent list") from exc
 
 
+async def list_phone_numbers(platform: str = "retell") -> list[dict]:
+    """The voice platform account's phone numbers, live (see the adapter's docstring).
+
+    Same no-db/no-tenant shape as list_platform_agents, and the same known gap behind it:
+    one API key serves every tenant, so every tenant sees the same numbers. ADR-012.
+    """
+    adapter = get_adapter(platform)
+    try:
+        return await adapter.list_phone_numbers()
+    except NotImplementedError as exc:
+        raise TestCallError(f"'{platform}' does not expose a phone number list") from exc
+
+
 async def get_platform_agent_variables(
     external_agent_id: str, platform: str = "retell"
 ) -> list[str]:

@@ -65,3 +65,23 @@ class TranscriptResponse(BaseModel):
     s3_audio_url: str | None
 
     model_config = {"from_attributes": True}
+
+
+class CallEventResponse(BaseModel):
+    """One row of a call's server-side audit trail (models/call.py's CallEvent).
+
+    `payload` is deliberately an untyped dict: each event_type carries its own shape —
+    "tool_call" holds {phase, tool, arguments|result|error}, "llm_timing" holds
+    {stage, model, duration_ms, ttfb_ms, ...}, "ivr_hangup" holds the detector's
+    evidence. Declaring a union of those here would restate, in a second place, shapes
+    whose authority lives at the writer (call_service.record_tool_event /
+    record_llm_events / record_call_event) — and the reader is a timeline that renders
+    whatever it's given, not a consumer that branches on every key.
+    """
+
+    id: uuid.UUID
+    event_type: str
+    payload: dict
+    ts: datetime
+
+    model_config = {"from_attributes": True}

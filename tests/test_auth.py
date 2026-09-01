@@ -34,6 +34,8 @@ PROTECTED_ROUTES = [
     ("get", "/api/calls"),
     ("get", f"/api/calls/{uuid.uuid4()}"),
     ("get", f"/api/calls/{uuid.uuid4()}/transcript"),
+    ("get", f"/api/calls/{uuid.uuid4()}/events"),
+    ("get", "/api/phone-numbers"),
     ("get", "/api/analytics/summary"),
     ("get", "/api/analytics/top-intents"),
     ("get", "/api/prospects"),

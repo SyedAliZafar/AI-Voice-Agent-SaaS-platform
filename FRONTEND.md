@@ -85,9 +85,33 @@ connect flow to build — the card now says where the key lives and what to edit
 the actually-actionable thing. Same reason the setup checklist's first step says "How"
 instead of "Connect".
 
-Still mocked on that page, and *not* covered by the rule above yet: the integrations list
-and phone numbers are hardcoded arrays with local-only toggles, even though
-`/api/integrations` is real. Wiring them is its own pass.
+**That pass has now happened.** The integrations list and phone numbers were the last two
+hardcoded arrays on that page, and both were describing things outside the browser — the
+exact case the rule covers. They now read `/api/integrations` (via `useIntegrations` +
+`features/settings/IntegrationCard`) and `/api/phone-numbers` (`usePhoneNumbers` +
+`PhoneNumberTable`).
+
+Three things the fake versions got to ignore, which anything touching this code must not:
+
+- **Secrets come back masked.** A stored `api_key` reads as `••••••••cd12`. That string
+  must never be submitted back, or it replaces the real credential with the mask — so
+  secret inputs start *empty* with an "already stored" hint, and an empty secret field on
+  save means "leave it alone", not "clear it".
+- **The PUT merges rather than replaces**, so a form sends only the keys actually typed
+  into. Changing a pipeline id cannot blank an API key nobody touched.
+- **Connected ≠ working.** A row existing only means a credential was saved once. Whether
+  it still works is a separate question that only `POST /{kind}/test` answers, and its
+  `ok: false` arrives as a 200 — a wrong key is a successful answer to "is my key right?",
+  so it's rendered as data, never as a request failure.
+
+The provider list (`INTEGRATION_PROVIDERS` in `useIntegrations.ts`) is hand-synced with
+the backend's `SUPPORTED`/`ALLOWED_CONFIG_KEYS`, same convention and same reason as
+`lib/types.ts`. Salesforce and Google Calendar were dropped from the UI in that pass: the
+backend accepts neither, so offering them was offering a button that could only fail.
+
+The "Add number" button is gone rather than wired — numbers are bought in the platform's
+own dashboard, so there was nothing for it to do, same call as the Retell card's removed
+"Manage".
 
 ## Never key a state reset on a polled object's identity
 
@@ -163,7 +187,19 @@ component could use it. It's now `lib/cx.ts`, exported.
 
 ## Design tokens — one source, not three
 
-There are currently three overlapping sources of the same values:
+> **Resolved for colours, mostly.** The `:root` block described below is gone: six of its
+> eight custom properties were referenced by nothing at all, and the two that were
+> (`--bg`, `--text`) are now `@apply bg-slate-50 text-slate-900` on `body`. The
+> `:focus-visible` ring reads `theme("boxShadow.focus")` and `theme("colors.brand.300")`
+> instead of restating the indigo, and the scrollbar/skeleton hexes read from the slate
+> scale. Verified by diffing the compiled CSS — it resolves to byte-identical values, so
+> nothing moved visually. **Still open:** the `.card` `@layer components` class, which
+> overlaps the `Card` component and is used on six plain divs (loading placeholders
+> included). It composes from the same tokens, so it isn't a duplicate *colour* — it's a
+> duplicate *component*, and collapsing it is a visual-regression risk with no user-facing
+> payoff. The rest of this section is kept as the reasoning.
+
+There were three overlapping sources of the same values:
 
 1. `tailwind.config.ts` — a real, deliberate token set: `brand` 50–900 scale, custom
    `boxShadow` (`card`, `card-hover`, `focus`), `borderRadius` (`xl`, `2xl`), `fade-in`

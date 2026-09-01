@@ -8,7 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_tenant
 from backend.database import get_db
-from backend.schemas.call import CallResponse, CallSyncResponse, TranscriptResponse
+from backend.schemas.call import (
+    CallEventResponse,
+    CallResponse,
+    CallSyncResponse,
+    TranscriptResponse,
+)
 from backend.services import call_service
 from backend.services.retell_adapter import RetellAdapter
 
@@ -104,3 +109,30 @@ async def get_transcript(
     if not transcript:
         raise HTTPException(status_code=404, detail="Transcript not found")
     return transcript
+
+
+@router.get("/{call_id}/events", response_model=list[CallEventResponse])
+async def get_call_events(
+    call_id: uuid.UUID,
+    limit: int = 200,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """What the agent actually did during this call: every tool dispatch and its result,
+    each turn's LLM timings, an IVR auto-hangup.
+
+    These rows have been written since ADR-009 but had no reader — every phase4/outliers
+    investigation in this repo got at them by querying Postgres by hand. The trail is the
+    only place some of that is recorded at all: a "dispatched" tool_call row survives a
+    barge-in cancelling the turn that made it, and an ivr_hangup is otherwise
+    indistinguishable from a prospect who hung up early.
+
+    404s on an unknown call rather than returning [] — "this call has no events" and
+    "this call doesn't exist" are different answers, and only one of them means something
+    is wrong. Empty is a perfectly normal answer for a hosted-LLM call, which runs on
+    Retell's brain and never reaches the code that writes these.
+    """
+    call = await call_service.get_call(db, call_id, tenant_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return await call_service.list_call_events(db, call_id, tenant_id, limit)
