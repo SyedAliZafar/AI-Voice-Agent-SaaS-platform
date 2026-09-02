@@ -383,17 +383,34 @@ def _status_for(call_status: str, disconnection_reason: str | None) -> str | Non
 
     Returns None when Retell says the call hasn't reached a terminal state yet, so
     callers leave the existing status alone rather than writing a wrong one.
+
+    "ended" is NOT the only terminal state. Retell's enum is
+    {not_connected, ongoing, ended, error}, and `not_connected` — a dial that rang out,
+    hit a busy line, was declined, or had an invalid destination — is terminal too
+    (retell_adapter.list_live_calls has always said so; this function used to disagree
+    and lump it in with the live states). Treating it as live left every unanswered
+    outbound call at status="in_progress" forever, which in turn meant
+    _fanout_post_call bailed and the prospect never left "not_called" despite a visible
+    call_count — the "called companies show up under Not called" bug.
+
+    A `disconnection_reason` is likewise proof the attempt is over: Retell only fills it
+    once there is nothing left to happen, so it forces a verdict whatever the status says.
     """
     if call_status == "error":
         return "failed"
-    if call_status != "ended":
-        # registered | not_connected | ongoing — still live, nothing to conclude.
-        return None
 
     reason = (disconnection_reason or "").lower()
+    if call_status not in ("ended", "not_connected") and not reason:
+        # registered | ongoing with nothing concluded yet — still live.
+        return None
+
     if reason in _TRANSFER_REASONS:
         return "escalated"
     if reason in _FAILURE_REASONS or reason.startswith("error"):
+        return "failed"
+    if call_status != "ended":
+        # not_connected with a reason we don't recognise (or none at all): the one thing
+        # we do know is that no conversation happened, so never "resolved".
         return "failed"
     return "resolved"
 

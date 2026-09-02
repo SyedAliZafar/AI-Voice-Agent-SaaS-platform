@@ -3,14 +3,20 @@ for outreach.
 
 Three independent status axes:
   research_status: pending -> running -> ready | failed  (has the KB been built?)
-  outreach_status: not_reached -> reached | callback | do_not_call  (have we called them?)
+  outreach_status: not_reached -> reached | callback | do_not_call  (did we get through?)
   status:          not_called | called | booked | flagged | no_answer | do_not_call
                    (what was the *outcome* of working this prospect?)
 
 `status` and `outreach_status` overlap and are deliberately NOT auto-synced — see the
 "two overlapping outreach axes" note in CONTEXT.md ADR-006. `outreach_status` is the
-Places-pipeline axis that `record_call()` advances automatically; `status` is the
+Places-pipeline axis, advanced automatically once a call *connects to a person*
+(prospect_service.classify_call_outcome / resync_status_from_calls); `status` is the
 operator-set campaign-outcome axis behind the /prospects dropdown and counts strip.
+
+"reached" means a human actually took the call — NOT that we dialled. `record_call()`
+used to flip it at dial time, which put a green "Reached" badge on every number that
+rang out or went to voicemail. Whether we *tried* is already carried by `call_count` /
+`last_called_at`, so the badge is free to mean the more useful thing.
 Reconciling them into one field is an open design decision, not an oversight.
 """
 

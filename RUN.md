@@ -75,3 +75,6 @@ uv run pytest
 uv run ruff check .
 uv run mypy backend
 ```
+
+
+docker compose up --build

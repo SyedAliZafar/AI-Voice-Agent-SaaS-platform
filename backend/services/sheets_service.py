@@ -33,6 +33,17 @@ written back.
 **A row removed from the sheet is never deleted from the database.** An accidental
 sort-then-delete would otherwise destroy real call history. Deletion stays an explicit
 act in the app.
+
+**Two tabs, and only the first one is two-way.** The main tab above is the editable
+master and keeps the operator's row order forever, which is what makes it safe to edit
+but also what makes it useless as a work queue — it grows in discovery order and never
+says who to call next. So the sync also writes a second **"Call list"** tab, regenerated
+top-to-bottom every run, ordered by callback priority (see CALL_LIST_SHEET below).
+
+That tab is *exempt* from the two-writer problem rather than solving it: every column is
+system-owned and it is never read back in, so an operator edit there has nothing to
+collide with — it is simply overwritten next sync. Operators still act on the main tab;
+the call list is the reading order they work through.
 """
 
 import asyncio
@@ -40,6 +51,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +102,119 @@ COLUMNS: list[tuple[str, str]] = [
 
 HEADER = [name for name, _ in COLUMNS]
 LAST_COLUMN = chr(ord("A") + len(COLUMNS) - 1)  # "L"
+
+
+# --- the call list tab ---------------------------------------------------------------
+#
+# A SECOND tab, and unlike the one above it is regenerated top-to-bottom on every sync:
+# it answers "who do I call next", which is an ordering, and an ordering can't survive
+# the main tab's rule that existing rows keep their position.
+#
+# It is exempt from the two-writer problem rather than solving it: every column is
+# system-owned and the tab is never read back in, so there is nothing on it for an
+# operator's edit to collide with. Operators still act on the *Prospects* tab — tick
+# "Call again?" there — and this tab is the reading order they work through.
+CALL_LIST_SHEET = "Call list"
+CALL_LIST_HEADER = [
+    "Bucket",
+    "Business name",
+    "Phone",
+    "City",
+    "Calls",
+    "Last called",
+    "Last outcome",
+    "Last duration",
+    "Notes",
+    "id",
+]
+CALL_LIST_LAST_COLUMN = chr(ord("A") + len(CALL_LIST_HEADER) - 1)  # "J"
+
+# A call where a person picked up and stayed on this long is a live conversation, and
+# the operator wants those at the top. Below it, the same "a human answered" population
+# means the opposite thing — they picked up and bailed. One knob splits both buckets.
+ENGAGED_MIN_SEC = 60
+
+# Retell disconnection_reasons meaning "it rang and nobody took it" — the number is fine,
+# the moment was wrong, so it is worth another dial. Distinct from the dead reasons below,
+# which Call.status collapses into the same "failed" as these.
+_NO_ANSWER_REASONS = {"dial_no_answer", "user_declined", "dial_busy"}
+
+# The number itself is the problem. Calling again does the same thing, so these are kept
+# off the list entirely rather than parked at the bottom.
+_DEAD_REASONS = {
+    "dial_failed",
+    "invalid_destination",
+    "marked_as_spam",
+    "telephony_provider_permission_denied",
+    "telephony_provider_unavailable",
+    "sip_routing_error",
+}
+
+# Off the list because the operator has already settled them: booked and do_not_call are
+# operator-set, and flagged means a human heard the pitch and the post-call sentiment came
+# back negative. Putting a rejection at the top of a callback list — which the >60s rule
+# would otherwise do, since a rejection is a long answered call — is the opposite of what
+# the ordering is for.
+_SETTLED_STATUSES = {"booked", "do_not_call", "flagged"}
+
+# Bucket order = call order. Index is the sort rank.
+CALL_LIST_BUCKETS = ["engaged", "voicemail", "no_answer", "hung_up"]
+_BUCKET_LABELS = {
+    "engaged": "Engaged",
+    "voicemail": "Voicemail",
+    "no_answer": "No answer",
+    "hung_up": "Hung up",
+}
+
+# Only a terminal call says anything about how the prospect responded; an in_progress row
+# has no outcome yet. Same set resync_status_from_calls filters on.
+_TERMINAL_CALL_STATUSES = ("resolved", "escalated", "failed")
+
+
+@dataclass(frozen=True)
+class LatestCall:
+    """The prospect's most recent terminal call, flattened to just what the sheet needs."""
+
+    reason: str
+    duration_sec: int
+    answered_by_human: bool | None
+
+
+def call_list_bucket(status: str, latest: LatestCall | None) -> str | None:
+    """Which call-list bucket a prospect belongs in, or None to keep it off the list.
+
+    Pure, and deliberately decided from the prospect's LATEST call rather than the best
+    one across its history. That is the opposite of prospect_service.resync_status_from_calls,
+    and the divergence is intentional: `Prospect.status` answers "how far did we ever get
+    with this company", where the best-ever outcome is the fact worth keeping. This answers
+    "what should I do next", where only the most recent attempt is informative — a prospect
+    who spoke to us in June and hit voicemail last night is a voicemail callback today.
+    """
+    if status in _SETTLED_STATUSES:
+        return None
+    if latest is None:
+        return None  # never dialled, or no terminal call yet — nothing to call *back*
+
+    reason = (latest.reason or "").lower()
+    if reason in _DEAD_REASONS:
+        return None
+
+    # Tested BEFORE answered_by_human, and the order is load-bearing for the same reason
+    # it is in prospect_service.outcome_status_for_call: an answering machine's outgoing
+    # greeting transcribes as a turn from the far end, so every voicemail looks like a
+    # human who talked. Retell's own machine detection is the authority here; our
+    # transcript heuristic is not.
+    if reason in prospect_service.VOICEMAIL_REASONS:
+        return "voicemail"
+    if latest.answered_by_human:
+        return "engaged" if latest.duration_sec > ENGAGED_MIN_SEC else "hung_up"
+    if reason in _NO_ANSWER_REASONS:
+        return "no_answer"
+    # Anything else that ended without a human on the line: a "resolved" call with zero
+    # caller turns, an unmapped reason, a reason we've never seen. It rang and nothing
+    # came of it, which is the no-answer bucket.
+    return "no_answer"
+
 
 # Sheets renders a real checkbox as TRUE/FALSE, but operators also type things. Accepted
 # spellings for "yes, call this one again" — anything else (including blank) is False.
@@ -268,12 +393,35 @@ async def _read_grid(spreadsheet_id: str, sheet_name: str) -> list[list[str]]:
     return [list(row) for row in (resp.json().get("values") or [])]
 
 
-async def _write_grid(spreadsheet_id: str, sheet_name: str, rows: list[list[str]]) -> None:
+async def _clear_grid(spreadsheet_id: str, sheet_name: str, last_column: str) -> None:
+    """Empty a tab's synced columns.
+
+    Only the call-list tab needs this, and it needs it because that tab is a *list* whose
+    length changes: when a prospect drops off it (booked, or its number went dead) the
+    rewrite is shorter than what's there and the tail rows survive underneath, reading as
+    live callbacks. The main tab is exempt — its row set only ever grows.
+    """
+    token = await _access_token()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{BASE_URL}/{spreadsheet_id}/values/{sheet_name}!A:{last_column}:clear",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+        )
+    if resp.status_code >= 400:
+        raise SheetSyncError(
+            f"Google Sheets rejected the clear of '{sheet_name}' ({resp.status_code}): {resp.text}"
+        )
+
+
+async def _write_grid(
+    spreadsheet_id: str, sheet_name: str, rows: list[list[str]], last_column: str = LAST_COLUMN
+) -> None:
     """Overwrite the synced range with `rows` (header first). One request, not one per
     row — Sheets' per-user write quota is 60/min, which a row-at-a-time loop would burn
     through on a list this size."""
     token = await _access_token()
-    rng = f"{sheet_name}!A1:{LAST_COLUMN}{len(rows)}"
+    rng = f"{sheet_name}!A1:{last_column}{len(rows)}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.put(
             f"{BASE_URL}/{spreadsheet_id}/values/{rng}",
@@ -312,6 +460,11 @@ def _text(value: str) -> str:
     return "'" + value if value and value[0] in "=+-@0" else value
 
 
+def _reason_of(latest: "LatestCall | None") -> str:
+    """The main tab's "Last outcome" cell — the raw disconnection_reason, or blank."""
+    return latest.reason if latest else ""
+
+
 def _row_for(prospect: Prospect, last_outcome: str) -> list[str]:
     """One sheet row for a prospect. System columns are computed; sheet-owned columns are
     echoed back as stored, which is what makes a normalization (a tidied phone number) or
@@ -335,21 +488,88 @@ def _row_for(prospect: Prospect, last_outcome: str) -> list[str]:
     ]
 
 
-async def _last_outcomes(db: AsyncSession, tenant_id: uuid.UUID) -> dict[Any, str]:
-    """Most recent `disconnection_reason` per prospect — the granular "what happened"
-    behind the coarser Prospect.status ("user_hangup" vs "voicemail_reached" vs
-    "dial_no_answer"). One query for the whole tenant, not one per row."""
+async def _last_outcomes(db: AsyncSession, tenant_id: uuid.UUID) -> dict[Any, LatestCall]:
+    """Most recent terminal call per prospect — the granular "what happened" behind the
+    coarser Prospect.status ("user_hangup" vs "voicemail_reached" vs "dial_no_answer"),
+    plus the duration and who answered, which is what the call list buckets on. One query
+    for the whole tenant, not one per row."""
     rows = await db.execute(
-        select(Call.prospect_id, Call.disconnection_reason, Call.started_at)
+        select(
+            Call.prospect_id,
+            Call.disconnection_reason,
+            Call.duration_sec,
+            Call.answered_by_human,
+            Call.status,
+            Call.started_at,
+        )
         .where(Call.tenant_id == tenant_id, Call.prospect_id.is_not(None))
         .order_by(Call.started_at.desc())
     )
-    latest: dict[Any, str] = {}
-    for prospect_id, reason, _started in rows.all():
+    latest: dict[Any, LatestCall] = {}
+    for prospect_id, reason, duration, answered, status, _started in rows.all():
         # Ordered newest-first, so the first sighting of a prospect is its latest call.
-        if prospect_id not in latest and reason:
-            latest[prospect_id] = reason
+        if prospect_id in latest:
+            continue
+        if not reason or status not in _TERMINAL_CALL_STATUSES:
+            continue
+        latest[prospect_id] = LatestCall(
+            reason=reason,
+            duration_sec=duration or 0,
+            answered_by_human=answered,
+        )
     return latest
+
+
+def _build_call_list(
+    prospects: list[Prospect], latest_by_id: dict[Any, LatestCall]
+) -> list[list[str]]:
+    """The call-list tab's full grid, header first — bucket order, then coldest-first.
+
+    Pure: takes what it needs and returns rows, so the ordering is testable without any
+    HTTP. Within a bucket the tie-breaks are, in order:
+
+      call_count ascending   — don't spend a 4th dial on one company before a 1st on another
+      last_called_at ascending — coldest first; never-called sorts to the top of its bucket
+      priority_score descending — the discovery ranking, as the final tie-break
+
+    last_called_at is compared as a POSIX timestamp rather than a datetime so a naive row
+    (older data) can't raise against a tz-aware one mid-sort.
+    """
+    ranked: list[tuple[tuple[int, int, float, float], Prospect, str, LatestCall]] = []
+    for prospect in prospects:
+        latest = latest_by_id.get(prospect.id)
+        bucket = call_list_bucket(prospect.status, latest)
+        if bucket is None:
+            continue
+        assert latest is not None  # call_list_bucket returns None without one
+        key = (
+            CALL_LIST_BUCKETS.index(bucket),
+            prospect.call_count,
+            prospect.last_called_at.timestamp() if prospect.last_called_at else 0.0,
+            -prospect.priority_score,
+        )
+        ranked.append((key, prospect, bucket, latest))
+    ranked.sort(key=lambda item: item[0])
+
+    rows = [CALL_LIST_HEADER]
+    for _key, prospect, bucket, latest in ranked:
+        rows.append(
+            [
+                _BUCKET_LABELS[bucket],
+                _text(prospect.name or ""),
+                _text(prospect.phone or ""),  # "+44..." would otherwise become #ERROR!
+                _text(prospect.city or ""),
+                str(prospect.call_count),
+                prospect.last_called_at.strftime("%Y-%m-%d %H:%M")
+                if prospect.last_called_at
+                else "",
+                latest.reason,
+                str(latest.duration_sec),
+                _text(prospect.prospect_notes or ""),
+                str(prospect.id),
+            ]
+        )
+    return rows
 
 
 async def sync(
@@ -372,7 +592,9 @@ async def sync(
     them straight back over the repair. (Learned the hard way: a phone-column fix was
     silently reverted by the very next sync.)
     """
-    stats = dict.fromkeys(("rows_read", "created", "updated", "queued", "written"), 0)
+    stats = dict.fromkeys(
+        ("rows_read", "created", "updated", "queued", "written", "call_list_written"), 0
+    )
 
     # Still read on a push-only run: the existing rows are what preserve row order below,
     # so skipping the read would reshuffle the operator's view.
@@ -495,11 +717,22 @@ async def sync(
             if match is not None:
                 prospect = remaining.pop(str(match.id), None)
         if prospect is not None:
-            rows.append(_row_for(prospect, last_outcomes.get(prospect.id, "")))
+            rows.append(_row_for(prospect, _reason_of(last_outcomes.get(prospect.id))))
     for prospect in all_prospects:
         if str(prospect.id) in remaining:
-            rows.append(_row_for(prospect, last_outcomes.get(prospect.id, "")))
+            rows.append(_row_for(prospect, _reason_of(last_outcomes.get(prospect.id))))
 
     await _write_grid(spreadsheet_id, sheet_name, rows)
     stats["written"] = len(rows) - 1
+
+    # --- the call list ----------------------------------------------------------------
+    # Same prospects, same outcomes, no extra queries — only a different ordering, written
+    # to its own tab. create_tab is a no-op when it already exists, so the first sync after
+    # this shipped provisions the tab rather than failing on a missing range.
+    call_list = _build_call_list(list(all_prospects), last_outcomes)
+    await create_tab(spreadsheet_id, CALL_LIST_SHEET)
+    await _clear_grid(spreadsheet_id, CALL_LIST_SHEET, CALL_LIST_LAST_COLUMN)
+    await _write_grid(spreadsheet_id, CALL_LIST_SHEET, call_list, CALL_LIST_LAST_COLUMN)
+    stats["call_list_written"] = len(call_list) - 1
+
     return stats

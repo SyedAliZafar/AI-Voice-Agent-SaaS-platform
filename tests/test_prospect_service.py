@@ -200,7 +200,12 @@ async def test_research_status_transitions(db_session, tenant_id):
 
 
 @pytest.mark.asyncio
-async def test_record_call_increments_count_and_flips_not_reached(db_session, tenant_id):
+async def test_record_call_counts_the_dial_without_claiming_we_reached_anyone(
+    db_session, tenant_id
+):
+    """Dialling is not reaching. "reached" waits for a human to actually pick up
+    (classify_call_outcome); leaving it here put a green "Reached" badge on every number
+    that rang out. The attempt itself is carried by call_count / last_called_at."""
     place = {"google_place_id": "p_call", "name": "CallCo"}
     [prospect] = await prospect_service.upsert_from_places(db_session, tenant_id, [place], "q")
     assert prospect.outreach_status == "not_reached"
@@ -209,7 +214,7 @@ async def test_record_call_increments_count_and_flips_not_reached(db_session, te
 
     updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert updated.call_count == 1
-    assert updated.outreach_status == "reached"
+    assert updated.outreach_status == "not_reached"
     assert updated.last_called_at is not None
 
 
@@ -341,6 +346,46 @@ async def test_resync_takes_the_best_outcome_not_the_latest(db_session, tenant_i
 
     updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert updated.status == "called"
+
+
+@pytest.mark.asyncio
+async def test_resync_walks_a_wrongly_reached_prospect_back_down(db_session, tenant_id):
+    """The repair path for prospects record_call() stamped "reached" at dial time: with
+    the whole history in hand, a number that only ever rang out is not_reached again."""
+    prospect = await _prospect(db_session, tenant_id)
+    await prospect_service.set_outreach_status(db_session, prospect.id, tenant_id, "reached")
+    rang_out = await _terminal_call(
+        db_session,
+        tenant_id,
+        prospect.id,
+        status="failed",
+        disconnection_reason="dial_no_answer",
+        answered_by_human=False,
+    )
+
+    await prospect_service.resync_status_from_calls(db_session, prospect, [rang_out])
+    await db_session.commit()
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "no_answer"
+    assert updated.outreach_status == "not_reached"
+
+
+@pytest.mark.asyncio
+async def test_resync_leaves_a_pending_callback_request_alone(db_session, tenant_id):
+    """"callback" is an operator asking for a retry, not a claim about past calls —
+    clobbering it would silently cancel the retry batch_call_targets owes them."""
+    prospect = await _prospect(db_session, tenant_id)
+    await prospect_service.set_outreach_status(db_session, prospect.id, tenant_id, "callback")
+    call = await _terminal_call(
+        db_session, tenant_id, prospect.id, status="resolved", answered_by_human=True
+    )
+
+    await prospect_service.resync_status_from_calls(db_session, prospect, [call])
+    await db_session.commit()
+
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.outreach_status == "callback"
 
 
 @pytest.mark.asyncio

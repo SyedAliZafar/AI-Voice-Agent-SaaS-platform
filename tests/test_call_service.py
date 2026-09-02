@@ -168,6 +168,54 @@ async def test_fanout_classifies_the_linked_prospect(db_session, tenant_id):
     assert updated.status == "no_answer"
 
 
+@pytest.mark.asyncio
+async def test_not_connected_is_terminal_and_classifies_the_prospect(db_session, tenant_id):
+    """Retell reports an unanswered dial as call_status="not_connected", not "ended".
+
+    Treating that as a live call left the row at in_progress forever, so the prospect
+    kept status="not_called" while showing a call_count — the bug where the dashboard's
+    "Not called" section listed companies that had plainly been called.
+    """
+    from backend.services import prospect_service
+
+    [prospect] = await prospect_service.upsert_from_places(
+        db_session, tenant_id, [{"google_place_id": "nc_1", "name": "NotConnectedCo"}], "q"
+    )
+    call = await call_service.create_outbound_call_record(
+        db_session,
+        tenant_id,
+        uuid.uuid4(),
+        "not_connected_call",
+        "+491701234567",
+        prospect_id=prospect.id,
+    )
+
+    await call_service.handle_call_ended(
+        db_session,
+        "not_connected_call",
+        {"call_status": "not_connected", "disconnection_reason": "dial_no_answer"},
+    )
+
+    updated_call = await call_service.get_call(db_session, call.id, tenant_id)
+    assert updated_call.status == "failed"
+    updated = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
+    assert updated.status == "no_answer"
+
+
+def test_status_for_terminal_states():
+    # Live: no verdict to draw yet.
+    assert call_service._status_for("ongoing", None) is None
+    assert call_service._status_for("registered", None) is None
+    # not_connected is terminal even without a reason, and never "resolved" — nobody
+    # ever picked up.
+    assert call_service._status_for("not_connected", None) == "failed"
+    assert call_service._status_for("not_connected", "user_declined") == "failed"
+    # A disconnection_reason is itself proof the attempt is over.
+    assert call_service._status_for("ongoing", "dial_busy") == "failed"
+    assert call_service._status_for("ended", "user_hangup") == "resolved"
+    assert call_service._status_for("ended", "call_transfer") == "escalated"
+
+
 class _StubAdapter:
     """Stands in for RetellAdapter in reconcile and end_call tests."""
 

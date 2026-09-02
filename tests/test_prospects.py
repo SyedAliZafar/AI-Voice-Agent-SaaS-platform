@@ -838,7 +838,8 @@ async def test_call_advances_outreach_counters(
 
     refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert refreshed.call_count == 1
-    assert refreshed.outreach_status == "reached"
+    # Placing the call does not make it "reached" — that waits for a human to pick up.
+    assert refreshed.outreach_status == "not_reached"
 
 
 @pytest.mark.asyncio
@@ -974,7 +975,7 @@ async def test_call_with_a_platform_agent_still_advances_outreach(
 
     refreshed = await prospect_service.get_prospect(db_session, prospect.id, tenant_id)
     assert refreshed.call_count == 1
-    assert refreshed.outreach_status == "reached"
+    assert refreshed.last_called_at is not None
 
 
 @pytest.mark.asyncio

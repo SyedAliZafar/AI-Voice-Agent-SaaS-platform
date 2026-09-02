@@ -537,9 +537,13 @@ async def record_call(db: AsyncSession, prospect_id: uuid.UUID, tenant_id: uuid.
     prospect.last_called_at = datetime.now(UTC)
     # "callback" is consumed here, not just advanced past: it's a one-shot request for a
     # retry (see batch_call_targets), and leaving it set would keep the prospect
-    # permanently eligible and re-dial them on every subsequent batch run.
-    if prospect.outreach_status in ("not_reached", "callback"):
-        prospect.outreach_status = "reached"
+    # permanently eligible and re-dial them on every subsequent batch run. It falls back
+    # to "not_reached" rather than "reached" — the dial has gone out, but nobody has
+    # picked up yet and won't have until a terminal webhook says so.
+    if prospect.outreach_status == "callback":
+        prospect.outreach_status = "not_reached"
+    # Deliberately does NOT set "reached". That is what classify_call_outcome does, once
+    # a human is actually on the line — see the axes note in backend/models/prospect.py.
     await db.commit()
 
 
@@ -565,7 +569,9 @@ _OUTCOME_STATUS_ORDER = {
 }
 
 # Retell disconnection_reasons meaning "a machine, not a person, took the call".
-_VOICEMAIL_REASONS = {"voicemail_reached", "machine_detected"}
+# Public: sheets_service.call_list_bucket makes the same voicemail call and must not
+# drift from this one.
+VOICEMAIL_REASONS = {"voicemail_reached", "machine_detected"}
 
 
 def outcome_status_for_call(call: Call) -> str:
@@ -578,7 +584,7 @@ def outcome_status_for_call(call: Call) -> str:
     so answered_by_human gates it. A sharper transcript-based signal can replace the
     sentiment check later without touching this seam.
     """
-    if (call.disconnection_reason or "").lower() in _VOICEMAIL_REASONS:
+    if (call.disconnection_reason or "").lower() in VOICEMAIL_REASONS:
         # Checked FIRST, ahead of answered_by_human, and that order is load-bearing.
         # answered_by_human is a heuristic — "did any transcript turn come from the far
         # end" — and an answering machine's outgoing greeting is transcribed as exactly
@@ -666,8 +672,13 @@ async def resync_status_from_calls(db: AsyncSession, prospect: Prospect, calls: 
             best = candidate
 
     prospect.status = best
-    if best in ("called", "flagged") and prospect.outreach_status == "not_reached":
-        prospect.outreach_status = "reached"
+    # outreach_status moves in BOTH directions here, for the same reason status does:
+    # with the whole history in hand this is the authority, and it is what repairs the
+    # prospects that record_call() wrongly stamped "reached" at dial time. Operator-set
+    # values (do_not_call) and a pending callback request are left alone — neither is a
+    # statement about what the calls did.
+    if prospect.outreach_status in ("not_reached", "reached"):
+        prospect.outreach_status = "reached" if best in ("called", "flagged") else "not_reached"
 
 
 # batch outreach + CSV export -------------------------------------------------------
@@ -692,8 +703,8 @@ async def batch_call_targets(
     `call_count <= max_call_count` test forever, which is correct as a default and wrong
     the moment an operator deliberately asks for a retry. `outreach_status == "callback"`
     is that ask — set from the sheet's "Call again?" column (sheets_service) or by hand
-    via PATCH — and record_call() clears it back to "reached" as the call goes out, so
-    one tick buys exactly one retry rather than a permanent re-dial loop.
+    via PATCH — and record_call() consumes it as the call goes out, so one tick buys
+    exactly one retry rather than a permanent re-dial loop.
     """
     query = select(Prospect).where(
         Prospect.tenant_id == tenant_id,

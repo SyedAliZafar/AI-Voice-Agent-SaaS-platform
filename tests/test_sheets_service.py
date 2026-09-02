@@ -7,9 +7,11 @@ a row vanishing from the sheet never deletes a prospect.
 """
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
+from backend.models.call import Call
 from backend.services import prospect_service, sheets_service
 
 H = sheets_service.HEADER
@@ -21,18 +23,37 @@ class _FakeSheet:
     def __init__(self, grid: list[list[str]] | None = None):
         self.grid = grid if grid is not None else []
         self.written: list[list[str]] | None = None
+        # Every tab written this sync, keyed by tab name — the call list goes to its own.
+        self.tabs: dict[str, list[list[str]]] = {}
+        self.created_tabs: list[str] = []
+        self.cleared_tabs: list[str] = []
 
     def install(self, monkeypatch):
         async def read(spreadsheet_id, sheet_name):
             return [list(r) for r in self.grid]
 
-        async def write(spreadsheet_id, sheet_name, rows):
-            self.written = rows
-            self.grid = rows
+        async def write(spreadsheet_id, sheet_name, rows, last_column=None):
+            self.tabs[sheet_name] = rows
+            if sheet_name != sheets_service.CALL_LIST_SHEET:
+                self.written = rows
+                self.grid = rows
+
+        async def create_tab(spreadsheet_id, sheet_name):
+            self.created_tabs.append(sheet_name)
+            return True
+
+        async def clear(spreadsheet_id, sheet_name, last_column):
+            self.cleared_tabs.append(sheet_name)
 
         monkeypatch.setattr(sheets_service, "_read_grid", read)
         monkeypatch.setattr(sheets_service, "_write_grid", write)
+        monkeypatch.setattr(sheets_service, "create_tab", create_tab)
+        monkeypatch.setattr(sheets_service, "_clear_grid", clear)
         return self
+
+    def call_list(self) -> list[list[str]]:
+        """Written call-list data rows (header dropped)."""
+        return (self.tabs.get(sheets_service.CALL_LIST_SHEET) or [])[1:]
 
     def rows(self) -> list[list[str]]:
         """Written data rows (header dropped)."""
@@ -152,10 +173,11 @@ async def test_callback_prospect_is_eligible_despite_its_call_count(db_session, 
     targets = await prospect_service.batch_call_targets(db_session, tenant_id, limit=10)
     assert [t.id for t in targets] == [p.id]
 
-    # Dispatching consumes the flag, so the next run doesn't re-dial them forever.
+    # Dispatching consumes the flag, so the next run doesn't re-dial them forever. It
+    # falls back to "not_reached", not "reached" — the dial went out, nobody answered yet.
     await prospect_service.record_call(db_session, p.id, tenant_id)
     reloaded = await prospect_service.get_prospect(db_session, p.id, tenant_id)
-    assert reloaded.outreach_status == "reached"
+    assert reloaded.outreach_status == "not_reached"
     assert await prospect_service.batch_call_targets(db_session, tenant_id, limit=10) == []
 
 
@@ -264,3 +286,179 @@ def test_text_escapes_only_formula_prefixes():
     assert sheets_service._text("02075849173") == "'02075849173"
     assert sheets_service._text("Acme Roofing") == "Acme Roofing"
     assert sheets_service._text("") == ""
+
+
+# --- the call list tab ---------------------------------------------------------------
+#
+# The operator's callback order: engaged conversations first, then voicemail, then
+# no-answer, then people who picked up and bailed. Dead numbers and settled prospects
+# stay off it entirely.
+
+
+def _latest(reason, duration=0, answered=None):
+    return sheets_service.LatestCall(
+        reason=reason, duration_sec=duration, answered_by_human=answered
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "latest", "expected"),
+    [
+        # A real conversation — top of the list.
+        ("called", _latest("user_hangup", 180, True), "engaged"),
+        ("called", _latest("agent_hangup", 90, True), "engaged"),
+        # Voicemail is decided by Retell's machine detection, NOT by our transcript
+        # heuristic: the machine's own greeting transcribes as a turn from the far end, so
+        # answered_by_human is True on every voicemail. Testing it first would file the
+        # whole bucket under "engaged".
+        ("voicemail", _latest("voicemail_reached", 30, True), "voicemail"),
+        ("voicemail", _latest("machine_detected", 120, True), "voicemail"),
+        # Rang out, declined, busy — the number is live, the moment was wrong.
+        ("no_answer", _latest("dial_no_answer", 0, False), "no_answer"),
+        ("no_answer", _latest("user_declined", 0, False), "no_answer"),
+        ("no_answer", _latest("dial_busy", 0, None), "no_answer"),
+        # Ended with nobody having spoken, for a reason we have no rule for.
+        ("called", _latest("some_new_retell_reason", 4, False), "no_answer"),
+        # Picked up and bailed.
+        ("called", _latest("user_hangup", 12, True), "hung_up"),
+        # Dead numbers: calling again does the same thing.
+        ("no_answer", _latest("dial_failed", 0, False), None),
+        ("no_answer", _latest("invalid_destination", 0, False), None),
+        ("no_answer", _latest("marked_as_spam", 0, False), None),
+        # Settled — already worked, or explicitly rejected.
+        ("booked", _latest("user_hangup", 200, True), None),
+        ("do_not_call", _latest("user_hangup", 200, True), None),
+        ("flagged", _latest("user_hangup", 200, True), None),
+        # Never dialled: there is nothing to call *back*.
+        ("not_called", None, None),
+    ],
+)
+def test_call_list_bucket(status, latest, expected):
+    assert sheets_service.call_list_bucket(status, latest) == expected
+
+
+def test_engaged_threshold_is_exclusive_at_sixty_seconds():
+    """The one tuning knob for the whole answered-by-human half of the list, so pin both
+    sides of it rather than only the obvious cases."""
+    assert sheets_service.call_list_bucket("called", _latest("user_hangup", 60, True)) == "hung_up"
+    assert sheets_service.call_list_bucket("called", _latest("user_hangup", 61, True)) == "engaged"
+
+
+def test_voicemail_definition_matches_prospect_service():
+    """Two modules decide "was this a machine" and they must not drift — the classifier
+    got this wrong once already and mislabelled a whole campaign of voicemails."""
+    for reason in prospect_service.VOICEMAIL_REASONS:
+        assert (
+            sheets_service.call_list_bucket("voicemail", _latest(reason, 30, True)) == "voicemail"
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_list_orders_by_bucket_then_coldest_first(db_session, tenant_id):
+    """The whole point of the tab: bucket order first, and inside a bucket the least-
+    dialled, longest-untouched prospect comes up before one already chased three times."""
+    made = []
+    for name, status, call_count, last_called in (
+        ("Hung Up Co", "called", 1, datetime(2026, 8, 1, tzinfo=UTC)),
+        ("No Answer Co", "no_answer", 1, datetime(2026, 8, 1, tzinfo=UTC)),
+        ("Voicemail Chased", "voicemail", 3, datetime(2026, 8, 1, tzinfo=UTC)),
+        ("Voicemail Cold", "voicemail", 1, datetime(2026, 7, 1, tzinfo=UTC)),
+        ("Voicemail Warm", "voicemail", 1, datetime(2026, 8, 1, tzinfo=UTC)),
+        ("Engaged Co", "called", 2, datetime(2026, 8, 1, tzinfo=UTC)),
+    ):
+        p = await _prospect(db_session, tenant_id, name, f"+4420{len(made):08d}")
+        p.status = status
+        p.call_count = call_count
+        p.last_called_at = last_called
+        made.append(p)
+    await db_session.commit()
+
+    latest = {
+        made[0].id: _latest("user_hangup", 10, True),
+        made[1].id: _latest("dial_no_answer", 0, False),
+        made[2].id: _latest("voicemail_reached", 20, True),
+        made[3].id: _latest("voicemail_reached", 20, True),
+        made[4].id: _latest("voicemail_reached", 20, True),
+        made[5].id: _latest("user_hangup", 240, True),
+    }
+
+    rows = sheets_service._build_call_list(made, latest)
+
+    assert rows[0] == sheets_service.CALL_LIST_HEADER
+    name_col = sheets_service.CALL_LIST_HEADER.index("Business name")
+    assert [r[name_col] for r in rows[1:]] == [
+        "Engaged Co",
+        # Same bucket: fewest calls first, then coldest last-called, then the chased one.
+        "Voicemail Cold",
+        "Voicemail Warm",
+        "Voicemail Chased",
+        "No Answer Co",
+        "Hung Up Co",
+    ]
+    bucket_col = sheets_service.CALL_LIST_HEADER.index("Bucket")
+    assert rows[1][bucket_col] == "Engaged"
+
+
+@pytest.mark.asyncio
+async def test_sync_writes_the_call_list_to_its_own_tab(db_session, tenant_id, monkeypatch):
+    """End to end: the tab is provisioned, cleared, and written — and the main tab keeps
+    its own ordering, untouched by the call list's."""
+    sheet = _FakeSheet([]).install(monkeypatch)
+    p = await _prospect(db_session, tenant_id, "Voicemail Co", "+442077335265")
+    p.status = "voicemail"
+    p.call_count = 1
+    db_session.add(
+        Call(
+            tenant_id=tenant_id,
+            agent_id=uuid.uuid4(),
+            caller_number="+442077335265",
+            prospect_id=p.id,
+            status="failed",
+            disconnection_reason="voicemail_reached",
+            duration_sec=22,
+            answered_by_human=True,
+            started_at=datetime(2026, 8, 30, tzinfo=UTC),
+        )
+    )
+    await db_session.commit()
+
+    stats = await sheets_service.sync(db_session, tenant_id, "sid", "Sheet1")
+
+    assert sheets_service.CALL_LIST_SHEET in sheet.created_tabs
+    # Cleared before the write: a shrinking list would otherwise leave stale rows below
+    # it that read as live callbacks.
+    assert sheets_service.CALL_LIST_SHEET in sheet.cleared_tabs
+    assert stats["call_list_written"] == 1
+    [row] = sheet.call_list()
+    assert row[sheets_service.CALL_LIST_HEADER.index("Bucket")] == "Voicemail"
+    assert row[sheets_service.CALL_LIST_HEADER.index("Last outcome")] == "voicemail_reached"
+    assert row[sheets_service.CALL_LIST_HEADER.index("Last duration")] == "22"
+    # Phones stay text on this tab too — a leading "+" would render as #ERROR! otherwise.
+    assert row[sheets_service.CALL_LIST_HEADER.index("Phone")] == "'+442077335265"
+    # The main tab still carries the raw reason in its own "Last outcome" column.
+    assert sheet.col("Last outcome") == "voicemail_reached"
+
+
+@pytest.mark.asyncio
+async def test_an_in_progress_call_keeps_a_prospect_off_the_call_list(
+    db_session, tenant_id, monkeypatch
+):
+    """A call that has not ended has no outcome to bucket on, and a prospect dialled but
+    never resolved must not show up as a no-answer callback."""
+    sheet = _FakeSheet([]).install(monkeypatch)
+    p = await _prospect(db_session, tenant_id, "Mid Call Co", "+442077335265")
+    db_session.add(
+        Call(
+            tenant_id=tenant_id,
+            agent_id=uuid.uuid4(),
+            caller_number="+442077335265",
+            prospect_id=p.id,
+            status="in_progress",
+            started_at=datetime(2026, 8, 30, tzinfo=UTC),
+        )
+    )
+    await db_session.commit()
+
+    await sheets_service.sync(db_session, tenant_id, "sid", "Sheet1")
+
+    assert sheet.call_list() == []
