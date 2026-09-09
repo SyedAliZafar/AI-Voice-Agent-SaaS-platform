@@ -2,10 +2,11 @@
 
 Multi-tenant SaaS for building, deploying, and monitoring AI voice agents on
 top of Retell AI and Vapi AI. DeepSeek/OpenAI power the conversation brain,
-chosen per agent (ADR-008 in `CONTEXT.md`).
+chosen per agent (ADR-008 in `ADR.md`).
 
-Read `CONTEXT.md` first — it has the full architecture, ADRs, data flows, and
-coding conventions. This file is just the fastest path to a running stack.
+Read `CONTEXT.md` first — it has the full architecture, data flows, coding
+conventions, and a one-line index of every ADR; the ADRs themselves live in
+`ADR.md`. This file is just the fastest path to a running stack.
 For day-to-day run/troubleshooting detail (public tunnel setup, stuck calls,
 custom-LLM debugging, ...), see `RUN.md`.
 
@@ -34,7 +35,7 @@ silently shadow the shared DB and hand you a private, diverging copy.)
 
 Solo local dev: set `CELERY_TASK_ALWAYS_EAGER=true` in `.env` so tasks run inline
 in-process — no separate worker needed. Never set this outside local dev; staging/prod
-need a real worker to keep webhook responses under 200ms (ADR-005 in `CONTEXT.md`).
+need a real worker to keep webhook responses under 200ms (ADR-005 in `ADR.md`).
 
 **Migrations do not run on container start** — nothing in the image or compose command
 invokes Alembic. A fresh clone needs no migration step anyway, since the schema is

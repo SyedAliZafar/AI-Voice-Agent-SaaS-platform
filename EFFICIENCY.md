@@ -57,7 +57,8 @@ context this session already has, which costs more than the edit itself.
 
 **When a change adds a new service, router, worker, model, or top-level frontend
 component, update CONTEXT.md's structure tree in the same change.** Not later, not in a
-follow-up.
+follow-up. `uv run python scripts/check_context_tree.py` catches what you forgot — it
+lists source files absent from the tree.
 
 This is the rule whose absence created the problem these docs were written to fix: the
 tree drifted far enough that it omitted an entire subsystem (the prospecting pipeline,
@@ -66,7 +67,8 @@ pointed at a file that had been deleted. A stale map is worse than no map, becau
 trusted.
 
 Same rule for decisions: if you make an architectural choice worth defending later,
-it goes in CONTEXT.md as an ADR, or in a phase doc. If a phase doc supersedes an ADR,
+it goes in ADR.md as a full ADR entry (plus its one-line row in CONTEXT.md's
+"Architecture decisions" index), or in a phase doc. If a phase doc supersedes an ADR,
 update the ADR — don't leave two contradictory sources.
 
 ## Known open gaps (don't rediscover these)

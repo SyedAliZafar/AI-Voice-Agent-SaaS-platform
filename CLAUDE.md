@@ -1,10 +1,13 @@
 # CLAUDE.md
 
-Read [CONTEXT.md](CONTEXT.md) first — it has the architecture, ADRs, data flows, prompt
-structure, the "Change recipes" table (what files a given kind of change touches), and
-the "what not to build" list. This file only covers commands and rules for working in
-this repo day-to-day. See [EFFICIENCY.md](EFFICIENCY.md) for how to work efficiently in
-this specific repo, and [FRONTEND.md](FRONTEND.md) for the target frontend/UI structure.
+Read [CONTEXT.md](CONTEXT.md) first — it has the architecture, structure tree, data
+flows, prompt structure, the "Change recipes" table (what files a given kind of change
+touches), the "what not to build" list, and a one-line index of every ADR. Read the
+matching full ADR in [ADR.md](ADR.md) only when your change touches that decision — the
+index in CONTEXT.md is enough to tell which one that is. This file only covers commands
+and rules for working in this repo day-to-day. See [EFFICIENCY.md](EFFICIENCY.md) for
+how to work efficiently in this specific repo, and [FRONTEND.md](FRONTEND.md) for the
+target frontend/UI structure.
 
 ## Commands
 
@@ -60,7 +63,10 @@ docker-compose up        # postgres, redis, minio, api, worker
 
 ## Docs
 - After a batch of structural work (new file/module, a flow changes, a change-recipe
-  row goes stale, an ADR-worthy decision), sync CONTEXT.md/FRONTEND.md in a dedicated
-  `docs: sync ...` commit before moving to the next unrelated task — see `16ccfb9` for
-  the pattern. Don't update docs for bug fixes or internal refactors that don't change
-  file roles or flow.
+  row goes stale, an ADR-worthy decision), sync CONTEXT.md/ADR.md/FRONTEND.md in a
+  dedicated `docs: sync ...` commit before moving to the next unrelated task — see
+  `16ccfb9` for the pattern. A new/changed ADR is a full entry in ADR.md **plus** its
+  one-line row in CONTEXT.md's "Architecture decisions" index. Run
+  `uv run python scripts/check_context_tree.py` as part of that sync — it flags source
+  files missing from CONTEXT.md's structure tree. Don't update docs for bug fixes or
+  internal refactors that don't change file roles or flow.
