@@ -906,8 +906,21 @@ async def test_call_is_tenant_scoped(
 
 @pytest.fixture
 def placed_platform_calls(monkeypatch) -> list[dict]:
-    """Same capture idea as placed_calls, for the other dial source."""
+    """Same capture idea as placed_calls, for the other dial source.
+
+    Stubs the *whole* platform-dial boundary, not just the dial itself: a serial batch
+    run also reads the agent's declared {{placeholders}} so it can fill them per
+    prospect (batch_service._variables_for), and an unstubbed read there is a live call
+    to api.retellai.com from the test suite.
+    """
     from backend.api import prospects as prospects_api
+
+    async def fake_declared(external_agent_id, platform="retell"):
+        return []
+
+    monkeypatch.setattr(
+        prospects_api.test_call_service, "get_platform_agent_variables", fake_declared
+    )
 
     calls: list[dict] = []
 
@@ -1134,6 +1147,95 @@ async def test_batch_call_rejects_naming_both_or_neither_agent(client, auth_head
     for body in ({}, {"agent_id": str(uuid.uuid4()), "external_agent_id": "x"}):
         resp = await client.post("/api/prospects/batch-call", json=body, headers=auth_headers)
         assert resp.status_code == 422
+
+
+# --- serial batch runs (paced sibling of /batch-call, one call at a time) -----------
+
+
+@pytest.mark.asyncio
+async def test_create_batch_run_dials_only_the_first_prospect(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    for i in range(3):
+        p = await _make_prospect(db_session, tenant_id, f"Roofer {i}", f"p_run_{i}")
+        p.phone = f"+44117000010{i}"
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/prospects/batch-runs",
+        json={"external_agent_id": "agent_ext_1", "limit": 3},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["total"] == 3
+    assert len(placed_platform_calls) == 1  # not all three — that's the whole point
+    statuses = [item["status"] for item in body["items"]]
+    assert statuses.count("dialing") == 1
+    assert statuses.count("queued") == 2
+    assert all(item["name"] != "(unknown)" for item in body["items"])
+
+
+@pytest.mark.asyncio
+async def test_get_batch_run_is_tenant_scoped(
+    client, db_session, tenant_id, auth_headers, other_auth_headers, placed_platform_calls
+):
+    p = await _make_prospect(db_session, tenant_id, "Roofer", "p_run_scope")
+    p.phone = "+441170001099"
+    await db_session.commit()
+
+    create_resp = await client.post(
+        "/api/prospects/batch-runs",
+        json={"external_agent_id": "agent_ext_1", "limit": 1},
+        headers=auth_headers,
+    )
+    run_id = create_resp.json()["id"]
+
+    own = await client.get(f"/api/prospects/batch-runs/{run_id}", headers=auth_headers)
+    other = await client.get(f"/api/prospects/batch-runs/{run_id}", headers=other_auth_headers)
+
+    assert own.status_code == 200
+    assert other.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_batch_run_stops_it(
+    client, db_session, tenant_id, auth_headers, placed_platform_calls
+):
+    p = await _make_prospect(db_session, tenant_id, "Roofer", "p_run_cancel")
+    p.phone = "+441170001098"
+    await db_session.commit()
+
+    create_resp = await client.post(
+        "/api/prospects/batch-runs",
+        json={"external_agent_id": "agent_ext_1", "limit": 1},
+        headers=auth_headers,
+    )
+    run_id = create_resp.json()["id"]
+
+    resp = await client.post(f"/api/prospects/batch-runs/{run_id}/cancel", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_create_batch_run_rejects_naming_both_or_neither_agent(client, auth_headers):
+    for body in ({}, {"agent_id": str(uuid.uuid4()), "external_agent_id": "x"}):
+        resp = await client.post("/api/prospects/batch-runs", json=body, headers=auth_headers)
+        assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_batch_run_422_when_nothing_eligible(client, auth_headers):
+    resp = await client.post(
+        "/api/prospects/batch-runs",
+        json={"external_agent_id": "agent_ext_1", "limit": 5},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
 
 
 # --- CSV export -----------------------------------------------------------------

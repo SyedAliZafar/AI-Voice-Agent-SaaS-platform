@@ -11,6 +11,8 @@ import { Prospect, ProspectStatus } from "@/lib/types";
 export function ProspectRow({
   prospect,
   isOpen,
+  selected,
+  onToggleSelect,
   onOpenCall,
   onChanged,
 }: {
@@ -19,6 +21,11 @@ export function ProspectRow({
    * one currently open — purely for the button's pressed styling, the drawer itself
    * lives outside this row so re-grouping the list can't carry it away mid-form. */
   isOpen: boolean;
+  /** Ticked for the next batch run. Selection is page-level state for the same reason
+   * the drawer is: this row can move to a different branch of the tree when research
+   * fills in its city, and state held here would be lost with it. */
+  selected: boolean;
+  onToggleSelect: () => void;
   onOpenCall: () => void;
   onChanged: () => void;
 }) {
@@ -52,8 +59,21 @@ export function ProspectRow({
   }
 
   return (
-    <Card className="p-4">
+    <Card className={selected ? "p-4 ring-1 ring-brand-300" : "p-4"}>
       <div className="flex flex-wrap items-center justify-between gap-3">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelect}
+          aria-label={`Select ${prospect.name} for a batch call`}
+          title={
+            prospect.phone
+              ? "Include in the next batch call"
+              : "No phone number — can't be called"
+          }
+          disabled={!prospect.phone}
+          className="size-4 shrink-0 rounded border-slate-300 text-brand-600 focus:ring-brand-300 disabled:opacity-30"
+        />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <p className="truncate font-medium text-slate-900">{prospect.name}</p>

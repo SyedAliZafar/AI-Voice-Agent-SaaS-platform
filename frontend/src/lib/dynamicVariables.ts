@@ -44,6 +44,25 @@ export function isOptionalProspectVariable(name: string): boolean {
   return canonicalKey(name) === "contactname";
 }
 
+/** Canonical keys whose value comes from the prospect being dialed. */
+const PER_PROSPECT_KEYS = ["companyname", "phonenumber", "city", "industry"];
+
+/**
+ * True when this placeholder is filled from each prospect rather than typed once.
+ *
+ * Only meaningful for a **batch**, where one form starts many calls: asking for
+ * {{company_name}} there is asking for a value that is wrong for every company but one.
+ * The single-prospect drawer has no such problem — it seeds these into editable fields
+ * from the one prospect being called, which is why it doesn't use this.
+ *
+ * The backend is the authority (batch_service._variables_for fills these per dial from
+ * backend/services/prospect_variables.py); this exists so the form doesn't demand a
+ * value the backend is about to override. Keep the two lists in sync.
+ */
+export function isPerProspectVariable(name: string): boolean {
+  return normalize(name) === "currenttime" || PER_PROSPECT_KEYS.includes(canonicalKey(name) ?? "");
+}
+
 /**
  * Fill what we can for a prospect call. `current_time` is included because Retell's own
  * dashboard lists it as operator-supplied rather than auto-injecting it, and an agent

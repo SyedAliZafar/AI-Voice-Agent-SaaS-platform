@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     # prospect_tasks.sweep_stale_prospects.
     prospect_stale_research_minutes: int = 20
 
+    # Serial batch outreach runs (see backend/services/batch_service.py). A batch item
+    # stuck "dialing" longer than this (its call_ended/call_analyzed webhook never
+    # arrived) is reconciled via the platform rather than left to stall the run forever
+    # — same shape as lead_stale_in_flight_minutes, see batch_tasks.sweep_stalled_batches.
+    batch_stall_minutes: int = 6
+
     # Storage
     s3_bucket: str = "voiceagent-recordings"
     s3_access_key: str = ""

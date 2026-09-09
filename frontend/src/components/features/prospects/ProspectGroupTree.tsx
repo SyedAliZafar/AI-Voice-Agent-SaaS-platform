@@ -16,11 +16,15 @@ import { CountryGroup } from "@/lib/prospectGrouping";
 export function ProspectGroupTree({
   groups,
   openId,
+  selectedIds,
+  onToggleSelect,
   onOpenCall,
   onChanged,
 }: {
   groups: CountryGroup[];
   openId: string | null;
+  selectedIds: Set<string>;
+  onToggleSelect: (id: string) => void;
   onOpenCall: (id: string) => void;
   onChanged: () => void;
 }) {
@@ -55,6 +59,8 @@ export function ProspectGroupTree({
                             key={prospect.id}
                             prospect={prospect}
                             isOpen={openId === prospect.id}
+                            selected={selectedIds.has(prospect.id)}
+                            onToggleSelect={() => onToggleSelect(prospect.id)}
                             onOpenCall={() => onOpenCall(prospect.id)}
                             onChanged={onChanged}
                           />

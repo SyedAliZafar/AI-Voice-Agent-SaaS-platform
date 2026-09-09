@@ -293,6 +293,10 @@ class RetellAdapter(VoicePlatformAdapter):
     # response can't hold the reconcile request open for minutes.
     _HISTORY_PAGE_SIZE = 200
 
+    # v2/list-agents pages like v2/list-calls. Kept modest: the roster is fetched live on
+    # every dial-picker open, so a page that takes seconds is worse than one more round trip.
+    _AGENT_PAGE_SIZE = 100
+
     async def list_call_history(
         self, *, since_ms: int | None = None, max_calls: int = 1000
     ) -> list[dict[str, Any]]:
@@ -358,7 +362,14 @@ class RetellAdapter(VoicePlatformAdapter):
         renamed, re-voiced or deleted in Retell's dashboard must not still be offered by
         our dial picker, and there is no webhook telling us when that happens.
 
-        Two normalizations worth knowing about:
+        Uses `POST /v2/list-agents`. The old `GET /list-agents` was deprecated on
+        2026-07-31 and is scheduled for removal; v2 also folds in what used to be
+        `/list-chat-agents`, which is why the channel filter below is sent explicitly —
+        without it, SMS/chat agents would appear in a picker that can only dial.
+
+        Three normalizations worth knowing about:
+          - v2 pages, so this loops on `has_more`/`pagination_key` rather than trusting a
+            single `limit`. The old GET silently truncated at 100 agents.
           - `list-agents` returns one entry *per agent version*, so an agent edited five
             times appears five times. We keep the highest `version` per agent_id —
             that's the one Retell dials when `override_agent_id` names it without a
@@ -369,17 +380,43 @@ class RetellAdapter(VoicePlatformAdapter):
             back at a websocket — and an agent pointing at *someone else's* websocket is
             the case where "just dial it" does something we can't explain.
         """
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{BASE_URL}/list-agents", headers=self.headers, params={"limit": limit}
-            )
-            resp.raise_for_status()
-            body = resp.json()
+        raw: list[dict[str, Any]] = []
+        pagination_key: str | None = None
 
-        # Bare array today; accept a paginated {items: [...]} too, same defensive shape as
-        # list_live_calls — a Retell-side pagination rollout would otherwise silently
-        # empty the picker.
-        raw = list(body.get("items") or []) if isinstance(body, dict) else list(body)
+        async with httpx.AsyncClient() as client:
+            while len(raw) < limit:
+                body: dict[str, Any] = {
+                    "limit": min(self._AGENT_PAGE_SIZE, limit - len(raw)),
+                    "filter_criteria": {
+                        "channel": {"type": "string", "op": "eq", "value": "voice"}
+                    },
+                }
+                if pagination_key:
+                    body["pagination_key"] = pagination_key
+
+                resp = await client.post(
+                    f"{BASE_URL}/v2/list-agents", headers=self.headers, json=body
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+
+                # v2 always envelopes in {items: [...]}; the bare-array branch is kept
+                # only so a stale mock or a proxy replaying the old shape degrades to
+                # "one page" instead of an empty dial picker.
+                page = payload.get("items") if isinstance(payload, dict) else payload
+                page = list(page or [])
+                if not page:
+                    break
+                raw.extend(page)
+
+                if not isinstance(payload, dict) or not payload.get("has_more"):
+                    break
+                # Same shape as list-calls: the cursor is the last item's id unless
+                # Retell hands back an explicit one.
+                next_key = payload.get("pagination_key") or page[-1].get("agent_id")
+                if not next_key or next_key == pagination_key:
+                    break
+                pagination_key = next_key
 
         latest: dict[str, dict[str, Any]] = {}
         for item in raw:

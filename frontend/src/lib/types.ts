@@ -334,6 +334,33 @@ export interface Prospect {
   created_at: string;
 }
 
+/** A serial, event-chained batch run (POST /prospects/batch-runs) — the paced sibling
+ * of POST /prospects/batch-call. It dials one prospect at a time; an item only leaves
+ * "dialing" once that call's real terminal webhook lands on the backend
+ * (call_service._fanout_post_call), so this is live state to poll, not a fixed-duration
+ * animation. See phases/in-progress/serial-batch-calling.md.
+ */
+export type BatchRunItemStatus = "queued" | "dialing" | "done" | "skipped";
+export type BatchRunStatus = "running" | "done" | "cancelled" | "failed";
+
+export interface BatchRunItem {
+  prospect_id: string;
+  name: string;
+  position: number;
+  status: BatchRunItemStatus;
+  call_id: string | null;
+  skip_reason: string | null;
+}
+
+export interface BatchRun {
+  id: string;
+  status: BatchRunStatus;
+  total: number;
+  started_at: string;
+  finished_at: string | null;
+  items: BatchRunItem[];
+}
+
 /** A third party this tenant has connected (GET /integrations).
  *
  * `config` comes back with secrets MASKED by the backend — an api_key reads as

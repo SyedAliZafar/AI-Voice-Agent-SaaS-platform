@@ -17,6 +17,7 @@ celery_app = Celery(
         "backend.workers.analytics_tasks",
         "backend.workers.prospect_tasks",
         "backend.workers.lead_tasks",
+        "backend.workers.batch_tasks",
     ],
 )
 
@@ -45,6 +46,13 @@ celery_app.conf.update(
         # message up) — see prospect_tasks module docstring.
         "sweep-stale-prospects": {
             "task": "sweep_stale_prospects",
+            "schedule": 300.0,
+        },
+        # Backstop for serial batch runs (backend/services/batch_service.py): if a
+        # batch item's call_ended/call_analyzed webhook never arrives, nothing else
+        # would ever advance that run past its currently-dialing item.
+        "sweep-stalled-batches": {
+            "task": "sweep_stalled_batches",
             "schedule": 300.0,
         },
     },

@@ -565,6 +565,19 @@ async def _fanout_post_call(
 
         await prospect_service.classify_call_outcome(db, call, prospect=prospect)
 
+        # Serial batch runs (see backend/services/batch_service.py): if this call was
+        # dialed as one item of an active run, mark that item done and hand off the
+        # next dial to a worker. batch_service's own guard (an UPDATE that only
+        # succeeds once per item) makes this safe under this function's "runs more
+        # than once per call" contract — a second fanout for the same call finds the
+        # item already "done" and does nothing.
+        from backend.services import batch_service
+        from backend.workers.batch_tasks import advance_batch_run
+
+        run_id = await batch_service.mark_item_done_and_advance(db, call)
+        if run_id:
+            advance_batch_run.delay(str(run_id))
+
 
 async def handle_call_ended(
     db: AsyncSession, external_call_id: str, payload: dict[str, Any] | None = None

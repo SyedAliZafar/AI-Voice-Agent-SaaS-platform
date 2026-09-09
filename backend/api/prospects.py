@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.deps import get_current_tenant
 from backend.database import get_db
 from backend.schemas.agent import SandboxChatResponse, TestCallResponse
+from backend.schemas.batch_run import BatchRunItemResponse, BatchRunRequest, BatchRunResponse
 from backend.schemas.prospect import (
     BatchCallDispatch,
     BatchCallRequest,
@@ -35,6 +36,7 @@ from backend.schemas.prospect import (
 )
 from backend.services import (
     agent_service,
+    batch_service,
     call_service,
     integration_config_service,
     llm_service,
@@ -361,6 +363,94 @@ async def batch_call(
         )
 
     return result
+
+
+async def _batch_run_response(db: AsyncSession, run) -> BatchRunResponse:
+    """Attaches each item's prospect name — BatchRunItem only stores prospect_id, and
+    the run view needs a name to render anything readable.
+    """
+    names = await batch_service.prospect_names_for_run(db, run)
+
+    return BatchRunResponse(
+        id=run.id,
+        status=run.status,
+        total=run.total,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        items=[
+            BatchRunItemResponse(
+                prospect_id=item.prospect_id,
+                name=names.get(item.prospect_id, "(unknown)"),
+                position=item.position,
+                status=item.status,
+                call_id=item.call_id,
+                skip_reason=item.skip_reason,
+            )
+            for item in run.items
+        ],
+    )
+
+
+@router.post("/batch-runs", response_model=BatchRunResponse, status_code=201)
+async def create_batch_run(
+    payload: BatchRunRequest,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Start a serial batch run: dials one prospect at a time, advancing only once the
+    previous call reaches a terminal state (call_service._fanout_post_call), never on a
+    fixed timer. This is POST /batch-call's paced sibling — same per-prospect behaviour —
+    for when the operator wants to watch a small list get worked one call at a time
+    instead of firing everything at once.
+
+    Either hand it `prospect_ids` (the rows the operator ticked) or let the same
+    filters /batch-call uses choose the targets. Declared above /{prospect_id} for the
+    same reason /batch-call is.
+    """
+    try:
+        run = await batch_service.start_run(
+            db,
+            tenant_id,
+            agent_id=payload.agent_id,
+            external_agent_id=payload.external_agent_id,
+            prospect_ids=payload.prospect_ids,
+            limit=payload.limit,
+            city=payload.city,
+            max_call_count=payload.max_call_count,
+            dynamic_variables=payload.dynamic_variables,
+        )
+    except batch_service.BatchRunError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return await _batch_run_response(db, run)
+
+
+@router.get("/batch-runs/{run_id}", response_model=BatchRunResponse)
+async def get_batch_run(
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll this to render run progress — who's done, who's next, who was skipped."""
+    run = await batch_service.get_run(db, tenant_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Batch run not found")
+    return await _batch_run_response(db, run)
+
+
+@router.post("/batch-runs/{run_id}/cancel", response_model=BatchRunResponse)
+async def cancel_batch_run(
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stops future dials. The call currently in flight (if any) is not hung up — it
+    runs to its natural end, it just won't trigger another dial afterwards.
+    """
+    run = await batch_service.cancel_run(db, tenant_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Batch run not found")
+    return await _batch_run_response(db, run)
 
 
 @router.get("/{prospect_id}", response_model=ProspectResponse)

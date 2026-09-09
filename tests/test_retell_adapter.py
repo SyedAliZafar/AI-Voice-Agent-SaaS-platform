@@ -7,6 +7,8 @@ asked for. Getting this wrong is not cosmetic: hanging up inherently races the c
 ending by itself, so a too-strict adapter reports failure for calls that are down.
 """
 
+import json
+
 import httpx
 import pytest
 
@@ -96,30 +98,40 @@ async def test_list_platform_agents_keeps_only_the_latest_version(monkeypatch):
     what override_agent_id does — it dials the latest."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        # GET /list-agents was deprecated 2026-07-31; v2 is a POST with a JSON body.
+        assert request.method == "POST"
+        assert request.url.path == "/v2/list-agents"
+        body = json.loads(request.content)
+        # v2 merged voice and chat agents onto one endpoint — an SMS agent in a picker
+        # that can only dial is a bug, so the filter must always be sent.
+        assert body["filter_criteria"]["channel"]["value"] == "voice"
         return httpx.Response(
             200,
-            json=[
-                {
-                    "agent_id": "agent_1",
-                    "agent_name": "Roofing v1",
-                    "version": 1,
-                    "voice_id": "11labs-Marissa",
-                    "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
-                },
-                {
-                    "agent_id": "agent_1",
-                    "agent_name": "Roofing v3",
-                    "version": 3,
-                    "voice_id": "11labs-Marissa",
-                    "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
-                },
-                {
-                    "agent_id": "agent_2",
-                    "agent_name": "HVAC",
-                    "version": 0,
-                    "response_engine": {"type": "custom-llm"},
-                },
-            ],
+            json={
+                "items": [
+                    {
+                        "agent_id": "agent_1",
+                        "agent_name": "Roofing v1",
+                        "version": 1,
+                        "voice_id": "11labs-Marissa",
+                        "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
+                    },
+                    {
+                        "agent_id": "agent_1",
+                        "agent_name": "Roofing v3",
+                        "version": 3,
+                        "voice_id": "11labs-Marissa",
+                        "response_engine": {"type": "retell-llm", "llm_id": "llm_1"},
+                    },
+                    {
+                        "agent_id": "agent_2",
+                        "agent_name": "HVAC",
+                        "version": 0,
+                        "response_engine": {"type": "custom-llm"},
+                    },
+                ],
+                "has_more": False,
+            },
         )
 
     _patch_transport(monkeypatch, handler)
@@ -135,18 +147,49 @@ async def test_list_platform_agents_keeps_only_the_latest_version(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_platform_agents_accepts_a_paginated_body(monkeypatch):
-    """Same defensive shape as list_live_calls: a Retell-side pagination rollout must not
-    silently empty the dial picker."""
+async def test_list_platform_agents_pages_until_has_more_is_false(monkeypatch):
+    """The old GET took a flat limit=100 and silently truncated. v2 pages, so an account
+    with more agents than one page must still show all of them in the picker."""
+
+    seen_keys: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"items": [{"agent_id": "agent_1"}], "has_more": False})
+        body = json.loads(request.content)
+        seen_keys.append(body.get("pagination_key"))
+        if body.get("pagination_key") is None:
+            return httpx.Response(
+                200,
+                json={"items": [{"agent_id": "agent_1"}], "has_more": True},
+            )
+        return httpx.Response(200, json={"items": [{"agent_id": "agent_2"}], "has_more": False})
 
     _patch_transport(monkeypatch, handler)
     agents = await RetellAdapter().list_platform_agents()
 
+    # Second page asked for the cursor derived from the first page's last agent.
+    assert seen_keys == [None, "agent_1"]
+    assert {a["external_id"] for a in agents} == {"agent_1", "agent_2"}
     # An unnamed agent falls back to its id — a blank row is indistinguishable from the
     # next blank row in a picker.
+    assert agents[0]["name"] == "agent_1"
+    assert agents[0]["engine"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_platform_agents_stops_on_a_page_that_claims_no_more(monkeypatch):
+    """A single page with has_more absent must terminate — an endpoint that kept
+    returning the same page would otherwise spin the dial picker forever."""
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"items": [{"agent_id": "agent_1"}]})
+
+    _patch_transport(monkeypatch, handler)
+    agents = await RetellAdapter().list_platform_agents()
+
+    assert calls["n"] == 1
     assert agents == [
         {
             "external_id": "agent_1",

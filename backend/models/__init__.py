@@ -1,5 +1,6 @@
 from backend.models.agent import Agent, PhoneNumber, ToolConfig
 from backend.models.base import Base
+from backend.models.batch_run import BatchRun, BatchRunItem
 from backend.models.call import Call, CallEvent, Transcript
 from backend.models.integration import Integration
 from backend.models.lead import Lead
@@ -21,4 +22,6 @@ __all__ = [
     "Lead",
     "Integration",
     "NdaDispatch",
+    "BatchRun",
+    "BatchRunItem",
 ]

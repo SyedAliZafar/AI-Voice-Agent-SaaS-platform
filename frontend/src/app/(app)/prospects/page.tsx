@@ -3,6 +3,7 @@
 import { Suspense, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
+import { BatchRunButton } from "@/components/features/prospects/BatchRunButton";
 import { CsvImportButton } from "@/components/features/prospects/CsvImportButton";
 import { SyncCallsButton } from "@/components/features/prospects/SyncCallsButton";
 import { SyncSheetButton } from "@/components/features/prospects/SyncSheetButton";
@@ -92,6 +93,20 @@ function ProspectsPageInner() {
   const [openId, setOpenId] = useState<string | null>(null);
   const openProspect = prospects.find((p) => p.id === openId) || null;
 
+  // Rows ticked for the next batch call. Held here rather than in ProspectRow because a
+  // row unmounts and remounts when research fills in its city and the tree re-groups —
+  // same reason the call drawer lives at page level.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   function persistSearchTerms() {
     setParam("q", query);
     setParam("where", location);
@@ -121,6 +136,13 @@ function ProspectsPageInner() {
   });
   const grouped = groupProspects(filteredProspects);
 
+  // Kept in the on-screen order of the list feeding the tree, since that's the order the
+  // batch dials them in and the panel says so. Selections that a later filter change
+  // hides stay selected — the panel names every prospect it's about to call, so nothing
+  // is dialed that the operator can't see listed.
+  const selectedProspects = filteredProspects.filter((p) => selectedIds.has(p.id));
+  const selectableVisible = filteredProspects.filter((p) => p.phone);
+
   // The list fetch caps at 500 rows (see useProspects) — stats.total is the real
   // count, so a tenant past that cap sees an honest "showing N of M" rather than a
   // group heading that silently undercounts.
@@ -133,6 +155,13 @@ function ProspectsPageInner() {
         subtitle="Discovery finds companies, research builds their knowledge base — you just pick who to call."
         actions={
           <div className="flex items-center gap-2">
+            <BatchRunButton
+              agents={retellAgents}
+              cityOptions={cityOptions.filter((c) => c !== UNSPECIFIED)}
+              selectedProspects={selectedProspects}
+              onClearSelection={() => setSelectedIds(new Set())}
+              onChanged={() => refetch().catch(() => {})}
+            />
             <SyncCallsButton onSynced={() => refetch().catch(() => {})} />
             <SyncSheetButton onSynced={() => refetch().catch(() => {})} />
             <CsvImportButton onImported={() => refetch().catch(() => {})} />
@@ -177,6 +206,31 @@ function ProspectsPageInner() {
               Showing {prospects.length} of {stats!.total} prospects.
             </p>
           )}
+          <div className="mb-4 -mt-1 flex items-center gap-3 text-xs">
+            <span className="text-slate-500">
+              {selectedProspects.length > 0
+                ? `${selectedProspects.length} selected for a batch call`
+                : "Tick prospects to choose exactly who a batch call works through."}
+            </span>
+            {selectableVisible.length > 0 && (
+              <button
+                onClick={() =>
+                  setSelectedIds(new Set(selectableVisible.slice(0, 15).map((p) => p.id)))
+                }
+                className="font-medium text-brand-600 hover:underline"
+              >
+                Select first {Math.min(15, selectableVisible.length)}
+              </button>
+            )}
+            {selectedProspects.length > 0 && (
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="font-medium text-slate-500 hover:underline"
+              >
+                Clear
+              </button>
+            )}
+          </div>
         </>
       )}
 
@@ -206,6 +260,8 @@ function ProspectsPageInner() {
         <ProspectGroupTree
           groups={grouped}
           openId={openId}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelect}
           onOpenCall={(id) => setOpenId(openId === id ? null : id)}
           onChanged={() => refetch().catch(() => {})}
         />
